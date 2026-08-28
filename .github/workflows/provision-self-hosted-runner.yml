@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       verify_only:
-        description: 'Skip SSH provisioning and only execute the five-job self-hosted verification and assertion'
+        description: 'Skip provisioning and only execute the five-job self-hosted verification and assertion'
         required: false
         default: false
         type: boolean
@@ -16,24 +16,32 @@ permissions:
 jobs:
   provision:
     if: ${{ !inputs.verify_only }}
-    name: Install runner pool on production server
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
+    name: Provision runner pool on production server
+    runs-on: [self-hosted, linux, x64, production]
+    timeout-minutes: 10
 
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       SELF_HOSTED_CREDENTIAL: ${{ secrets.SELF_HOSTED_CREDENTIAL }}
-      SSH_HOST: ${{ secrets.SSH_HOST }}
-      SSH_USER: ${{ secrets.SSH_USER }}
-      SSH_KEY: ${{ secrets.SSH_KEY }}
       SUDO_PASSWORD: ${{ secrets.SUDO_PASSWORD }}
 
     steps:
-      - name: Generate per-slot runner tokens and resolve package
-        id: runner
+      - name: Provision and verify runner pool slots
         shell: bash
         run: |
           set -Eeuo pipefail
+
+          test -n "$SUDO_PASSWORD"
+
+          _sudo() {
+            printf '%s\n' "$SUDO_PASSWORD" | sudo -S -p '' "$@"
+          }
+
+          _sudo -v
+          command -v curl >/dev/null
+          command -v tar >/dev/null
+          command -v sha256sum >/dev/null
+          command -v gh >/dev/null
 
           REGISTRATION_SCOPE=organization
           RUNNER_GROUP=madeena-devops
@@ -55,233 +63,213 @@ jobs:
             API_AUTH_TOKEN="${GH_TOKEN:-}"
           fi
 
-          # Generate distinct fresh registration tokens for all 5 runner slots via separate API calls
-          for slot in $(seq 1 5); do
-            if ! TOKEN="$(GH_TOKEN="$API_AUTH_TOKEN" gh api --method POST \
+          get_registration_token() {
+            local token=""
+            if ! token="$(GH_TOKEN="$API_AUTH_TOKEN" gh api --method POST \
               orgs/Madeena-software/actions/runners/registration-token \
-              --jq '.token' 2>/dev/null)" || [ -z "$TOKEN" ] || [ "$TOKEN" = "null" ]; then
-              echo "Organization runner registration token unavailable for slot $slot. Organization-level registration in Madeena-software is required." >&2
-              exit 1
+              --jq '.token' 2>/dev/null)" || [ -z "$token" ] || [ "$token" = "null" ]; then
+              echo "ERROR: Organization runner registration token unavailable. Organization-level registration in Madeena-software is required." >&2
+              return 1
             fi
-            echo "::add-mask::$TOKEN"
-            eval "TOKEN_${slot}=\"\$TOKEN\""
-            test -n "$TOKEN"
-          done
-
-          RUNNER_VERSION="$(gh api repos/actions/runner/releases/latest --jq '.tag_name')"
-          RUNNER_ASSET="actions-runner-linux-x64-${RUNNER_VERSION#v}.tar.gz"
-          RUNNER_SHA256="$(gh api repos/actions/runner/releases/latest \
-            --jq ".assets[] | select(.name == \"${RUNNER_ASSET}\") | .digest" \
-            | sed 's/^sha256://')"
-
-          test -n "$RUNNER_VERSION"
-          test -n "$RUNNER_SHA256"
-
-          {
-            echo "token_1=$TOKEN_1"
-            echo "token_2=$TOKEN_2"
-            echo "token_3=$TOKEN_3"
-            echo "token_4=$TOKEN_4"
-            echo "token_5=$TOKEN_5"
-            echo "version=$RUNNER_VERSION"
-            echo "asset=$RUNNER_ASSET"
-            echo "sha256=$RUNNER_SHA256"
-            echo "scope=$REGISTRATION_SCOPE"
-            echo "group=$RUNNER_GROUP"
-            echo "target_url=$RUNNER_TARGET_URL"
-          } >> "$GITHUB_OUTPUT"
-
-      - name: Install and start runners over SSH
-        shell: bash
-        env:
-          TOKEN_1: ${{ steps.runner.outputs.token_1 }}
-          TOKEN_2: ${{ steps.runner.outputs.token_2 }}
-          TOKEN_3: ${{ steps.runner.outputs.token_3 }}
-          TOKEN_4: ${{ steps.runner.outputs.token_4 }}
-          TOKEN_5: ${{ steps.runner.outputs.token_5 }}
-          RUNNER_VERSION: ${{ steps.runner.outputs.version }}
-          RUNNER_ASSET: ${{ steps.runner.outputs.asset }}
-          RUNNER_SHA256: ${{ steps.runner.outputs.sha256 }}
-          RUNNER_SCOPE: ${{ steps.runner.outputs.scope }}
-          RUNNER_GROUP: ${{ steps.runner.outputs.group }}
-          RUNNER_TARGET_URL: ${{ steps.runner.outputs.target_url }}
-        run: |
-          set -Eeuo pipefail
-
-          test -n "$SSH_HOST"
-          test -n "$SSH_USER"
-          test -n "$SSH_KEY"
-          test -n "$SUDO_PASSWORD"
-
-          KEY_FILE="$RUNNER_TEMP/simama-runner-key"
-          install -m 700 -d "$HOME/.ssh"
-          install -m 600 /dev/null "$KEY_FILE"
-          printf '%s\n' "$SSH_KEY" > "$KEY_FILE"
-
-          SSH_ARGS=(
-            -i "$KEY_FILE"
-            -o BatchMode=yes
-            -o ConnectTimeout=10
-            -o ConnectionAttempts=1
-            -o StrictHostKeyChecking=accept-new
-          )
-
-          connected=false
-          retry_window=600
-          retry_interval=10
-          retry_deadline=$((SECONDS + retry_window))
-          attempt=0
-          while (( SECONDS < retry_deadline )); do
-            attempt=$((attempt + 1))
-            if ssh "${SSH_ARGS[@]}" "$SSH_USER@$SSH_HOST" 'printf ready' >/dev/null 2>&1; then
-              connected=true
-              break
-            fi
-            remaining=$((retry_deadline - SECONDS))
-            (( remaining <= 0 )) && break
-            echo "SSH connection attempt $attempt failed; retrying in ${retry_interval}s (${remaining}s remain)."
-            if (( remaining > retry_interval )); then
-              sleep "$retry_interval"
-            else
-              sleep "$remaining"
-            fi
-          done
-          if [ "$connected" != true ]; then
-            echo "Unable to connect to the target server after ${retry_window}s of retries." >&2
-            exit 1
-          fi
-
-          REMOTE_SCRIPT=$(cat <<'REMOTE_SCRIPT'
-          set -Eeuo pipefail
-
-          IFS= read -r TOKEN_1
-          IFS= read -r TOKEN_2
-          IFS= read -r TOKEN_3
-          IFS= read -r TOKEN_4
-          IFS= read -r TOKEN_5
-          IFS= read -r SUDO_PASSWORD
-          IFS= read -r RUNNER_VERSION
-          IFS= read -r RUNNER_ASSET
-          IFS= read -r RUNNER_SHA256
-          IFS= read -r RUNNER_SCOPE
-          IFS= read -r RUNNER_GROUP
-          IFS= read -r RUNNER_TARGET_URL
-
-          test -n "$TOKEN_1"
-          test -n "$TOKEN_2"
-          test -n "$TOKEN_3"
-          test -n "$TOKEN_4"
-          test -n "$TOKEN_5"
-          test -n "$SUDO_PASSWORD"
-          test -n "$RUNNER_VERSION"
-          test -n "$RUNNER_ASSET"
-          test -n "$RUNNER_SHA256"
-          test -n "$RUNNER_SCOPE"
-          test -n "$RUNNER_GROUP"
-          test -n "$RUNNER_TARGET_URL"
-
-          SLOT_TOKENS=("$TOKEN_1" "$TOKEN_2" "$TOKEN_3" "$TOKEN_4" "$TOKEN_5")
-
-          _sudo() {
-            printf '%s\n' "$SUDO_PASSWORD" | sudo -S -p '' "$@"
+            printf '%s' "$token"
           }
 
-          _sudo -v
-          command -v curl >/dev/null
-          command -v tar >/dev/null
-          command -v sha256sum >/dev/null
+          read_runner_metadata() {
+            local dir="$1"
+            local key="$2"
+            if [ ! -f "$dir/.runner" ]; then
+              return 1
+            fi
+            if command -v python3 >/dev/null 2>&1; then
+              python3 -c "import json, sys; d = json.load(open('$dir/.runner')); print(str(next((v for k, v in d.items() if k.lower() == '$key'.lower()), '')))" 2>/dev/null || true
+            elif command -v jq >/dev/null 2>&1; then
+              jq -r --arg k "$key" 'to_entries[] | select(.key | ascii_downcase == ($k | ascii_downcase)) | .value // empty' "$dir/.runner" 2>/dev/null | head -n 1 || true
+            else
+              sed -nE "s/.*\"($key)\"[[:space:]]*:[[:space:]]*\"([^\"]+)\".*/\\2/Ip" "$dir/.runner" 2>/dev/null | head -n 1
+            fi
+          }
 
-          RUNNER_URL="https://github.com/actions/runner/releases/download/${RUNNER_VERSION}/${RUNNER_ASSET}"
-          ARCHIVE_CACHE="/tmp/${RUNNER_ASSET}"
+          validate_slot_identity() {
+            local dir="$1"
+            local expected_name="$2"
+            local expected_url="$3"
+            local expected_pool="${4:-}"
 
+            if [ ! -d "$dir" ] || [ ! -f "$dir/.runner" ] || [ ! -f "$dir/svc.sh" ] || [ ! -f "$dir/config.sh" ] || [ ! -f "$dir/run.sh" ]; then
+              echo "Directory $dir is missing one or more required runner installation files (.runner, svc.sh, config.sh, run.sh)." >&2
+              return 1
+            fi
+
+            local runner_meta_name
+            local runner_meta_url
+            local runner_meta_pool
+            runner_meta_name="$(read_runner_metadata "$dir" "agentName")"
+            runner_meta_url="$(read_runner_metadata "$dir" "gitHubUrl")"
+            runner_meta_pool="$(read_runner_metadata "$dir" "poolName")"
+
+            if [ -z "$runner_meta_name" ] || [ "$runner_meta_name" != "$expected_name" ]; then
+              echo "Slot metadata mismatch in $dir: agentName='$runner_meta_name' does not match expected '$expected_name'." >&2
+              return 1
+            fi
+
+            local norm_meta_url="${runner_meta_url%/}"
+            local norm_expected_url="${expected_url%/}"
+            if [ -z "$norm_meta_url" ] || [ "$norm_meta_url" != "$norm_expected_url" ]; then
+              echo "Slot metadata mismatch in $dir: gitHubUrl='$runner_meta_url' does not match expected '$expected_url'." >&2
+              return 1
+            fi
+
+            if [ -n "$expected_pool" ] && [ -n "$runner_meta_pool" ] && [ "$runner_meta_pool" != "$expected_pool" ]; then
+              echo "Slot metadata mismatch in $dir: poolName='$runner_meta_pool' does not match expected '$expected_pool'." >&2
+              return 1
+            fi
+
+            return 0
+          }
+
+          ARCHIVE_CACHE=""
           ensure_archive() {
-            if [ -f "$ARCHIVE_CACHE" ] && ! (printf '%s  %s\n' "$RUNNER_SHA256" "$ARCHIVE_CACHE" | sha256sum --check --status >/dev/null 2>&1); then
+            if [ -n "$ARCHIVE_CACHE" ] && [ -f "$ARCHIVE_CACHE" ]; then
+              return 0
+            fi
+
+            local runner_version
+            local runner_asset
+            local runner_sha256
+            local runner_url
+
+            runner_version="$(GH_TOKEN="$API_AUTH_TOKEN" gh api repos/actions/runner/releases/latest --jq '.tag_name')"
+            runner_asset="actions-runner-linux-x64-${runner_version#v}.tar.gz"
+            runner_sha256="$(GH_TOKEN="$API_AUTH_TOKEN" gh api repos/actions/runner/releases/latest \
+              --jq ".assets[] | select(.name == \"${runner_asset}\") | .digest" \
+              | sed 's/^sha256://')"
+
+            test -n "$runner_version"
+            test -n "$runner_sha256"
+
+            runner_url="https://github.com/actions/runner/releases/download/${runner_version}/${runner_asset}"
+            ARCHIVE_CACHE="/tmp/${runner_asset}"
+
+            if [ -f "$ARCHIVE_CACHE" ] && ! (printf '%s  %s\n' "$runner_sha256" "$ARCHIVE_CACHE" | sha256sum --check --status >/dev/null 2>&1); then
               rm -f "$ARCHIVE_CACHE"
             fi
             if [ ! -f "$ARCHIVE_CACHE" ]; then
-              curl --fail --location --retry 3 --output "$ARCHIVE_CACHE" "$RUNNER_URL"
-              printf '%s  %s\n' "$RUNNER_SHA256" "$ARCHIVE_CACHE" | sha256sum --check --status
+              curl --fail --location --retry 3 --output "$ARCHIVE_CACHE" "$runner_url"
+              printf '%s  %s\n' "$runner_sha256" "$ARCHIVE_CACHE" | sha256sum --check --status
             fi
           }
 
           HOST_NAME="$(hostname -s)"
           TOTAL_RUNNERS=5
 
-          for i in $(seq 1 "$TOTAL_RUNNERS"); do
-            token_idx=$((i - 1))
-            CURRENT_SLOT_TOKEN="${SLOT_TOKENS[$token_idx]}"
+          # Slot 1: Validate active bootstrap runner prerequisites - MUST be preserved and not reconfigured
+          SLOT1_DIR="$HOME/actions-runner-madeena-devops"
+          SLOT1_EXPECTED_NAME="simama-production-server"
+          echo "=== Validating Bootstrap Slot 1 ($SLOT1_DIR) ==="
+          if [ ! -d "$SLOT1_DIR" ]; then
+            echo "ERROR: Bootstrap Slot 1 directory ($SLOT1_DIR) does not exist!" >&2
+            exit 1
+          fi
+          if [ ! -f "$SLOT1_DIR/.runner" ]; then
+            echo "ERROR: Bootstrap Slot 1 configuration ($SLOT1_DIR/.runner) not found!" >&2
+            exit 1
+          fi
+          if [ ! -f "$SLOT1_DIR/svc.sh" ] || [ ! -f "$SLOT1_DIR/config.sh" ] || [ ! -f "$SLOT1_DIR/run.sh" ]; then
+            echo "ERROR: Bootstrap Slot 1 ($SLOT1_DIR) is missing required service or runner scripts (svc.sh, config.sh, run.sh)!" >&2
+            exit 1
+          fi
 
-            if [ "$i" -eq 1 ]; then
-              RUNNER_DIR="$HOME/actions-runner-madeena-devops"
-              RUNNER_NAME="simama-production-${HOST_NAME}"
-            else
-              RUNNER_DIR="$HOME/actions-runner-madeena-devops-${i}"
-              RUNNER_NAME="simama-production-${HOST_NAME}-${i}"
-            fi
+          SLOT1_META_NAME="$(read_runner_metadata "$SLOT1_DIR" "agentName")"
+          if [ -n "$SLOT1_META_NAME" ] && [ "$SLOT1_META_NAME" != "$SLOT1_EXPECTED_NAME" ]; then
+            echo "ERROR: Bootstrap Slot 1 ($SLOT1_DIR) agentName '$SLOT1_META_NAME' does not match expected '$SLOT1_EXPECTED_NAME'!" >&2
+            exit 1
+          fi
 
-            echo "=== Checking runner $i/$TOTAL_RUNNERS ($RUNNER_NAME in $RUNNER_DIR) ==="
-            mkdir -p "$RUNNER_DIR"
+          SLOT1_URL="$(read_runner_metadata "$SLOT1_DIR" "gitHubUrl")"
+          SLOT1_NORM_URL="${SLOT1_URL%/}"
+          TARGET_NORM_URL="${RUNNER_TARGET_URL%/}"
+          if [ -n "$SLOT1_NORM_URL" ] && [ "$SLOT1_NORM_URL" != "$TARGET_NORM_URL" ]; then
+            echo "ERROR: Bootstrap Slot 1 ($SLOT1_DIR) URL '$SLOT1_URL' does not match expected '$RUNNER_TARGET_URL'!" >&2
+            exit 1
+          fi
 
-            if [ ! -f "$RUNNER_DIR/.runner" ]; then
-              echo "Configuring runner $i ($RUNNER_NAME) with fresh slot registration token..."
+          SLOT1_POOL="$(read_runner_metadata "$SLOT1_DIR" "poolName")"
+          if [ -n "$SLOT1_POOL" ] && [ "$SLOT1_POOL" != "$RUNNER_GROUP" ]; then
+            echo "ERROR: Bootstrap Slot 1 ($SLOT1_DIR) poolName '$SLOT1_POOL' does not match expected '$RUNNER_GROUP'!" >&2
+            exit 1
+          fi
+
+          if ! _sudo "$SLOT1_DIR/svc.sh" status >/dev/null 2>&1; then
+            echo "ERROR: Bootstrap Slot 1 ($SLOT1_DIR) systemd service status check failed. Service is not in active/running state!" >&2
+            exit 1
+          fi
+          echo "Slot 1 bootstrap runner verified (valid configuration and active service). Preserving Slot 1."
+
+          # Slots 2 through 5: Inspect and idempotently configure/start
+          for i in $(seq 2 "$TOTAL_RUNNERS"); do
+            RUNNER_DIR="$HOME/actions-runner-madeena-devops-${i}"
+            RUNNER_NAME="simama-production-${HOST_NAME}-${i}"
+
+            echo "=== Checking Slot $i/$TOTAL_RUNNERS ($RUNNER_NAME in $RUNNER_DIR) ==="
+
+            if [ ! -d "$RUNNER_DIR" ] || [ -z "$(ls -A "$RUNNER_DIR" 2>/dev/null)" ]; then
+              echo "Slot $i ($RUNNER_NAME) is missing; configuring new runner instance..."
+              mkdir -p "$RUNNER_DIR"
               ensure_archive
               tar -xzf "$ARCHIVE_CACHE" -C "$RUNNER_DIR"
+
+              SLOT_TOKEN="$(get_registration_token)"
+              test -n "$SLOT_TOKEN"
+              echo "::add-mask::$SLOT_TOKEN"
+
               (
                 cd "$RUNNER_DIR"
                 ./config.sh --unattended \
                   --url "$RUNNER_TARGET_URL" \
-                  --token "$CURRENT_SLOT_TOKEN" \
+                  --token "$SLOT_TOKEN" \
                   --name "$RUNNER_NAME" \
                   --runnergroup "$RUNNER_GROUP" \
                   --labels self-hosted,linux,x64,production \
                   --work _work
               )
-            else
-              echo "Runner $i ($RUNNER_NAME) is already configured; preserving its registration."
-            fi
 
-            if ! _sudo "$RUNNER_DIR/svc.sh" status >/dev/null 2>&1; then
               echo "Installing systemd service for runner $i..."
               _sudo "$RUNNER_DIR/svc.sh" install
-            fi
+              echo "Starting systemd service for runner $i..."
+              _sudo "$RUNNER_DIR/svc.sh" start
+              _sudo "$RUNNER_DIR/svc.sh" status
+              echo "Runner $i service is active."
 
-            echo "Ensuring service is running for runner $i..."
-            _sudo "$RUNNER_DIR/svc.sh" start >/dev/null 2>&1 \
-              || _sudo "$RUNNER_DIR/svc.sh" restart >/dev/null 2>&1
-            _sudo "$RUNNER_DIR/svc.sh" status
-            echo "Runner $i service is active."
+            elif validate_slot_identity "$RUNNER_DIR" "$RUNNER_NAME" "$RUNNER_TARGET_URL" "$RUNNER_GROUP"; then
+              echo "Slot $i ($RUNNER_NAME) metadata and identity verified; preserving registration."
+              if [ ! -f "$RUNNER_DIR/.service" ]; then
+                echo "Runner $i service is not installed; installing and starting service..."
+                _sudo "$RUNNER_DIR/svc.sh" install
+                _sudo "$RUNNER_DIR/svc.sh" start
+                _sudo "$RUNNER_DIR/svc.sh" status
+                echo "Runner $i service is now active."
+              elif _sudo "$RUNNER_DIR/svc.sh" status >/dev/null 2>&1; then
+                echo "Runner $i service is already active."
+              else
+                echo "Runner $i service is installed but stopped; starting service..."
+                _sudo "$RUNNER_DIR/svc.sh" start
+                _sudo "$RUNNER_DIR/svc.sh" status
+                echo "Runner $i service is now active."
+              fi
+
+            else
+              echo "ERROR: Slot $i ($RUNNER_DIR) exists but failed identity/metadata validation." >&2
+              echo "Existing directory state is ambiguous or inconsistent. Stopping to avoid destructive recreation without authority." >&2
+              exit 1
+            fi
           done
 
-          echo "All $TOTAL_RUNNERS runner services are active in group: $RUNNER_GROUP"
-          REMOTE_SCRIPT
-          )
-
-          {
-            printf '%s\n' "$TOKEN_1"
-            printf '%s\n' "$TOKEN_2"
-            printf '%s\n' "$TOKEN_3"
-            printf '%s\n' "$TOKEN_4"
-            printf '%s\n' "$TOKEN_5"
-            printf '%s\n' "$SUDO_PASSWORD"
-            printf '%s\n' "$RUNNER_VERSION"
-            printf '%s\n' "$RUNNER_ASSET"
-            printf '%s\n' "$RUNNER_SHA256"
-            printf '%s\n' "$RUNNER_SCOPE"
-            printf '%s\n' "$RUNNER_GROUP"
-            printf '%s\n' "$RUNNER_TARGET_URL"
-          } | ssh "${SSH_ARGS[@]}" "$SSH_USER@$SSH_HOST" \
-            "bash -c $(printf '%q' "$REMOTE_SCRIPT")"
-
-      - name: Verify remote runner service
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-          echo 'Remote runner pool configured successfully.'
+          echo "All $TOTAL_RUNNERS runner slots verified/active in group: $RUNNER_GROUP"
 
   verify-self-hosted:
     name: Verify runner pool concurrency (job ${{ matrix.job_index }}/5)
     needs: provision
-    if: ${{ always() && (inputs.verify_only || needs.provision.result == 'success') }}
+    if: ${{ !cancelled() && (inputs.verify_only || needs.provision.result == 'success') }}
     runs-on: [self-hosted, linux, x64, production]
     timeout-minutes: 5
     strategy:
@@ -326,7 +314,7 @@ jobs:
   assert-runner-pool:
     name: Assert 5 distinct concurrent runners
     needs: verify-self-hosted
-    if: ${{ always() && (inputs.verify_only || needs.provision.result == 'success') }}
+    if: ${{ !cancelled() && needs.verify-self-hosted.result == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
 

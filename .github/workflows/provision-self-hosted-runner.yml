@@ -199,7 +199,10 @@ jobs:
             exit 1
           fi
 
-          if ! _sudo "$SLOT1_DIR/svc.sh" status >/dev/null 2>&1; then
+          if ! (
+            cd "$SLOT1_DIR"
+            _sudo ./svc.sh status >/dev/null 2>&1
+          ); then
             echo "ERROR: Bootstrap Slot 1 ($SLOT1_DIR) systemd service status check failed. Service is not in active/running state!" >&2
             exit 1
           fi
@@ -234,26 +237,37 @@ jobs:
               )
 
               echo "Installing systemd service for runner $i..."
-              _sudo "$RUNNER_DIR/svc.sh" install
-              echo "Starting systemd service for runner $i..."
-              _sudo "$RUNNER_DIR/svc.sh" start
-              _sudo "$RUNNER_DIR/svc.sh" status
+              (
+                cd "$RUNNER_DIR"
+                _sudo ./svc.sh install
+                _sudo ./svc.sh start
+                _sudo ./svc.sh status
+              )
               echo "Runner $i service is active."
 
             elif validate_slot_identity "$RUNNER_DIR" "$RUNNER_NAME" "$RUNNER_TARGET_URL" "$RUNNER_GROUP"; then
               echo "Slot $i ($RUNNER_NAME) metadata and identity verified; preserving registration."
               if [ ! -f "$RUNNER_DIR/.service" ]; then
                 echo "Runner $i service is not installed; installing and starting service..."
-                _sudo "$RUNNER_DIR/svc.sh" install
-                _sudo "$RUNNER_DIR/svc.sh" start
-                _sudo "$RUNNER_DIR/svc.sh" status
+                (
+                  cd "$RUNNER_DIR"
+                  _sudo ./svc.sh install
+                  _sudo ./svc.sh start
+                  _sudo ./svc.sh status
+                )
                 echo "Runner $i service is now active."
-              elif _sudo "$RUNNER_DIR/svc.sh" status >/dev/null 2>&1; then
+              elif (
+                cd "$RUNNER_DIR"
+                _sudo ./svc.sh status >/dev/null 2>&1
+              ); then
                 echo "Runner $i service is already active."
               else
                 echo "Runner $i service is installed but stopped; starting service..."
-                _sudo "$RUNNER_DIR/svc.sh" start
-                _sudo "$RUNNER_DIR/svc.sh" status
+                (
+                  cd "$RUNNER_DIR"
+                  _sudo ./svc.sh start
+                  _sudo ./svc.sh status
+                )
                 echo "Runner $i service is now active."
               fi
 

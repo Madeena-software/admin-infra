@@ -48,7 +48,7 @@ jobs:
             exit 1
           fi
 
-          for cmd in curl tar sha256sum gh; do
+          for cmd in curl tar sha256sum; do
             if command -v "$cmd" >/dev/null 2>&1; then
               echo "Prerequisite available: $cmd"
             else
@@ -56,6 +56,18 @@ jobs:
               exit 1
             fi
           done
+
+          JSON_PARSER=""
+          if command -v python3 >/dev/null 2>&1; then
+            JSON_PARSER="python3"
+            echo "Prerequisite available: python3 (selected JSON parser)"
+          elif command -v jq >/dev/null 2>&1; then
+            JSON_PARSER="jq"
+            echo "Prerequisite available: jq (selected JSON parser)"
+          else
+            echo "ERROR: JSON parser unavailable; require python3 or jq" >&2
+            exit 1
+          fi
 
           REGISTRATION_SCOPE=organization
           RUNNER_GROUP=madeena-devops
@@ -77,15 +89,63 @@ jobs:
             API_AUTH_TOKEN="${GH_TOKEN:-}"
           fi
 
+          github_rest_api() {
+            local method="$1"
+            local path="$2"
+            local use_auth="${3:-false}"
+            local url="https://api.github.com/${path#/}"
+
+            case "$url" in
+              https://api.github.com/*) ;;
+              *)
+                echo "ERROR: Invalid GitHub API URL target: $url" >&2
+                return 1
+                ;;
+            esac
+
+            local curl_args=(
+              --silent
+              --show-error
+              --fail
+              --location
+              --retry 3
+              --retry-connrefused
+              -X "$method"
+              -H "Accept: application/vnd.github+json"
+              -H "X-GitHub-Api-Version: 2026-03-10"
+            )
+
+            if [ "$use_auth" = "true" ]; then
+              if [ -z "${API_AUTH_TOKEN:-}" ]; then
+                echo "ERROR: GitHub API authentication token is required but empty." >&2
+                return 1
+              fi
+              curl_args+=(-H "Authorization: Bearer $API_AUTH_TOKEN")
+            fi
+
+            curl "${curl_args[@]}" "$url"
+          }
+
           get_registration_token() {
-            local token=""
-            if ! token="$(GH_TOKEN="$API_AUTH_TOKEN" gh api --method POST \
-              orgs/Madeena-software/actions/runners/registration-token \
-              --jq '.token' 2>/dev/null)" || [ -z "$token" ] || [ "$token" = "null" ]; then
+            local raw_token=""
+            local api_err=0
+
+            if [ "$JSON_PARSER" = "python3" ]; then
+              raw_token="$(github_rest_api POST "orgs/Madeena-software/actions/runners/registration-token" true 2>/dev/null \
+                | python3 -c "import json, sys; d = json.load(sys.stdin); t = d.get('token'); print(t, end='') if (t and isinstance(t, str)) else sys.exit(1)" 2>/dev/null)" || api_err=1
+            elif [ "$JSON_PARSER" = "jq" ]; then
+              raw_token="$(github_rest_api POST "orgs/Madeena-software/actions/runners/registration-token" true 2>/dev/null \
+                | jq -er '.token // empty' 2>/dev/null)" || api_err=1
+            else
+              api_err=1
+            fi
+
+            if [ "$api_err" -ne 0 ] || [ -z "$raw_token" ] || [ "$raw_token" = "null" ]; then
               echo "ERROR: Organization runner registration token unavailable. Organization-level registration in Madeena-software is required." >&2
               return 1
             fi
-            printf '%s' "$token"
+
+            printf '%s' "$raw_token"
           }
 
           read_runner_metadata() {
@@ -94,9 +154,9 @@ jobs:
             if [ ! -f "$dir/.runner" ]; then
               return 1
             fi
-            if command -v python3 >/dev/null 2>&1; then
+            if [ "$JSON_PARSER" = "python3" ]; then
               python3 -c "import json, sys; d = json.load(open('$dir/.runner')); print(str(next((v for k, v in d.items() if k.lower() == '$key'.lower()), '')))" 2>/dev/null || true
-            elif command -v jq >/dev/null 2>&1; then
+            elif [ "$JSON_PARSER" = "jq" ]; then
               jq -r --arg k "$key" 'to_entries[] | select(.key | ascii_downcase == ($k | ascii_downcase)) | .value // empty' "$dir/.runner" 2>/dev/null | head -n 1 || true
             else
               sed -nE "s/.*\"($key)\"[[:space:]]*:[[:space:]]*\"([^\"]+)\".*/\\2/Ip" "$dir/.runner" 2>/dev/null | head -n 1
@@ -147,21 +207,62 @@ jobs:
               return 0
             fi
 
-            local runner_version
-            local runner_asset
-            local runner_sha256
-            local runner_url
+            local release_tmp
+            release_tmp="$(mktemp /tmp/actions-runner-release.XXXXXX.json)"
+            trap 'rm -f "${release_tmp:-}"' RETURN
 
-            runner_version="$(GH_TOKEN="$API_AUTH_TOKEN" gh api repos/actions/runner/releases/latest --jq '.tag_name')"
-            runner_asset="actions-runner-linux-x64-${runner_version#v}.tar.gz"
-            runner_sha256="$(GH_TOKEN="$API_AUTH_TOKEN" gh api repos/actions/runner/releases/latest \
-              --jq ".assets[] | select(.name == \"${runner_asset}\") | .digest" \
-              | sed 's/^sha256://')"
+            if ! github_rest_api GET "repos/actions/runner/releases/latest" false > "$release_tmp"; then
+              echo "ERROR: Failed to fetch latest actions/runner release metadata from GitHub API." >&2
+              rm -f "${release_tmp:-}"
+              return 1
+            fi
 
-            test -n "$runner_version"
-            test -n "$runner_sha256"
+            local runner_meta=""
+            local parse_err=0
+            if [ "$JSON_PARSER" = "python3" ]; then
+              runner_meta="$(python3 -c "import json, sys; d = json.load(open(sys.argv[1])); tag = d.get('tag_name', ''); ver = tag[1:] if tag.startswith('v') else tag; asset = f'actions-runner-linux-x64-{ver}.tar.gz'; matched = next((a for a in d.get('assets', []) if a.get('name') == asset), None); sys.exit(1) if not (tag and matched and matched.get('digest', '').startswith('sha256:')) else print('\n'.join([tag, asset, matched['digest'][7:], matched.get('browser_download_url', f'https://github.com/actions/runner/releases/download/{tag}/{asset}')]))" "$release_tmp")" || parse_err=1
+            elif [ "$JSON_PARSER" = "jq" ]; then
+              runner_meta="$(jq -er '
+                .tag_name as $tag |
+                if ($tag == null or $tag == "") then error("missing tag_name") else . end |
+                ($tag | if startswith("v") then .[1:] else . end) as $ver |
+                ("actions-runner-linux-x64-" + $ver + ".tar.gz") as $expected_name |
+                ([.assets[] | select(.name == $expected_name)][0]) as $asset |
+                if ($asset == null) then error("missing asset " + $expected_name) else . end |
+                $asset.digest as $digest |
+                if ($digest == null or ($digest | startswith("sha256:") | not)) then error("invalid digest") else . end |
+                ($digest | .[7:]) as $raw_sha |
+                ($asset.browser_download_url // ("https://github.com/actions/runner/releases/download/" + $tag + "/" + $expected_name)) as $url |
+                "\($tag)\n\($expected_name)\n\($raw_sha)\n\($url)"
+              ' "$release_tmp")" || parse_err=1
+            else
+              parse_err=1
+            fi
 
-            runner_url="https://github.com/actions/runner/releases/download/${runner_version}/${runner_asset}"
+            rm -f "${release_tmp:-}"
+
+            if [ "$parse_err" -ne 0 ] || [ -z "$runner_meta" ]; then
+              echo "ERROR: Failed to parse latest actions/runner release metadata or locate linux-x64 asset with sha256 digest." >&2
+              return 1
+            fi
+
+            local runner_version=""
+            local runner_asset=""
+            local runner_sha256=""
+            local runner_url=""
+
+            {
+              read -r runner_version
+              read -r runner_asset
+              read -r runner_sha256
+              read -r runner_url
+            } <<< "$runner_meta"
+
+            if [ -z "$runner_version" ] || [ -z "$runner_asset" ] || [ -z "$runner_sha256" ] || [ -z "$runner_url" ]; then
+              echo "ERROR: Extracted runner release metadata fields are incomplete." >&2
+              return 1
+            fi
+
             ARCHIVE_CACHE="/tmp/${runner_asset}"
 
             if [ -f "$ARCHIVE_CACHE" ] && ! (printf '%s  %s\n' "$runner_sha256" "$ARCHIVE_CACHE" | sha256sum --check --status >/dev/null 2>&1); then

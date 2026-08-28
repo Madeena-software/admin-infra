@@ -72,7 +72,7 @@ risk, syntax, and operational authorization before production use.
 
 ### Active tasks
 
-No repository-specific task is established by this context file.
+- [bootstrap-five-runner-pool.md](file:///var/www/admin-infra/.agents/tasks/bootstrap-five-runner-pool.md) — Bootstrap Five-Runner Organization Pool via Existing Self-Hosted Runner (Validated/Published)
 
 ### Blocking items
 
@@ -82,5 +82,5 @@ No repository-specific task is established by this context file.
 
 ## Accepted baseline
 
-`unknown` — establish after the initial repository commit is reviewed and
-accepted.
+`4eea91539493308be4a9a680c4daab5f88fa09ce`
+

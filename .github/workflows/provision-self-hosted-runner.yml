@@ -33,11 +33,21 @@ jobs:
 
           test -n "$SUDO_PASSWORD"
 
+          echo "Runner execution identity:"
+          whoami
+          id
+          groups
+
           _sudo() {
             printf '%s\n' "$SUDO_PASSWORD" | sudo -S -p '' "$@"
           }
 
-          _sudo -v
+          if ! printf '%s\n' "$SUDO_PASSWORD" | sudo -S -p '' -v; then
+            echo "ERROR: sudo authentication failed for runner user: $(whoami)" >&2
+            echo "Verify that SUDO_PASSWORD belongs to this Linux user and that the user is permitted to sudo." >&2
+            exit 1
+          fi
+
           command -v curl >/dev/null
           command -v tar >/dev/null
           command -v sha256sum >/dev/null

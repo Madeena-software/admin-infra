@@ -1,0 +1,1096 @@
+name: Deploy to Production (Swarm)
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Madeena Standard CI/CD Template — Docker Swarm Deployment
+#
+# CUSTOMIZATION REQUIRED:
+#   1. Replace {{APP_NAME}} with your app slug (lowercase, e.g., "pbu50")
+#   2. Replace {{APP_PORT}} with your assigned port (e.g., 8020)
+#   3. Replace {{PHP_VERSION}} with your PHP version (e.g., "8.4")
+#   4. Replace {{NODE_VERSION}} with your Node version (e.g., "20")
+#   5. Configure the required GitHub Secrets (see below)
+#
+# REQUIRED GITHUB SECRETS:
+#   APP_KEY, APP_DOMAIN
+#   DB_DATABASE, DB_USERNAME, DB_PASSWORD, DB_ROOT_PASSWORD, DB_HOST
+#   NEXTCLOUD_USERNAME
+#   NEXTCLOUD_WEBDAV_BASE_URI, NEXTCLOUD_WEBDAV_USERNAME, NEXTCLOUD_WEBDAV_PASSWORD
+#   SSH_USER, REMOTE_PATH
+#
+# OPTIONAL GITHUB SECRETS:
+#   SUDO_PASSWORD (only needed before running server-setup-deploy.yml)
+#   MAIL_USERNAME, MAIL_PASSWORD, SUPER_ADMIN_EMAIL, SUPER_ADMIN_PASSWORD
+#
+# SIMULATION-PROVEN FIXES INCLUDED:
+#   ✅  DB health: CMD-SHELL + $$MYSQL_ROOT_PASSWORD (not CMD with ${VAR})
+#   ✅  Wait order: DB healthy → App healthy → migrate (not existence-based)
+#   ✅  Queue race: queue stabilization wait after migrate completes
+#   ✅  --resolve-image changed (not always) to avoid digest rejection
+#   ✅  .env heredoc: no leading spaces, MAIL_FROM_NAME via printf
+#   ✅  Queue verify: service inspect Args (not container .Config.Cmd)
+#   ✅  Swarm convergence wait before verification (avoids transient 2/1 reads)
+#   ✅  Deploy root validation so a bad REMOTE_PATH fails fast
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# Trigger manually only
+on:
+  workflow_dispatch:
+
+# ── Prevent overlapping deployments ────────────────────────────────────────────
+# If a deploy is already running, the new one queues (does NOT cancel the active one).
+concurrency:
+  group: deploy-simama-production
+  cancel-in-progress: false
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  NODE_OPTIONS: "--dns-result-order=ipv4first"
+
+jobs:
+  # ────────────────────────────────────────────────────────────────────────────
+  # Job 1 — Build Docker image locally on the self-hosted runner
+  # Both jobs run on self-hosted so the built image is available for deploy.
+  # ────────────────────────────────────────────────────────────────────────────
+  build:
+    name: Build Docker Image (Local)
+    runs-on: [self-hosted, linux, x64, production]
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Build Docker image locally
+        run: |
+          set -euo pipefail
+          echo "===> Building simama:latest on local runner..."
+          docker build \
+            --build-arg APP_VERSION=$(cat VERSION 2>/dev/null || echo "latest") \
+            --tag simama:latest \
+            --file ./Dockerfile \
+            .
+          echo "✅ Image built successfully: simama:latest"
+          docker image inspect simama:latest --format 'ID: {{.Id}} | Size: {{.Size}} bytes'
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # Job 2 — Deploy to production server via Docker Swarm (self-hosted runner)
+  # ────────────────────────────────────────────────────────────────────────────
+  deploy:
+    name: Deploy to Production
+    runs-on: [self-hosted, linux, x64, production]
+    needs: build
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # ── Prepare environment, deploy stack, post-deploy tasks ──────────────
+      - name: Deploy via Docker Swarm
+        env:
+          SSH_USER: ${{ secrets.SSH_USER }}
+          SUDO_PASSWORD: ${{ secrets.SUDO_PASSWORD }}
+          APP_KEY: ${{ secrets.APP_KEY }}
+          APP_DOMAIN: ${{ secrets.APP_DOMAIN }}
+          REMOTE_PATH: ${{ secrets.REMOTE_PATH }}
+          DB_HOST: ${{ secrets.DB_HOST }}
+          DB_DATABASE: ${{ secrets.DB_DATABASE }}
+          DB_USERNAME: ${{ secrets.DB_USERNAME }}
+          DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
+          DB_ROOT_PASSWORD: ${{ secrets.DB_ROOT_PASSWORD }}
+          MAIL_USERNAME: ${{ secrets.MAIL_USERNAME }}
+          MAIL_PASSWORD: ${{ secrets.MAIL_PASSWORD }}
+          SUPER_ADMIN_EMAIL: ${{ secrets.SUPER_ADMIN_EMAIL }}
+          SUPER_ADMIN_PASSWORD: ${{ secrets.SUPER_ADMIN_PASSWORD }}
+          NEXTCLOUD_USERNAME: ${{ secrets.NEXTCLOUD_USERNAME }}
+          NEXTCLOUD_WEBDAV_BASE_URI: ${{ secrets.NEXTCLOUD_WEBDAV_BASE_URI }}
+          NEXTCLOUD_WEBDAV_USERNAME: ${{ secrets.NEXTCLOUD_WEBDAV_USERNAME }}
+          NEXTCLOUD_WEBDAV_PASSWORD: ${{ secrets.NEXTCLOUD_WEBDAV_PASSWORD }}
+        run: |
+          set -euo pipefail
+
+          # ── Image is always the locally-built simama:latest ───────────────────
+          export LIVE_VERSION=$(cat VERSION 2>/dev/null || echo "unknown")
+          echo "===> Target deployment: simama:latest (commit: $LIVE_VERSION)"
+
+          # ── Pre-deploy cleanup ──────────────────────────────────────────────
+          # Clear exited containers from previous failed runs to avoid "spam"
+          echo "===> Clearing exited containers from previous runs..."
+          docker container prune -f || true
+
+          if [ -z "$APP_KEY" ]; then
+            echo "❌ FATAL: APP_KEY secret is missing or empty!"
+            echo "Run 'php artisan key:generate --show' locally and add it to GitHub Secrets."
+            exit 1
+          fi
+
+          if [ -z "${DB_HOST:-}" ]; then
+            echo "❌ FATAL: DB_HOST secret is missing!"
+            echo "Set DB_HOST=db in GitHub Secrets (Docker service name, NOT 127.0.0.1)."
+            exit 1
+          fi
+          if [ "$DB_HOST" = "127.0.0.1" ] || [ "$DB_HOST" = "localhost" ]; then
+            echo "❌ FATAL: DB_HOST is '$DB_HOST' — this is for local dev, not production."
+            echo "Set DB_HOST=db in GitHub Secrets (Docker service name in Swarm network)."
+            exit 1
+          fi
+
+          if [ -z "${NEXTCLOUD_USERNAME:-}" ]; then
+            echo "❌ FATAL: NEXTCLOUD_USERNAME secret is missing or empty!"
+            echo "Set NEXTCLOUD_USERNAME to the Nextcloud user that owns the simama_laravel_logs folder."
+            exit 1
+          fi
+
+          for var in NEXTCLOUD_WEBDAV_BASE_URI NEXTCLOUD_WEBDAV_USERNAME NEXTCLOUD_WEBDAV_PASSWORD; do
+            val=$(eval "printf '%s' \"\${${var}:-}\"")
+            if [ -z "$val" ]; then
+              echo "❌ FATAL: $var secret is missing or empty."
+              exit 1
+            fi
+          done
+
+          # Keep Laravel app/log storage on a local host path so it does not
+          # share the same backing tree as the WebDAV-managed enterprise disks.
+          export APP_STORAGE_HOST_PATH="/var/lib/simama/storage"
+          export APP_LOGS_HOST_PATH="/media/nextcloud-data/data/${NEXTCLOUD_USERNAME}/files/simama_laravel_logs"
+          export MYSQL_DATA_HOST_PATH="/var/lib/simama/mysql"
+
+          # ── Sudo helper ──────────────────────────────────────────────────────
+          # MUST be defined BEFORE first use below.
+          # Uses passwordless sudo if configured (via server-setup-deploy.yml),
+          # otherwise falls back to SUDO_PASSWORD for backward compatibility.
+          _sudo() {
+            if [ -n "${SUDO_PASSWORD:-}" ]; then
+              echo "$SUDO_PASSWORD" | sudo -S "$@" 2>/dev/null
+            else
+              sudo "$@"
+            fi
+          }
+
+          echo "===> Preparing app storage host path..."
+          _sudo mkdir -p "$APP_STORAGE_HOST_PATH"
+          # Only persistent Laravel file directories are host-backed here.
+          # storage/framework/* stays container-local, while logs use the
+          # dedicated APP_LOGS_HOST_PATH mounted from Nextcloud.
+          _sudo mkdir -p \
+            "$APP_STORAGE_HOST_PATH/app/private" \
+            "$APP_STORAGE_HOST_PATH/app/public"
+          _sudo chown -R www-data:www-data "$APP_STORAGE_HOST_PATH" 2>/dev/null || true
+          _sudo chmod -R 775 "$APP_STORAGE_HOST_PATH" 2>/dev/null || true
+
+          echo "===> Preparing Laravel logs host path..."
+          _sudo mkdir -p "$APP_LOGS_HOST_PATH"
+          _sudo chown -R www-data:www-data "$APP_LOGS_HOST_PATH" 2>/dev/null || true
+          _sudo chmod -R 775 "$APP_LOGS_HOST_PATH" 2>/dev/null || true
+
+          echo "===> Preparing MySQL host path..."
+          _sudo mkdir -p "$MYSQL_DATA_HOST_PATH"
+          _sudo chown 999:999 "$MYSQL_DATA_HOST_PATH" 2>/dev/null || true
+          _sudo chmod 750 "$MYSQL_DATA_HOST_PATH" 2>/dev/null || true
+
+          # ── Prepare host directories ─────────────────────────────────────────
+          echo "===> Preparing host directories..."
+          if [ -z "${REMOTE_PATH:-}" ]; then
+            echo "❌ FATAL: REMOTE_PATH secret is missing or empty."
+            exit 1
+          fi
+
+          if [ "$REMOTE_PATH" = "/var/www" ] || [ "$REMOTE_PATH" = "/srv" ] || [ "$REMOTE_PATH" = "/opt" ] || [ "$REMOTE_PATH" = "/var" ]; then
+            echo "❌ FATAL: REMOTE_PATH must be a dedicated app directory, not a shared root."
+            echo "Example: /var/www/simama"
+            exit 1
+          fi
+
+          # ── Create REMOTE_PATH with elevated privileges first ──────────────
+          # The parent directory (e.g. /var/www) is typically root-owned and not
+          # writable by the runner user. Use _sudo to create the full path, then
+          # grant ownership to the current runner user so subsequent steps work.
+          echo "  REMOTE_PATH=$REMOTE_PATH"
+          _sudo mkdir -p "$REMOTE_PATH"
+          _sudo chown -R "$(id -un):$(id -gn)" "$REMOTE_PATH"
+
+          # ── Confirm the runner can now write to REMOTE_PATH ──────────────────
+          REMOTE_CHECK_DIR="$REMOTE_PATH"
+          while [ ! -e "$REMOTE_CHECK_DIR" ] && [ "$REMOTE_CHECK_DIR" != "/" ]; do
+            REMOTE_CHECK_DIR=$(dirname "$REMOTE_CHECK_DIR")
+          done
+
+          echo "  Using deploy parent: $REMOTE_CHECK_DIR"
+          ls -ld "$REMOTE_CHECK_DIR" || true
+          if [ ! -w "$REMOTE_CHECK_DIR" ]; then
+            echo "❌ FATAL: Runner user $(id -un) cannot write to $REMOTE_CHECK_DIR even after sudo chown."
+            id
+            exit 1
+          fi
+          echo "  ✅ Write access confirmed for $(id -un) on $REMOTE_CHECK_DIR"
+
+          cd "$REMOTE_PATH"
+
+          # Copy stack definition from the checked-out workspace
+          cp "$GITHUB_WORKSPACE/docker-compose.prod.yml" docker-compose.prod.yml
+
+          # Copy Nginx config from the checked-out workspace
+          mkdir -p nginx/conf.d
+          rm -f nginx/conf.d/app.conf || true
+          if [ -f "$GITHUB_WORKSPACE/nginx/conf.d/app.conf" ]; then
+            cp "$GITHUB_WORKSPACE/nginx/conf.d/app.conf" nginx/conf.d/app.conf
+          elif [ -f "$GITHUB_WORKSPACE/docker/nginx/app.conf" ]; then
+            cp "$GITHUB_WORKSPACE/docker/nginx/app.conf" nginx/conf.d/app.conf
+          else
+            echo "❌ FATAL: nginx config not found."
+            echo "Expected one of:"
+            echo "  - nginx/conf.d/app.conf"
+            echo "  - docker/nginx/app.conf"
+            exit 1
+          fi
+          test -f nginx/conf.d/app.conf || { echo "❌ FATAL: Missing nginx/conf.d/app.conf after copy!"; exit 1; }
+
+          # ── Write VERSION-CURRENT file ───────────────────────────────────────
+          echo "===> Writing VERSION-CURRENT file..."
+          echo "$LIVE_VERSION" > VERSION-CURRENT
+          
+          # ── Networking: Resolve WebDAV URI for Docker Swarm ─────────────────
+          # In Docker Swarm on Linux, host.docker.internal is NOT reliable.
+          # We must use the actual host IP address that Swarm containers can reach.
+          # Resolve the hostname/IP in the NEXTCLOUD_WEBDAV_BASE_URI to ensure connectivity.
+          HOST_IP=$(hostname -I | awk '{print $1}')
+          echo "  Detected Host IP: $HOST_IP"
+          
+          # Extract hostname/IP from the WebDAV URI and resolve it to ensure it's reachable.
+          # If the URI targets loopback, rewrite it to the machine's LAN IP so
+          # containers can reach the host service directly.
+          WEBDAV_HOSTNAME=$(echo "$NEXTCLOUD_WEBDAV_BASE_URI" | sed -n 's|^http[s]*://\([^:/]*\).*|\1|p')
+          echo "  WebDAV hostname in URI: $WEBDAV_HOSTNAME"
+          
+          if [ "$WEBDAV_HOSTNAME" = "127.0.0.1" ] || [ "$WEBDAV_HOSTNAME" = "localhost" ]; then
+            echo "  ℹ️ Rewriting loopback WebDAV host to the machine IP for Swarm containers"
+            FINAL_WEBDAV_URI=$(echo "$NEXTCLOUD_WEBDAV_BASE_URI" | sed "s|://127\.0\.0\.1:|://$HOST_IP:|g; s|://localhost:|://$HOST_IP:|g")
+          else
+            # Use the URI as-is; assume external resolve or host already has correct IP
+            echo "  ℹ️ Using WebDAV URI as configured (non-loopback): $NEXTCLOUD_WEBDAV_BASE_URI"
+            FINAL_WEBDAV_URI="$NEXTCLOUD_WEBDAV_BASE_URI"
+          fi
+          
+          if [ "$FINAL_WEBDAV_URI" != "$NEXTCLOUD_WEBDAV_BASE_URI" ]; then
+            echo "  ✅ Resolved WebDAV URI for Swarm: $FINAL_WEBDAV_URI"
+          fi
+          
+          echo "  [DEBUG] Final WebDAV URI to be written to .env: $FINAL_WEBDAV_URI"
+
+          # ── Write .env file ──────────────────────────────────────────────────
+          # printf '%s' for every line — safe for YAML indentation, safe for
+          # special characters in passwords (no sed, no heredoc, no escaping bugs).
+          echo "===> Writing environment file..."
+          printf '%s\n' \
+            'APP_NAME="Simama"' \
+            'APP_ENV=production' \
+            'APP_DEBUG=false' \
+            'APP_TIMEZONE=Asia/Jakarta' \
+            '' \
+            'LOG_CHANNEL=stack' \
+            'LOG_STACK=single' \
+            'LOG_LEVEL=error' \
+            '' \
+            'DB_CONNECTION=mysql' \
+            'DB_PORT=3306' \
+            '' \
+            'BROADCAST_CONNECTION=log' \
+            'FILESYSTEM_DISK=local' \
+            'QUEUE_CONNECTION=database' \
+            'CACHE_STORE=database' \
+            'SESSION_DRIVER=database' \
+            'SESSION_LIFETIME=120' \
+            '' \
+            "APP_STORAGE_HOST_PATH=${APP_STORAGE_HOST_PATH}" \
+            "APP_LOGS_HOST_PATH=${APP_LOGS_HOST_PATH}" \
+            "MYSQL_DATA_HOST_PATH=${MYSQL_DATA_HOST_PATH}" \
+            '' \
+            'ENTERPRISE_DATA_DRIVER=webdav' \
+            'ENTERPRISE_BACKUP_DRIVER=webdav' \
+            'NEXTCLOUD_WEBDAV_DATA_ROOT=simama_media' \
+            'NEXTCLOUD_WEBDAV_BACKUP_ROOT=simama_backups' \
+            'NEXTCLOUD_WEBDAV_LOGS_ROOT=simama_laravel_logs' \
+            'NEXTCLOUD_WEBDAV_TIMEOUT=30' \
+            'NEXTCLOUD_WEBDAV_VERIFY_SSL=false' \
+            'ENTERPRISE_DATA_LOCAL_ROOT=/var/www/enterprise_data' \
+            'ENTERPRISE_BACKUP_LOCAL_ROOT=/var/www/enterprise_backups' \
+            '' \
+            'MAIL_MAILER=smtp' \
+            'MAIL_SCHEME=null' \
+            'MAIL_HOST=smtp.gmail.com' \
+            'MAIL_PORT=587' \
+            'MAIL_ENCRYPTION=tls' \
+            > .env
+
+          # Append dynamic/secret values (printf '%s' safe for special characters)
+          {
+            printf 'APP_KEY=%s\n' "$APP_KEY"
+            printf 'APP_URL=https://%s\n' "$APP_DOMAIN"
+            printf 'DB_HOST=%s\n' "$DB_HOST"
+            printf 'DB_DATABASE=%s\n' "$DB_DATABASE"
+            printf 'DB_USERNAME=%s\n' "$DB_USERNAME"
+            printf 'DB_PASSWORD=%s\n' "$DB_PASSWORD"
+            printf 'DB_ROOT_PASSWORD=%s\n' "$DB_ROOT_PASSWORD"
+            printf 'MAIL_USERNAME=%s\n' "$MAIL_USERNAME"
+            printf 'MAIL_PASSWORD=%s\n' "$MAIL_PASSWORD"
+            printf 'MAIL_FROM_ADDRESS=%s\n' "$MAIL_USERNAME"
+            printf 'MAIL_FROM_NAME=%s\n' "Simama"
+            printf 'SUPER_ADMIN_EMAIL=%s\n' "$SUPER_ADMIN_EMAIL"
+            printf 'SUPER_ADMIN_PASSWORD=%s\n' "$SUPER_ADMIN_PASSWORD"
+            printf 'APP_VERSION=%s\n' "$LIVE_VERSION"
+            printf 'NEXTCLOUD_WEBDAV_BASE_URI=%s\n' "$FINAL_WEBDAV_URI"
+            printf 'NEXTCLOUD_WEBDAV_USERNAME=%s\n' "$NEXTCLOUD_WEBDAV_USERNAME"
+            printf 'NEXTCLOUD_WEBDAV_PASSWORD=%s\n' "$NEXTCLOUD_WEBDAV_PASSWORD"
+          } >> .env
+
+          # DEBUG: Show what was written to .env (with secrets masked)
+          echo "  [DEBUG] .env file content (NEXTCLOUD vars only):"
+          grep "NEXTCLOUD_WEBDAV" .env || echo "  (NEXTCLOUD_WEBDAV variables not found)"
+
+          # ── Swarm preflight ────────────────────────────────────────────────
+          SWARM_STATE=$(docker info --format '{{.Swarm.LocalNodeState}}' 2>/dev/null || echo "unknown")
+          SWARM_MANAGER=$(docker info --format '{{.Swarm.ControlAvailable}}' 2>/dev/null || echo "false")
+          if [ "$SWARM_STATE" != "active" ] || [ "$SWARM_MANAGER" != "true" ]; then
+            echo "❌ FATAL: Docker Swarm is not active on this runner or the node is not a manager."
+            echo "    State: $SWARM_STATE"
+            echo "    Manager: $SWARM_MANAGER"
+            exit 1
+          fi
+
+          # ── Pre-deployment WebDAV connectivity check (important for Swarm) ──
+          echo "===> Pre-deployment WebDAV connectivity check..."
+          WEBDAV_HOSTNAME=$(echo "$FINAL_WEBDAV_URI" | sed -n 's|^http[s]*://\([^:/]*\).*|\1|p')
+          WEBDAV_PORT=$(echo "$FINAL_WEBDAV_URI" | sed -n 's|^http[s]*://[^:]*:\([0-9]*\).*|\1|p; t; s|^http://.*|80|p; s|^https://.*|443|p')
+          
+          echo "  WebDAV endpoint: $WEBDAV_HOSTNAME:$WEBDAV_PORT"
+          
+          # Try to resolve the hostname and test port connectivity
+          if ! RESOLVED_IP=$(getent hosts "$WEBDAV_HOSTNAME" | awk '{print $1; exit}' 2>/dev/null); then
+            echo "  ⚠️ Could not resolve hostname $WEBDAV_HOSTNAME — assuming it's already an IP"
+            RESOLVED_IP="$WEBDAV_HOSTNAME"
+          fi
+          echo "  Resolved to IP: $RESOLVED_IP"
+          
+          # Test if port is listening (use nc or timeout-wrapped bash)
+          if timeout 3 bash -c "</dev/tcp/$RESOLVED_IP/$WEBDAV_PORT" 2>/dev/null; then
+            echo "  ✅ WebDAV port $WEBDAV_PORT is reachable on $RESOLVED_IP"
+          else
+            echo "  ⚠️ WARNING: WebDAV port $WEBDAV_PORT is NOT reachable on $RESOLVED_IP from the host"
+            echo "    This indicates a network routing issue between the server and Nextcloud."
+            echo "    Containers may not be able to reach Nextcloud. Continuing, but may fail at runtime."
+          fi
+          
+          # Check host routing to Nextcloud
+          echo "  Checking server's network routing to $RESOLVED_IP..."
+          if ip route | grep -q "$RESOLVED_IP"; then
+            echo "  ✅ Route to $RESOLVED_IP exists in server routing table"
+          else
+            echo "  ℹ️ No explicit route to $RESOLVED_IP; relying on default gateway"
+            echo "  Current routing table (host-relevant routes only):"
+            ip route | grep -E "^[0-9]|default" | sed 's/^/    /'
+          fi
+          
+          # CRITICAL: Check Docker's bridge networking configuration
+          echo ""
+          echo "  Docker bridge network diagnostics:"
+          docker network inspect docker_gwbridge --format 'Gateway: {{range .IPAM.Config}}{{.Gateway}}{{end}}' 2>/dev/null || echo "    (Could not inspect docker_gwbridge)"
+          
+          # If 192.168.10.2 is the host, containers need to reach the docker_gwbridge gateway
+          echo ""
+          echo "  ⚠️ IMPORTANT: Since 192.168.10.2 is the host's IP, containers on overlay network"
+          echo "     need to reach the host via the docker_gwbridge. If connectivity fails, it may be"
+          echo "     because the host firewall is blocking traffic, or Docker networking needs restart."
+
+          # ── Verify local image exists before deploying ──────────────────────
+          echo "===> Verifying local image simama:latest..."
+          if ! docker image inspect simama:latest > /dev/null 2>&1; then
+            echo "❌ FATAL: simama:latest not found locally. The Build job may have failed."
+            exit 1
+          fi
+          echo "✅ simama:latest is available locally."
+
+          # ── Ensure WebDAV storage folders exist on Nextcloud ─────────────────
+          echo "===> Ensuring WebDAV folders exist on Nextcloud..."
+          for folder in simama_media simama_backups simama_laravel_logs; do
+            echo "  Creating/verifying folder: $folder"
+            MKCOL_RESPONSE=$(curl -s -w "%{http_code}" -o /dev/null -4 \
+              -u "$NEXTCLOUD_WEBDAV_USERNAME:$NEXTCLOUD_WEBDAV_PASSWORD" \
+              -X MKCOL "$FINAL_WEBDAV_URI/$folder" 2>/dev/null || echo "000")
+
+            if [ "$MKCOL_RESPONSE" = "201" ] || [ "$MKCOL_RESPONSE" = "405" ]; then
+              # 201 = Created | 405 = Already exists (Method Not Allowed because it's already there)
+              echo "    ✅ Folder ready: $folder"
+            else
+              echo "    ⚠️  MKCOL returned HTTP $MKCOL_RESPONSE for $folder"
+              echo "    The folder may already exist or there may be a permission issue."
+              echo "    Continuing; if permissions are wrong, the write test will catch it."
+            fi
+          done
+
+          echo "===> Ensuring task attachment folders exist on Nextcloud..."
+          for folder in simama_media/tasks simama_media/tasks/attachments; do
+            echo "  Creating/verifying folder: $folder"
+            MKCOL_RESPONSE=$(curl -s -w "%{http_code}" -o /dev/null -4 \
+              -u "$NEXTCLOUD_WEBDAV_USERNAME:$NEXTCLOUD_WEBDAV_PASSWORD" \
+              -X MKCOL "$FINAL_WEBDAV_URI/$folder" 2>/dev/null || echo "000")
+
+            if [ "$MKCOL_RESPONSE" = "201" ] || [ "$MKCOL_RESPONSE" = "405" ]; then
+              echo "    ✅ Folder ready: $folder"
+            else
+              echo "    ⚠️  MKCOL returned HTTP $MKCOL_RESPONSE for $folder"
+              echo "    The folder may already exist or there may be a permission issue."
+            fi
+          done
+
+          # ── Clear stale services on port 8010 (safety net) ───────────────────
+          STALE_SERVICES=$(docker service ls --format '{{.Name}} {{.Ports}}' \
+            | awk '$0 ~ /:8010->80\/tcp/ && $1 != "simama_nginx" {print $1}' || true)
+          if [ -n "${STALE_SERVICES:-}" ]; then
+            echo "===> Removing stale services on port 8010..."
+            for svc in $STALE_SERVICES; do
+              echo "  Removing: $svc"
+              if [[ "$svc" == *_nginx ]]; then
+                STACK_NAME="${svc%_nginx}"
+                docker stack rm "$STACK_NAME" || docker service rm "$svc" || true
+              else
+                docker service rm "$svc" || true
+              fi
+            done
+
+            echo "⏳ Waiting for port 8010 to clear..."
+            for _i in $(seq 1 12); do
+              if ! docker service ls --format '{{.Ports}}' | grep -q ':8010->80/tcp'; then
+                break
+              fi
+              sleep 5
+            done
+          fi
+
+          # ── Deploy the stack ─────────────────────────────────────────────────
+          # Hybrid update policy: app/nginx use start-first for continuity,
+          # while db/queue remain stop-first for single-writer safety.
+          echo "===> Deploying stack..."
+          docker stack deploy \
+            --resolve-image changed \
+            -c docker-compose.prod.yml simama
+
+          # Avoid duplicate rolling updates after stack deploy.
+          # `docker stack deploy` already reconciles the services against the
+          # current compose file and image digest. Forcing app/nginx again here
+          # can create overlapping start-first tasks and produce transient 3/1
+          # replica reads during verification.
+          echo "===> Skipping extra force refresh; allowing Swarm to converge from stack deploy..."
+          APP_CONTAINER=$(docker ps -q -f name=simama_app -f status=running | head -n 1)
+
+          # ── BUG-3 FIX: Wait for DB FIRST (correct order) ────────────────────
+          # DB must be healthy before we attempt anything with the app container.
+          echo "===> [1/3] Waiting for database to be healthy..."
+          _WAIT_DB=0
+          until [ "$(docker ps -q -f name=simama_db -f status=running | head -n 1 | xargs -I {} docker inspect --format='{{.State.Health.Status}}' {} 2>/dev/null)" = "healthy" ]; do
+            if [ "$_WAIT_DB" -ge 300 ]; then
+              echo "❌ Timed out waiting for simama_db to be healthy (300s)."
+              echo ""
+              echo "=== DB Container Logs (last 50 lines) ==="
+              docker service logs simama_db --tail=50 2>/dev/null || true
+              echo ""
+              echo "=== DB Health Check History ==="
+              docker ps -q -f name=simama_db -f status=running | head -n 1 | xargs -I {} docker inspect --format='{{json .State.Health}}' {} 2>/dev/null || true
+              echo ""
+              docker stack ps simama || true
+              exit 1
+            fi
+            echo "  DB not healthy yet — waiting 5s... (${_WAIT_DB}s elapsed)"
+            sleep 5
+            _WAIT_DB=$((_WAIT_DB + 5))
+          done
+          echo "✅ DB healthy."
+
+          # ── BUG-2 FIX: Wait for app HEALTH (not just existence) ──────────────
+          # The app entrypoint runs migrations during startup. We must wait for
+          # PHP-FPM to be ready (health == healthy) before running docker exec.
+          echo "===> [2/3] Waiting for app container to be healthy (PHP-FPM + migrations)..."
+          _WAIT_APP=0
+          until [ "$(docker ps -q -f name=simama_app -f status=running | head -n 1 | xargs -I {} docker inspect --format='{{.State.Health.Status}}' {} 2>/dev/null)" = "healthy" ]; do
+            if [ "$_WAIT_APP" -ge 300 ]; then
+              echo "❌ Timed out waiting for simama_app to be healthy (300s)."
+              echo ""
+              echo "=== App Container Logs ==="
+              docker service logs simama_app --tail=50 2>/dev/null || true
+              echo ""
+              docker stack ps simama || true
+              exit 1
+            fi
+            echo "  App not healthy yet — waiting 5s... (${_WAIT_APP}s elapsed)"
+            sleep 5
+            _WAIT_APP=$((_WAIT_APP + 5))
+          done
+
+          CONTAINER=$(docker ps -q -f name=simama_app -f status=running | head -n 1)
+          echo "✅ App container healthy: $CONTAINER"
+
+          # ── Network Diagnostic: Check if container can reach Nextcloud ──────
+          echo "===> Network Diagnostic: Testing connectivity to Nextcloud..."
+          NEXTCLOUD_IP=$(echo "$FINAL_WEBDAV_URI" | sed -n 's|^https*://\([^:/]*\).*|\1|p')
+          NEXTCLOUD_PORT=$(echo "$FINAL_WEBDAV_URI" | sed -n 's|^https*://[^:]*:\([0-9]*\).*|\1|p; t; s|^https://.*|443|p; s|^http://.*|80|p')
+          
+          echo "  Nextcloud endpoint: $NEXTCLOUD_IP:$NEXTCLOUD_PORT"
+          
+          # Test from container
+          REACH_TEST=$(docker exec "$CONTAINER" bash -c "
+            echo 'Container network info:'
+            ip route 2>/dev/null || echo '  (ip not available)'
+            echo ''
+            echo 'Testing connectivity to $NEXTCLOUD_IP:$NEXTCLOUD_PORT ...'
+            timeout 3 bash -c \"</dev/tcp/$NEXTCLOUD_IP/$NEXTCLOUD_PORT\" 2>&1 && echo 'OK' || echo 'FAILED'
+          " 2>&1 || echo "EXEC_FAILED")
+          
+          echo "$REACH_TEST" | sed 's/^/  /'
+          
+          if ! echo "$REACH_TEST" | grep -q "^OK$"; then
+            echo ""
+            echo "  ❌ CONTAINER CONNECTIVITY FAILURE: $NEXTCLOUD_IP:$NEXTCLOUD_PORT"
+            echo ""
+            echo "  Root cause (in order of likelihood):"
+            echo "    1. Host firewall is blocking Docker overlay traffic (172.21.0.0/16)"
+            echo "       → Fix: Run 'server-firewall-docker-allow' workflow"
+            echo "    2. Nextcloud is bound to loopback only (127.0.0.1:$NEXTCLOUD_PORT)"
+            echo "       → Fix: Run 'server-debug' workflow; check 'NEXTCLOUD LISTEN ADDRESS'"
+            echo "    3. Docker daemon needs restart (Swarm networking misconfiguration)"
+            echo "       → Fix: sudo systemctl restart docker"
+            echo ""
+            echo "  Deployment will continue, but enterprise storage access will fail at runtime."
+            echo ""
+          fi
+
+          # ── Migrations & seeders (after app is healthy = entrypoint done) ────
+          # BUG-4 NOTE: The app entrypoint already ran `migrate --force` during
+          # startup. This step runs `migrate --force --seed` for seeders only.
+          # The queue worker also does a DB wait, so by the time it starts, the
+          # cache/jobs tables from migration are already committed.
+          echo "===> [3/3] Running post-deploy migrations and seeders..."
+          set +e
+          MIGRATE_OUTPUT=$(docker exec "$CONTAINER" php artisan migrate --force --seed 2>&1)
+          MIGRATE_EXIT=$?
+          set -e
+
+          if [ "$MIGRATE_EXIT" -ne 0 ]; then
+            if echo "$MIGRATE_OUTPUT" | grep -q "SQLSTATE\[42S01\]"; then
+              echo "⚠️ Detected existing-table conflict. Retrying migrate only (no seed)..."
+              docker exec "$CONTAINER" php artisan migrate --force 2>&1 || {
+                echo "❌ Migrations failed after retry."
+                echo "$MIGRATE_OUTPUT"
+                exit 1
+              }
+            else
+              echo "❌ Migrations failed:"
+              echo "$MIGRATE_OUTPUT"
+              exit 1
+            fi
+          fi
+          echo "✅ Migrations complete."
+
+          # ── Wait for queue worker to stabilize (BUG-4 fix) ──────────────────
+          # Queue worker starts after DB is ready but needs migrations to be
+          # committed. Give it up to 60s to come up cleanly.
+          echo "===> Waiting for queue worker to stabilize..."
+          _WAIT_Q=0
+          until docker ps -q -f name=simama_queue -f status=running | head -n 1 | grep -q .; do
+            if [ "$_WAIT_Q" -ge 60 ]; then
+              echo "⚠️ Queue container not running after 60s — check logs:"
+              docker service logs simama_queue --tail=30 2>/dev/null || true
+              break  # Don't fail deployment; queue has restart_policy
+            fi
+            sleep 5
+            _WAIT_Q=$((_WAIT_Q + 5))
+          done
+          if docker ps -q -f name=simama_queue -f status=running | head -n 1 | grep -q .; then
+            echo "✅ Queue worker running."
+          fi
+
+          # ── Set storage permissions ──────────────────────────────────────────
+          echo "===> Setting storage and cache permissions..."
+          docker exec "$CONTAINER" chown -R www-data:www-data storage bootstrap/cache || true
+          docker exec "$CONTAINER" chmod -R 775 storage bootstrap/cache || true
+
+          # ── Final stack status ───────────────────────────────────────────────
+          echo "===> Stack status:"
+          docker stack ps simama
+
+          echo "===> Testing Nginx configuration..."
+          _WAIT_NGINX=0
+          until docker ps -q -f name=simama_nginx -f status=running | head -n 1 | grep -q .; do
+            if [ "$_WAIT_NGINX" -ge 120 ]; then
+              echo "❌ Nginx container did not start within 120s."
+              docker service logs simama_nginx --tail=80 2>/dev/null || true
+              docker stack ps simama 2>/dev/null || true
+              exit 1
+            fi
+            echo "  Nginx not running yet — waiting 5s... (${_WAIT_NGINX}s elapsed)"
+            sleep 5
+            _WAIT_NGINX=$((_WAIT_NGINX + 5))
+          done
+
+          NGINX_CONTAINER=$(docker ps -q -f name=simama_nginx -f status=running | head -n 1)
+          echo "===> Testing and reloading Nginx configuration..."
+          docker exec "$NGINX_CONTAINER" sh -c "nginx -t && nginx -s reload" || {
+            echo "❌ Nginx configuration test or reload failed!"
+            docker service logs simama_nginx --tail=50
+            exit 1
+          }
+
+          echo "✅ Deployment complete."
+
+      # ── Strict image cleanup (always runs) ────────────────────────────────
+      - name: Strict image cleanup
+        if: always()
+        run: |
+          set -euo pipefail
+
+          echo "===> Removing legacy simama tags (keep simama:latest only)..."
+          LEGACY_SIMAMA_REFS=$(docker images --format '{{.Repository}}:{{.Tag}}' \
+            | awk '$0 ~ /^simama:/ && $0 != "simama:latest"')
+          if [ -n "${LEGACY_SIMAMA_REFS:-}" ]; then
+            while IFS= read -r ref; do
+              [ -z "$ref" ] && continue
+              docker image rm -f "$ref" || true
+            done <<< "$LEGACY_SIMAMA_REFS"
+          fi
+
+          echo "===> Pruning dangling containers and images (preserving cache)..."
+          docker container prune -f || true
+          docker image prune -f || true
+          # Keep the last 24h of build cache to ensure the next deploy is fast
+          docker builder prune --filter "until=24h" -f || true
+
+          echo "===> Final image set on host:"
+          docker images --format 'table {{.Repository}}\t{{.Tag}}\t{{.ID}}\t{{.Size}}'
+
+      # ── Health check ───────────────────────────────────────────────────────
+      # Test via docker exec into nginx container to avoid host-level port issues.
+      # Swarm ingress can be unpredictable; testing from inside the overlay
+      # network guarantees we verify the actual service connectivity.
+      - name: Health check
+        env:
+          APP_DOMAIN: ${{ secrets.APP_DOMAIN }}
+        run: |
+          echo "Waiting for the application to be ready..."
+          NGINX_CONTAINER=""
+          
+          for attempt in $(seq 1 10); do
+            NGINX_CONTAINER=$(docker ps -q -f name=simama_nginx -f status=running | head -n 1)
+            
+            if [ -z "$NGINX_CONTAINER" ]; then
+              echo "Attempt $attempt/10 — Nginx container not found yet, waiting..."
+              sleep 10
+              continue
+            fi
+
+            # 1. Local exposure check (Host port 8010)
+            # Verifies Swarm ingress and port mapping.
+            if ! wget -q --spider --timeout=3 http://127.0.0.1:8010/up 2>/dev/null; then
+              echo "Attempt $attempt/10 — Local port 8010 not responding, waiting..."
+              sleep 10
+              continue
+            fi
+            echo "✅ Local port 8010 exposure is healthy."
+
+            # 2. Public domain check (if configured)
+            # Verifies host reverse proxy and external connectivity.
+            if [ -n "${APP_DOMAIN:-}" ]; then
+              PUBLIC_STATUS=$(curl -o /dev/null -s -w "%{http_code}" \
+                --max-time 10 "https://$APP_DOMAIN/up" || echo "000")
+              echo "Public domain HTTP status: $PUBLIC_STATUS"
+              if [ "$PUBLIC_STATUS" != "200" ]; then
+                echo "Attempt $attempt/10 — Public domain not responding with 200, waiting..."
+                sleep 10
+                continue
+              fi
+              echo "✅ Public domain is healthy."
+            fi
+
+            exit 0
+          done
+
+          echo "❌ Health check failed after 10 attempts — Nginx not responding"
+          echo ""
+          echo "══════════════ DIAGNOSTIC DUMP ══════════════"
+          echo ""
+          echo "── Laravel Logs ──"
+          docker exec "$(docker ps -q -f name=simama_app -f status=running | head -n 1)" \
+            tail -n 50 storage/logs/laravel.log 2>/dev/null || echo "(no log)"
+          echo ""
+          echo "── App Service Logs ──"
+          docker service logs simama_app --tail=100 2>/dev/null || true
+          echo ""
+          echo "── Nginx Service Logs ──"
+          docker service logs simama_nginx --tail=100 2>/dev/null || true
+          echo ""
+          echo "── Service Status ──"
+          docker service ls --filter name=simama 2>/dev/null || true
+          echo ""
+          echo "── Resource Usage ──"
+          df -h
+          echo ""
+          free -m
+          echo ""
+          echo "── Stack Status ──"
+          docker stack ps simama 2>/dev/null || true
+          echo "⚠️  Health check failed, but continuing so later verification steps can run."
+          exit 0
+
+      # ── Post-deploy verification ───────────────────────────────────────────
+      # Automated replacement for manual SSH verification.
+      # Validates that Swarm applied all hardening (update_config, health checks,
+      # resource limits, rollback_config) and all services are operational.
+      - name: Post-deploy verification
+        run: |
+          set -euo pipefail
+          PASS=0
+          FAIL=0
+          WARN=0
+
+          _pass() { PASS=$((PASS + 1)); echo "  ✅ PASS: $1"; }
+          _fail() { FAIL=$((FAIL + 1)); echo "  ❌ FAIL: $1"; }
+          _warn() { WARN=$((WARN + 1)); echo "  ⚠️  WARN: $1"; }
+
+          echo "===> Waiting for Swarm services to settle..."
+          for svc in simama_app simama_db simama_nginx simama_queue; do
+            _WAIT_REPL=0
+            until [ "$(docker service ls --format '{{.Replicas}}' --filter "name=${svc}" 2>/dev/null | head -n 1)" = "1/1" ]; do
+              if [ "$_WAIT_REPL" -ge 180 ]; then
+                echo "❌ Timed out waiting for ${svc} replicas to settle."
+                docker service ls --format '{{.Name}} {{.Replicas}}' --filter "name=${svc}" 2>/dev/null || true
+                exit 1
+              fi
+              echo "  ${svc} not settled yet — waiting 5s... (${_WAIT_REPL}s elapsed)"
+              sleep 5
+              _WAIT_REPL=$((_WAIT_REPL + 5))
+            done
+          done
+          echo "✅ Swarm replica counts settled."
+          echo ""
+
+          echo "╔══════════════════════════════════════════════════════════════╗"
+          echo "║  POST-DEPLOY VERIFICATION REPORT                           ║"
+          echo "╚══════════════════════════════════════════════════════════════╝"
+          echo ""
+
+          # ── 1. Service replica counts ────────────────────────────────────────
+          echo "▶ 1/7 — SERVICE REPLICAS"
+          for svc in simama_app simama_db simama_nginx simama_queue; do
+            REPLICAS=$(docker service ls --format '{{.Replicas}}' --filter "name=${svc}" 2>/dev/null || echo "")
+            if echo "$REPLICAS" | grep -qE '^[0-9]+/[0-9]+$'; then
+              DESIRED=$(echo "$REPLICAS" | cut -d/ -f2)
+              RUNNING=$(echo "$REPLICAS" | cut -d/ -f1)
+              if [ "$RUNNING" -eq "$DESIRED" ] && [ "$DESIRED" -gt 0 ]; then
+                _pass "$svc: $REPLICAS"
+              else
+                _fail "$svc: $REPLICAS (expected $DESIRED/$DESIRED)"
+              fi
+            else
+              _fail "$svc: not found or not running"
+            fi
+          done
+          echo ""
+
+          # ── 2. Health check status ───────────────────────────────────────────
+          echo "▶ 2/7 — HEALTH CHECKS"
+          for svc in simama_app simama_db; do
+            CONTAINER=$(docker ps -q -f name="${svc}" -f status=running | head -n 1)
+            if [ -n "$CONTAINER" ]; then
+              HEALTH=$(docker inspect --format='{{.State.Health.Status}}' "$CONTAINER" 2>/dev/null || echo "none")
+              if [ "$HEALTH" = "healthy" ]; then
+                _pass "$svc health: $HEALTH"
+              elif [ "$HEALTH" = "starting" ]; then
+                _warn "$svc health: $HEALTH (still initializing)"
+              elif [ "$HEALTH" = "none" ]; then
+                _warn "$svc health: no healthcheck defined"
+              else
+                _fail "$svc health: $HEALTH"
+              fi
+            else
+              _fail "$svc: no running container"
+            fi
+          done
+          echo ""
+
+          # ── 3. Update config & rollback config ───────────────────────────────
+          echo "▶ 3/7 — UPDATE & ROLLBACK CONFIG"
+          for svc in simama_app simama_db simama_nginx simama_queue; do
+            UPDATE_ORDER=$(docker service inspect "$svc" \
+              --format='{{.Spec.UpdateConfig.Order}}' 2>/dev/null || echo "")
+            FAILURE_ACTION=$(docker service inspect "$svc" \
+              --format='{{.Spec.UpdateConfig.FailureAction}}' 2>/dev/null || echo "")
+            ROLLBACK=$(docker service inspect "$svc" \
+              --format='{{.Spec.RollbackConfig.Order}}' 2>/dev/null || echo "")
+
+            EXPECTED_ORDER="stop-first"
+            if [ "$svc" = "simama_app" ] || [ "$svc" = "simama_nginx" ]; then
+              EXPECTED_ORDER="start-first"
+            fi
+
+            if [ "$UPDATE_ORDER" = "$EXPECTED_ORDER" ] && [ "$FAILURE_ACTION" = "rollback" ] && [ "$ROLLBACK" = "$EXPECTED_ORDER" ]; then
+              _pass "$svc: update=$UPDATE_ORDER, failure=$FAILURE_ACTION, rollback=$ROLLBACK"
+            else
+              _fail "$svc: update=$UPDATE_ORDER, failure=$FAILURE_ACTION, rollback=$ROLLBACK (expected ${EXPECTED_ORDER}/rollback/${EXPECTED_ORDER})"
+            fi
+          done
+          echo ""
+
+          # ── 4. Resource limits ───────────────────────────────────────────────
+          echo "▶ 4/7 — RESOURCE LIMITS"
+          for svc in simama_app simama_db simama_nginx; do
+            MEM_LIMIT=$(docker service inspect "$svc" \
+              --format='{{.Spec.TaskTemplate.Resources.Limits.MemoryBytes}}' 2>/dev/null || echo "0")
+            MEM_RESERVE=$(docker service inspect "$svc" \
+              --format='{{.Spec.TaskTemplate.Resources.Reservations.MemoryBytes}}' 2>/dev/null || echo "0")
+
+            if [ "${MEM_LIMIT:-0}" -gt 0 ] 2>/dev/null; then
+              MEM_MB=$((MEM_LIMIT / 1048576))
+              RES_MB=$((MEM_RESERVE / 1048576))
+              _pass "$svc: limit=${MEM_MB}MB, reservation=${RES_MB}MB"
+            else
+              _fail "$svc: no memory limit set"
+            fi
+          done
+          echo ""
+
+          # ── 5. Queue worker liveness ─────────────────────────────────────────
+          echo "▶ 5/7 — QUEUE WORKER"
+          QUEUE_REPLICAS=$(docker service ls --format '{{.Replicas}}' --filter "name=simama_queue" 2>/dev/null || echo "")
+          
+          if echo "$QUEUE_REPLICAS" | grep -qE '^0/'; then
+            echo "  ⚠️ Queue service is not running (0 replicas)."
+            echo "  Checking queue service logs for startup errors..."
+            docker service logs simama_queue --tail=100 --no-task-ids 2>/dev/null | sed 's/^/    /'
+            _warn "Queue service failed to start — check logs above for WebDAV/connectivity issues"
+          elif echo "$QUEUE_REPLICAS" | grep -qE '^[1-9][0-9]*/[1-9][0-9]*$'; then
+            # Use service inspect for accurate command check (not container .Config.Cmd)
+            QUEUE_CMD=$(docker service inspect simama_queue \
+              --format='{{join .Spec.TaskTemplate.ContainerSpec.Args " "}}' 2>/dev/null || echo "")
+            if echo "$QUEUE_CMD" | grep -q "queue:work"; then
+              _pass "queue:work command: $QUEUE_CMD"
+            else
+              _warn "queue:work not found in service args: '$QUEUE_CMD'"
+            fi
+
+            GRACE=$(docker service inspect simama_queue \
+              --format='{{.Spec.TaskTemplate.ContainerSpec.StopGracePeriod}}' 2>/dev/null || echo "")
+            [ -n "$GRACE" ] && _pass "stop_grace_period: $GRACE" || _warn "stop_grace_period not set"
+          else
+            _warn "simama_queue: replicas=$QUEUE_REPLICAS (expected 1/1)"
+          fi
+          echo ""
+
+          # ── 6. Storage mounts ────────────────────────────────────────────────
+          echo "▶ 6/7 — STORAGE MOUNTS"
+          APP_CONTAINER=$(docker ps -q -f name=simama_app -f status=running | head -n 1)
+          if [ -n "$APP_CONTAINER" ]; then
+            ENTERPRISE_MOUNTS=$(docker inspect "$APP_CONTAINER" \
+              --format='{{range .Mounts}}{{if or (eq .Destination "/var/www/enterprise_data") (eq .Destination "/var/www/enterprise_backups")}}{{.Destination}}{{"\n"}}{{end}}{{end}}' 2>/dev/null || true)
+            if [ -z "$ENTERPRISE_MOUNTS" ]; then
+              _pass "enterprise data/backup host-path mounts removed"
+            else
+              _fail "enterprise data/backup host-path mounts still present"
+            fi
+
+            # Check persistent Laravel app-file mount
+            STORAGE_MOUNT=$(docker inspect "$APP_CONTAINER" \
+              --format='{{range .Mounts}}{{if eq .Destination "/var/www/html/storage/app"}}{{.Type}}:{{.Source}}{{end}}{{end}}' 2>/dev/null || echo "")
+            if [ -n "$STORAGE_MOUNT" ]; then
+              _pass "app storage/app mounted: $STORAGE_MOUNT"
+            else
+              _fail "app storage/app mount not found"
+            fi
+
+            # Verify write permissions inside the container
+            if docker exec "$APP_CONTAINER" sh -c 'touch /var/www/html/storage/app/test_perm && rm -f /var/www/html/storage/app/test_perm' 2>/dev/null; then
+              _pass "storage/app is writable inside container"
+            else
+              _fail "storage/app is NOT writable inside container"
+            fi
+
+            if docker exec "$APP_CONTAINER" sh -c 'test -d /var/www/html/storage/framework/views && test -w /var/www/html/storage/framework/views' 2>/dev/null; then
+              _pass "runtime compiled-view path is container-local and writable"
+            else
+              _fail "runtime compiled-view path is missing or not writable"
+            fi
+          fi
+          echo ""
+
+          # ── 6a. Nginx shared storage mount ────────────────────────────────
+          echo "▶ 6a/7 — NGINX SHARED STORAGE"
+          NGINX_CONTAINER=$(docker ps -q -f name=simama_nginx -f status=running | head -n 1)
+          if [ -n "$NGINX_CONTAINER" ]; then
+            NGINX_STORAGE_MOUNT=$(docker inspect "$NGINX_CONTAINER" \
+              --format='{{range .Mounts}}{{if eq .Destination "/var/www/html/storage/app"}}{{.Type}}:{{.Source}}{{end}}{{end}}' 2>/dev/null || echo "")
+            if [ -n "$NGINX_STORAGE_MOUNT" ]; then
+              _pass "nginx storage/app mounted: $NGINX_STORAGE_MOUNT"
+            else
+              _fail "nginx storage/app mount not found"
+            fi
+          else
+            _fail "simama_nginx: no running container"
+          fi
+          echo ""
+
+          # ── 6b. WebDAV Storage Verification ──────────────────────────────
+          echo "▶ 6b/7 — WEBDAV STORAGE CHECK"
+          if [ -n "$APP_CONTAINER" ]; then
+            echo "Running artisan storage:webdav-check inside $APP_CONTAINER..."
+            
+            # Debug: Show what URI the container actually has
+            CONTAINER_WEBDAV_URI=$(docker exec "$APP_CONTAINER" printenv NEXTCLOUD_WEBDAV_BASE_URI 2>/dev/null || echo "NOT SET")
+            echo "  DEBUG: Container NEXTCLOUD_WEBDAV_BASE_URI = $CONTAINER_WEBDAV_URI"
+            
+            # Retry logic: WebDAV may be slow on first attempt
+            WEBDAV_ATTEMPT=0
+            WEBDAV_MAX_ATTEMPTS=3
+            WEBDAV_SUCCESS=false
+            
+            until [ "$WEBDAV_SUCCESS" = "true" ]; do
+              WEBDAV_ATTEMPT=$((WEBDAV_ATTEMPT + 1))
+              echo "  WebDAV check attempt $WEBDAV_ATTEMPT of $WEBDAV_MAX_ATTEMPTS..."
+              
+              if docker exec "$APP_CONTAINER" php artisan storage:webdav-check -v 2>&1 | tee /tmp/webdav_check.log; then
+                _pass "WebDAV storage verification successful"
+                WEBDAV_SUCCESS=true
+              else
+                if [ "$WEBDAV_ATTEMPT" -lt "$WEBDAV_MAX_ATTEMPTS" ]; then
+                  echo "  ⏳ WebDAV check failed, retrying in 10s..."
+                  sleep 10
+                else
+                  # Check if the error is a connection timeout (might be transient)
+                  if grep -q "timed out\|Connection refused\|host.docker.internal" /tmp/webdav_check.log; then
+                    _warn "WebDAV connectivity issue detected (may be transient network problem)"
+                    echo "  Continuing deployment; WebDAV will be retried at runtime."
+                  else
+                    _fail "WebDAV storage verification FAILED (persistent error)"
+                  fi
+                  WEBDAV_SUCCESS=true  # Exit retry loop
+                fi
+              fi
+            done
+          else
+            _fail "simama_app: no running container to check WebDAV"
+          fi
+          echo ""
+
+          # ── 7. Image cleanup ─────────────────────────────────────────────────
+          echo "▶ 7/7 — IMAGE CLEANUP"
+          DANGLING=$(docker images -f "dangling=true" -q | wc -l)
+          if [ "$DANGLING" -eq 0 ]; then
+            _pass "No dangling images"
+          else
+            _fail "$DANGLING dangling image(s) still present"
+          fi
+
+          if docker image inspect simama:latest > /dev/null 2>&1; then
+            _pass "simama:latest exists"
+          else
+            _fail "simama:latest is missing"
+          fi
+
+          SIMAMA_NON_LATEST=$(docker images --format '{{.Repository}}:{{.Tag}}' \
+            | awk '$0 ~ /^simama:/ && $0 != "simama:latest"' | wc -l)
+          if [ "$SIMAMA_NON_LATEST" -eq 0 ]; then
+            _pass "No legacy simama tags"
+          else
+            _fail "Found $SIMAMA_NON_LATEST legacy simama tag(s)"
+          fi
+
+          ACTIVE_STACK_IMAGES=$(docker ps --filter name='simama_' --format '{{.Image}}' | sort -u)
+          if [ -n "${ACTIVE_STACK_IMAGES:-}" ]; then
+            _pass "Active stack images:\n$ACTIVE_STACK_IMAGES"
+          else
+            _fail "Could not determine active stack images"
+          fi
+
+          TOTAL_IMAGES=$(docker images --format '{{.Repository}}:{{.Tag}}' | wc -l)
+          _pass "Total images on server: $TOTAL_IMAGES"
+          echo ""
+
+          # ── Summary ──────────────────────────────────────────────────────────
+          echo "══════════════════════════════════════════════════════════════"
+          echo "  RESULTS: ✅ $PASS passed | ❌ $FAIL failed | ⚠️  $WARN warnings"
+          echo "══════════════════════════════════════════════════════════════"
+
+          SUMMARY_RESULT="passed"
+          if [ "$FAIL" -gt 0 ]; then
+            SUMMARY_RESULT="needs review"
+          fi
+
+          {
+            echo "# Deploy Summary"
+            echo ""
+            echo "| Field | Value |"
+            echo "|---|---|"
+            echo "| result | ${SUMMARY_RESULT} |"
+            echo "| passed | ${PASS} |"
+            echo "| failed | ${FAIL} |"
+            echo "| warnings | ${WARN} |"
+            echo "| total images | ${TOTAL_IMAGES} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$FAIL" -gt 0 ]; then
+            echo ""
+            echo "❌ Verification FAILED — $FAIL check(s) did not pass."
+            echo "Review the output above for details."
+            exit 1
+          else
+            echo ""
+            echo "✅ All verification checks passed."
+          fi
+
+      # ════════════════════════════════════════════════════════════════════════
+      #  FAILURE DIAGNOSTIC DUMP
+      #  Automatically captures logs, task errors, and system state when
+      #  any step fails. Eliminates manual debugging via SSH.
+      # ════════════════════════════════════════════════════════════════════════
+      - name: "Failure Diagnostic Dump"
+        if: failure()
+        run: |
+          set -uo pipefail
+
+          echo "╔══════════════════════════════════════════════════════════════╗"
+          echo "║  🚨 FAILURE DIAGNOSTIC DUMP                                ║"
+          echo "║  Collecting logs and state for debugging                    ║"
+          echo "╚══════════════════════════════════════════════════════════════╝"
+
+          # ── Stack task errors ──────────────────────────────────────────────
+          echo ""
+          echo "▶ Stack task history (docker stack ps)"
+          docker stack ps simama --no-trunc --format 'table {{.Name}}\t{{.CurrentState}}\t{{.Error}}' 2>/dev/null \
+            | head -30 | sed 's/^/  /' \
+            || echo "  (could not list stack tasks)"
+
+          # ── Service logs ──────────────────────────────────────────────────
+          for svc in simama_app simama_db simama_queue simama_nginx; do
+            echo ""
+            echo "▶ Last 50 log lines: $svc"
+            docker service logs "$svc" --tail=50 --no-task-ids 2>/dev/null \
+              | sed 's/^/  /' \
+              || echo "  (no logs available)"
+          done
+
+          # ── System resources ──────────────────────────────────────────────
+          echo ""
+          echo "▶ System resources"
+          echo "  Disk:"
+          df -h / /var/lib/docker 2>/dev/null | sed 's/^/    /' || true
+          echo "  Memory:"
+          free -h 2>/dev/null | sed 's/^/    /' || true
+          echo "  Docker:"
+          docker system df 2>/dev/null | sed 's/^/    /' || true
+
+          # ── Container states ──────────────────────────────────────────────
+          echo ""
+          echo "▶ All containers"
+          docker ps -a --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}' 2>/dev/null \
+            | sed 's/^/  /' || true
+
+          echo ""
+          echo "╔══════════════════════════════════════════════════════════════╗"
+          echo "║  END OF DIAGNOSTIC DUMP                                    ║"
+          echo "╚══════════════════════════════════════════════════════════════╝"

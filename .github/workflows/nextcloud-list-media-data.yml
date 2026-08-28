@@ -1,0 +1,117 @@
+name: "Nextcloud - List Directory"
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_path:
+        description: "Path to list"
+        required: false
+        default: "/media/nextcloud-data"
+        type: string
+      max_depth:
+        description: "Recursion depth for listing"
+        required: false
+        default: "1"
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  SUDO_PASSWORD: ${{ secrets.SUDO_PASSWORD }}
+  TARGET_DIR: ${{ inputs.target_path }}
+
+jobs:
+  list-data:
+    name: "List Directory: ${{ inputs.target_path }}"
+    runs-on: [self-hosted, linux, x64, production]
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: "Inspect ${{ env.TARGET_DIR }}"
+        id: inspect
+        run: |
+          set -euo pipefail
+          _sudo() { echo "$SUDO_PASSWORD" | sudo -S "$@" 2>/dev/null; }
+
+          echo "════════════════════════════════════════════════"
+          echo "  Target: $TARGET_DIR"
+          echo "════════════════════════════════════════════════"
+
+          if _sudo test -d "$TARGET_DIR"; then
+            echo "✅ Directory exists."
+            
+            echo ""
+            echo "════════════════════════════════════════════════"
+            echo "  [1] MOUNT & DISK DIAGNOSTICS"
+            echo "════════════════════════════════════════════════"
+            echo "▶ Disk Usage (df -h):"
+            _sudo df -h "$TARGET_DIR" | sed 's/^/  /'
+            
+            echo ""
+            echo "▶ Is it a mount point? (mountpoint command):"
+            _sudo mountpoint "$TARGET_DIR" || echo "  ⚠️  $TARGET_DIR is NOT a mount point (it is just a folder on the root drive)"
+
+            echo ""
+            echo "▶ All media mounts (mount | grep media):"
+            mount | grep media | sed 's/^/  /' || echo "  (none)"
+
+            echo ""
+            echo "▶ Physical Blocks (lsblk):"
+            _sudo lsblk -o NAME,SIZE,TYPE,MOUNTPOINT,FSTYPE | sed 's/^/  /'
+
+            echo ""
+            echo "════════════════════════════════════════════════"
+            echo "  [2] NEXTCLOUD CONFIGURATION"
+            echo "════════════════════════════════════════════════"
+            if command -v nextcloud.occ >/dev/null 2>&1; then
+              echo "▶ occ config:system:get datadirectory:"
+              _sudo nextcloud.occ config:system:get datadirectory 2>/dev/null | sed 's/^/  /' || echo "  (failed to get via occ)"
+            fi
+
+            echo ""
+            echo "▶ config.php check:"
+            _sudo find /var/snap/nextcloud -name "config.php" -type f 2>/dev/null | while read -r cfg; do
+              echo "  File: $cfg"
+              _sudo grep -i "datadirectory" "$cfg" 2>/dev/null | sed 's/^/  /'
+            done
+
+            echo ""
+            echo "════════════════════════════════════════════════"
+            echo "  [3] DIRECTORY CONTENTS"
+            echo "════════════════════════════════════════════════"
+            echo "▶ Top-level listing (ls -lah):"
+            _sudo ls -lah "$TARGET_DIR/" | sed 's/^/  /' || echo "  (error listing)"
+
+            echo ""
+            echo "▶ Recursive listing (depth: ${{ inputs.max_depth }}):"
+            _sudo find "$TARGET_DIR" -maxdepth "${{ inputs.max_depth }}" 2>/dev/null | sort | sed 's/^/  /' || echo "  (none)"
+
+            echo ""
+            echo "▶ Hidden files in root:"
+            _sudo ls -la "$TARGET_DIR" | grep ' \.' | sed 's/^/  /' || echo "  (none)"
+
+          else
+            echo "❌ $TARGET_DIR does NOT exist or is not accessible."
+            echo "Current mounts:"
+            mount | grep media | sed 's/^/  /' || echo "  (no /media mounts found)"
+            exit 1
+          fi
+
+      - name: "Generate Job Summary"
+        if: always()
+        run: |
+          {
+            echo "# Directory Listing: $TARGET_DIR"
+            echo ""
+            echo "Ran at: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+            echo ""
+            echo "### Configuration"
+            echo "- **Target:** \`$TARGET_DIR\`"
+            echo "- **Max Depth:** \`${{ inputs.max_depth }}\`"
+            echo ""
+            echo "Please check the logs for the full output."
+          } >> "$GITHUB_STEP_SUMMARY"

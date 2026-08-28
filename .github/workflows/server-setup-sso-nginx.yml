@@ -1,0 +1,90 @@
+name: "Server — Configure sso.mhcsgo.cloud Nginx & SSL"
+
+on:
+  workflow_dispatch:
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  configure-nginx-ssl:
+    name: Configure Nginx & SSL
+    runs-on: [self-hosted, linux, x64, production]
+    timeout-minutes: 10
+
+    steps:
+      - name: Create sso.mhcsgo.cloud Nginx Site Configuration
+        run: |
+          set -euo pipefail
+          set -x
+
+          NGINX_CONF="/etc/nginx/sites-available/sso.mhcsgo.cloud.conf"
+          NGINX_LINK="/etc/nginx/sites-enabled/sso.mhcsgo.cloud.conf"
+
+          echo "===> Generating temporary HTTP server block..."
+          TMP_CONF=$(mktemp)
+          cat << 'EOF' > "$TMP_CONF"
+          server {
+              listen 80;
+              server_name sso.mhcsgo.cloud;
+
+              client_max_body_size 100M;
+
+              location / {
+                  proxy_pass http://127.0.0.1:8012;
+                  proxy_set_header Host $host;
+                  proxy_set_header X-Real-IP $remote_addr;
+                  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                  proxy_set_header X-Forwarded-Proto $scheme;
+              }
+          }
+          EOF
+
+          echo "===> Copying configuration to sites-available..."
+          sudo cp "$TMP_CONF" "$NGINX_CONF"
+          sudo chmod 644 "$NGINX_CONF"
+          rm -f "$TMP_CONF"
+
+          echo "===> Creating symlink to sites-enabled..."
+          sudo ln -sf "$NGINX_CONF" "$NGINX_LINK"
+
+          echo "===> Testing Nginx configuration..."
+          sudo nginx -t
+
+          echo "===> Reloading Nginx..."
+          sudo systemctl reload nginx
+          echo "✅ HTTP site block is active."
+
+      - name: Obtain and Configure Let's Encrypt SSL Certificate
+        run: |
+          set -euo pipefail
+          set -x
+
+          echo "===> Running Certbot for sso.mhcsgo.cloud..."
+          if command -v certbot >/dev/null 2>&1; then
+            sudo certbot --nginx -d sso.mhcsgo.cloud --non-interactive --agree-tos --redirect --register-unsafely-without-email || {
+              echo "❌ Certbot failed! Checking nginx logs..."
+              sudo tail -n 50 /var/log/nginx/error.log
+              exit 1
+            }
+            echo "✅ SSL successfully configured by Certbot."
+          else
+            echo "❌ Certbot is not installed on the server!"
+            exit 1
+          fi
+
+      - name: Verify Nginx Reload and Service Health
+        run: |
+          set -euo pipefail
+          set -x
+
+          echo "===> Final Nginx configuration test..."
+          sudo nginx -t
+
+          echo "===> Reloading Nginx to apply SSL certs..."
+          sudo systemctl reload nginx
+          
+          echo "===> Verifying HTTP readiness endpoint..."
+          curl -I -s -f http://127.0.0.1:8012 || {
+             echo "⚠️ Warning: SSO Application is not running locally on port 8012 yet. This is expected if the app is not yet deployed."
+          }

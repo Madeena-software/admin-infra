@@ -1,0 +1,78 @@
+name: "Server — Remove Simama External Storage Mounts"
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  cleanup_mounts:
+    name: Remove Simama External Storage Mounts
+    runs-on: [self-hosted, linux, x64, production]
+
+    steps:
+      - name: Delete External Storage Mounts
+        env:
+          SUDO_PASSWORD: ${{ secrets.SUDO_PASSWORD }}
+          NEXTCLOUD_USER: ${{ secrets.NEXTCLOUD_USERNAME }}
+        run: |
+          set -euo pipefail
+
+          _sudo() {
+            if [ -n "${SUDO_PASSWORD:-}" ]; then
+              echo "$SUDO_PASSWORD" | sudo -S "$@" 2>/dev/null
+            else
+              sudo "$@"
+            fi
+          }
+
+          echo "=== 1. Checking Nextcloud OCC CLI ==="
+          OCC_CMD=""
+          if command -v nextcloud.occ >/dev/null; then
+            OCC_CMD="nextcloud.occ"
+          elif [ -f "/snap/bin/nextcloud.occ" ]; then
+            OCC_CMD="/snap/bin/nextcloud.occ"
+          elif _sudo command -v nextcloud.occ >/dev/null; then
+            OCC_CMD="nextcloud.occ"
+          fi
+
+          if [ -z "$OCC_CMD" ]; then
+            echo "❌ ERROR: nextcloud.occ command not found!"
+            exit 1
+          fi
+          echo "Found occ: $OCC_CMD"
+
+          echo "=== 2. Listing Current External Storage Mounts ==="
+          _sudo $OCC_CMD files_external:list || true
+
+          echo "=== 3. Deleting Simama External Storage Mounts ==="
+          # Find all mount IDs where the mount name matches 'Simama-Backups' or 'Simama-Storage'
+          # nextcloud.occ files_external:list usually outputs a table, or we can use the json format if supported
+          # Let's search by mount name case-insensitively
+          EXT_IDS=$(_sudo $OCC_CMD files_external:list | grep -i "Simama" | awk -F'|' '{print $2}' | tr -d ' ' || true)
+
+          if [ -n "$EXT_IDS" ]; then
+            for id in $EXT_IDS; do
+              if [[ "$id" =~ ^[0-9]+$ ]]; then
+                echo "🗑️ Deleting External Storage Mount ID: $id"
+                _sudo $OCC_CMD files_external:delete --yes "$id" || _sudo $OCC_CMD files_external:delete "$id" || true
+              fi
+            done
+            echo "✅ Deleted Simama external storage mounts."
+          else
+            echo "ℹ️ No Simama external storage mounts found."
+          fi
+
+          echo "=== 4. Scanning Files for User: $NEXTCLOUD_USER ==="
+          if [ -n "$NEXTCLOUD_USER" ]; then
+            echo "Running scan for user files path: /${NEXTCLOUD_USER}/files"
+            _sudo $OCC_CMD files:scan --path="/${NEXTCLOUD_USER}/files" || true
+            echo "✅ File scan complete."
+          else
+            echo "⚠️ NEXTCLOUD_USERNAME secret is missing; skipping files scan."
+          fi
+
+          echo "=== 5. Final Mount List ==="
+          _sudo $OCC_CMD files_external:list || true
+          echo "Cleanup complete! 🎉"

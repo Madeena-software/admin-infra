@@ -1,0 +1,111 @@
+name: "Server — Configure s3.mhcsgo.cloud Nginx & SSL"
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Madeena Standard CI/CD — Configure Nginx and SSL for s3.mhcsgo.cloud Gateway
+#
+# This workflow sets up the host Nginx reverse proxy for s3.mhcsgo.cloud and runs
+# Certbot to obtain and configure the Let's Encrypt SSL certificate.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+on:
+  workflow_dispatch:
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  configure-nginx-ssl:
+    name: Configure Nginx & SSL
+    runs-on: [self-hosted, linux, x64, production]
+    timeout-minutes: 10
+
+    steps:
+      - name: Create s3.mhcsgo.cloud Nginx Site Configuration
+        run: |
+          set -euo pipefail
+          set -x
+
+          NGINX_CONF="/etc/nginx/sites-available/s3-domain.conf"
+          NGINX_LINK="/etc/nginx/sites-enabled/s3-domain.conf"
+
+          echo "===> Generating temporary HTTP server block..."
+          TMP_CONF=$(mktemp)
+          cat << 'EOF' > "$TMP_CONF"
+          server {
+              listen 80;
+              server_name s3.mhcsgo.cloud;
+
+              # Optimize upload limits for large S3 objects
+              client_max_body_size 0;
+              proxy_buffering off;
+              proxy_request_buffering off;
+
+              location / {
+                  proxy_set_header Host $http_host;
+                  proxy_set_header X-Real-IP $remote_addr;
+                  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                  proxy_set_header X-Forwarded-Proto $scheme;
+
+                  # WebSockets/S3 Stream configuration
+                  proxy_connect_timeout 300;
+                  proxy_http_version 1.1;
+                  proxy_set_header Connection "";
+                  chunked_transfer_encoding off;
+
+                  proxy_pass http://127.0.0.1:9000;
+              }
+          }
+          EOF
+
+          echo "===> Copying configuration to sites-available..."
+          sudo cp "$TMP_CONF" "$NGINX_CONF"
+          sudo chmod 644 "$NGINX_CONF"
+          rm -f "$TMP_CONF"
+
+          echo "===> Creating symlink to sites-enabled..."
+          sudo ln -sf "$NGINX_CONF" "$NGINX_LINK"
+
+          echo "===> Testing Nginx configuration..."
+          sudo nginx -t
+
+          echo "===> Reloading Nginx..."
+          sudo systemctl reload nginx
+          echo "✅ HTTP site block is active."
+
+      - name: Obtain and Configure Let's Encrypt SSL Certificate
+        run: |
+          set -euo pipefail
+          set -x
+
+          echo "===> Running Certbot for s3.mhcsgo.cloud..."
+          if command -v certbot >/dev/null 2>&1; then
+            # Run certbot to request a certificate and configure SSL + redirect automatically
+            # We use --register-unsafely-without-email to reuse or proceed without registering a new email if account exists
+            sudo certbot --nginx -d s3.mhcsgo.cloud --non-interactive --agree-tos --redirect --register-unsafely-without-email || {
+              echo "❌ Certbot failed! Checking nginx logs..."
+              sudo tail -n 50 /var/log/nginx/error.log
+              exit 1
+            }
+            echo "✅ SSL successfully configured by Certbot."
+          else
+            echo "❌ Certbot is not installed on the server!"
+            exit 1
+          fi
+
+      - name: Verify Nginx Reload and Service Health
+        run: |
+          set -euo pipefail
+          set -x
+
+          echo "===> Final Nginx configuration test..."
+          sudo nginx -t
+
+          echo "===> Reloading Nginx to apply SSL certs..."
+          sudo systemctl reload nginx
+          
+          echo "===> Verifying HTTP readiness endpoint..."
+          curl -sf http://127.0.0.1:9000/minio/health/ready || {
+             echo "❌ MinIO S3 API is not running locally on port 9000!"
+             exit 1
+          }
+          echo "✅ MinIO S3 API is healthy locally."

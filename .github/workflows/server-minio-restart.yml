@@ -1,0 +1,23 @@
+name: "Server — Restart MinIO Service"
+
+on:
+  workflow_dispatch:
+
+jobs:
+  restart-minio:
+    name: Restart MinIO
+    runs-on: [self-hosted, linux, x64, production]
+    steps:
+      - name: Restart MinIO systemd service
+        env:
+          SUDO_PASSWORD: ${{ secrets.SUDO_PASSWORD }}
+        run: |
+          set -euo pipefail
+          echo "Stopping minio.service..."
+          echo "$SUDO_PASSWORD" | sudo -S systemctl stop minio.service || true
+          
+          echo "Starting minio.service..."
+          echo "$SUDO_PASSWORD" | sudo -S systemctl start minio.service
+          
+          echo "Status minio.service..."
+          systemctl status minio.service --no-pager || true

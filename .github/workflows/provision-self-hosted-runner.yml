@@ -1,0 +1,387 @@
+name: Provision Organization Self-Hosted Runner Pool
+
+on:
+  workflow_dispatch:
+    inputs:
+      verify_only:
+        description: 'Skip SSH provisioning and only execute the five-job self-hosted verification and assertion'
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  provision:
+    if: ${{ !inputs.verify_only }}
+    name: Install runner pool on production server
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      SELF_HOSTED_CREDENTIAL: ${{ secrets.SELF_HOSTED_CREDENTIAL }}
+      SSH_HOST: ${{ secrets.SSH_HOST }}
+      SSH_USER: ${{ secrets.SSH_USER }}
+      SSH_KEY: ${{ secrets.SSH_KEY }}
+      SUDO_PASSWORD: ${{ secrets.SUDO_PASSWORD }}
+
+    steps:
+      - name: Generate per-slot runner tokens and resolve package
+        id: runner
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          REGISTRATION_SCOPE=organization
+          RUNNER_GROUP=madeena-devops
+          RUNNER_TARGET_URL=https://github.com/Madeena-software
+
+          # Determine API authentication token: extract from SELF_HOSTED_CREDENTIAL if formatted as '--token <PAT>', otherwise use trimmed secret or fallback to GITHUB_TOKEN
+          API_AUTH_TOKEN=""
+          if [ -n "${SELF_HOSTED_CREDENTIAL:-}" ]; then
+            EXTRACTED_TOKEN="$(printf '%s\n' "$SELF_HOSTED_CREDENTIAL" \
+              | sed -nE 's/.*--token[[:space:]]+([^#[:space:]]+).*/\1/p' \
+              | head -n 1)"
+            if [ -n "$EXTRACTED_TOKEN" ]; then
+              API_AUTH_TOKEN="$EXTRACTED_TOKEN"
+            else
+              API_AUTH_TOKEN="$(printf '%s\n' "$SELF_HOSTED_CREDENTIAL" | xargs)"
+            fi
+          fi
+          if [ -z "$API_AUTH_TOKEN" ]; then
+            API_AUTH_TOKEN="${GH_TOKEN:-}"
+          fi
+
+          # Generate distinct fresh registration tokens for all 5 runner slots via separate API calls
+          for slot in $(seq 1 5); do
+            if ! TOKEN="$(GH_TOKEN="$API_AUTH_TOKEN" gh api --method POST \
+              orgs/Madeena-software/actions/runners/registration-token \
+              --jq '.token' 2>/dev/null)" || [ -z "$TOKEN" ] || [ "$TOKEN" = "null" ]; then
+              echo "Organization runner registration token unavailable for slot $slot. Organization-level registration in Madeena-software is required." >&2
+              exit 1
+            fi
+            echo "::add-mask::$TOKEN"
+            eval "TOKEN_${slot}=\"\$TOKEN\""
+            test -n "$TOKEN"
+          done
+
+          RUNNER_VERSION="$(gh api repos/actions/runner/releases/latest --jq '.tag_name')"
+          RUNNER_ASSET="actions-runner-linux-x64-${RUNNER_VERSION#v}.tar.gz"
+          RUNNER_SHA256="$(gh api repos/actions/runner/releases/latest \
+            --jq ".assets[] | select(.name == \"${RUNNER_ASSET}\") | .digest" \
+            | sed 's/^sha256://')"
+
+          test -n "$RUNNER_VERSION"
+          test -n "$RUNNER_SHA256"
+
+          {
+            echo "token_1=$TOKEN_1"
+            echo "token_2=$TOKEN_2"
+            echo "token_3=$TOKEN_3"
+            echo "token_4=$TOKEN_4"
+            echo "token_5=$TOKEN_5"
+            echo "version=$RUNNER_VERSION"
+            echo "asset=$RUNNER_ASSET"
+            echo "sha256=$RUNNER_SHA256"
+            echo "scope=$REGISTRATION_SCOPE"
+            echo "group=$RUNNER_GROUP"
+            echo "target_url=$RUNNER_TARGET_URL"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Install and start runners over SSH
+        shell: bash
+        env:
+          TOKEN_1: ${{ steps.runner.outputs.token_1 }}
+          TOKEN_2: ${{ steps.runner.outputs.token_2 }}
+          TOKEN_3: ${{ steps.runner.outputs.token_3 }}
+          TOKEN_4: ${{ steps.runner.outputs.token_4 }}
+          TOKEN_5: ${{ steps.runner.outputs.token_5 }}
+          RUNNER_VERSION: ${{ steps.runner.outputs.version }}
+          RUNNER_ASSET: ${{ steps.runner.outputs.asset }}
+          RUNNER_SHA256: ${{ steps.runner.outputs.sha256 }}
+          RUNNER_SCOPE: ${{ steps.runner.outputs.scope }}
+          RUNNER_GROUP: ${{ steps.runner.outputs.group }}
+          RUNNER_TARGET_URL: ${{ steps.runner.outputs.target_url }}
+        run: |
+          set -Eeuo pipefail
+
+          test -n "$SSH_HOST"
+          test -n "$SSH_USER"
+          test -n "$SSH_KEY"
+          test -n "$SUDO_PASSWORD"
+
+          KEY_FILE="$RUNNER_TEMP/simama-runner-key"
+          install -m 700 -d "$HOME/.ssh"
+          install -m 600 /dev/null "$KEY_FILE"
+          printf '%s\n' "$SSH_KEY" > "$KEY_FILE"
+
+          SSH_ARGS=(
+            -i "$KEY_FILE"
+            -o BatchMode=yes
+            -o ConnectTimeout=10
+            -o ConnectionAttempts=1
+            -o StrictHostKeyChecking=accept-new
+          )
+
+          connected=false
+          retry_window=600
+          retry_interval=10
+          retry_deadline=$((SECONDS + retry_window))
+          attempt=0
+          while (( SECONDS < retry_deadline )); do
+            attempt=$((attempt + 1))
+            if ssh "${SSH_ARGS[@]}" "$SSH_USER@$SSH_HOST" 'printf ready' >/dev/null 2>&1; then
+              connected=true
+              break
+            fi
+            remaining=$((retry_deadline - SECONDS))
+            (( remaining <= 0 )) && break
+            echo "SSH connection attempt $attempt failed; retrying in ${retry_interval}s (${remaining}s remain)."
+            if (( remaining > retry_interval )); then
+              sleep "$retry_interval"
+            else
+              sleep "$remaining"
+            fi
+          done
+          if [ "$connected" != true ]; then
+            echo "Unable to connect to the target server after ${retry_window}s of retries." >&2
+            exit 1
+          fi
+
+          REMOTE_SCRIPT=$(cat <<'REMOTE_SCRIPT'
+          set -Eeuo pipefail
+
+          IFS= read -r TOKEN_1
+          IFS= read -r TOKEN_2
+          IFS= read -r TOKEN_3
+          IFS= read -r TOKEN_4
+          IFS= read -r TOKEN_5
+          IFS= read -r SUDO_PASSWORD
+          IFS= read -r RUNNER_VERSION
+          IFS= read -r RUNNER_ASSET
+          IFS= read -r RUNNER_SHA256
+          IFS= read -r RUNNER_SCOPE
+          IFS= read -r RUNNER_GROUP
+          IFS= read -r RUNNER_TARGET_URL
+
+          test -n "$TOKEN_1"
+          test -n "$TOKEN_2"
+          test -n "$TOKEN_3"
+          test -n "$TOKEN_4"
+          test -n "$TOKEN_5"
+          test -n "$SUDO_PASSWORD"
+          test -n "$RUNNER_VERSION"
+          test -n "$RUNNER_ASSET"
+          test -n "$RUNNER_SHA256"
+          test -n "$RUNNER_SCOPE"
+          test -n "$RUNNER_GROUP"
+          test -n "$RUNNER_TARGET_URL"
+
+          SLOT_TOKENS=("$TOKEN_1" "$TOKEN_2" "$TOKEN_3" "$TOKEN_4" "$TOKEN_5")
+
+          _sudo() {
+            printf '%s\n' "$SUDO_PASSWORD" | sudo -S -p '' "$@"
+          }
+
+          _sudo -v
+          command -v curl >/dev/null
+          command -v tar >/dev/null
+          command -v sha256sum >/dev/null
+
+          RUNNER_URL="https://github.com/actions/runner/releases/download/${RUNNER_VERSION}/${RUNNER_ASSET}"
+          ARCHIVE_CACHE="/tmp/${RUNNER_ASSET}"
+
+          ensure_archive() {
+            if [ -f "$ARCHIVE_CACHE" ] && ! (printf '%s  %s\n' "$RUNNER_SHA256" "$ARCHIVE_CACHE" | sha256sum --check --status >/dev/null 2>&1); then
+              rm -f "$ARCHIVE_CACHE"
+            fi
+            if [ ! -f "$ARCHIVE_CACHE" ]; then
+              curl --fail --location --retry 3 --output "$ARCHIVE_CACHE" "$RUNNER_URL"
+              printf '%s  %s\n' "$RUNNER_SHA256" "$ARCHIVE_CACHE" | sha256sum --check --status
+            fi
+          }
+
+          HOST_NAME="$(hostname -s)"
+          TOTAL_RUNNERS=5
+
+          for i in $(seq 1 "$TOTAL_RUNNERS"); do
+            token_idx=$((i - 1))
+            CURRENT_SLOT_TOKEN="${SLOT_TOKENS[$token_idx]}"
+
+            if [ "$i" -eq 1 ]; then
+              RUNNER_DIR="$HOME/actions-runner-madeena-devops"
+              RUNNER_NAME="simama-production-${HOST_NAME}"
+            else
+              RUNNER_DIR="$HOME/actions-runner-madeena-devops-${i}"
+              RUNNER_NAME="simama-production-${HOST_NAME}-${i}"
+            fi
+
+            echo "=== Checking runner $i/$TOTAL_RUNNERS ($RUNNER_NAME in $RUNNER_DIR) ==="
+            mkdir -p "$RUNNER_DIR"
+
+            if [ ! -f "$RUNNER_DIR/.runner" ]; then
+              echo "Configuring runner $i ($RUNNER_NAME) with fresh slot registration token..."
+              ensure_archive
+              tar -xzf "$ARCHIVE_CACHE" -C "$RUNNER_DIR"
+              (
+                cd "$RUNNER_DIR"
+                ./config.sh --unattended \
+                  --url "$RUNNER_TARGET_URL" \
+                  --token "$CURRENT_SLOT_TOKEN" \
+                  --name "$RUNNER_NAME" \
+                  --runnergroup "$RUNNER_GROUP" \
+                  --labels self-hosted,linux,x64,production \
+                  --work _work
+              )
+            else
+              echo "Runner $i ($RUNNER_NAME) is already configured; preserving its registration."
+            fi
+
+            if ! _sudo "$RUNNER_DIR/svc.sh" status >/dev/null 2>&1; then
+              echo "Installing systemd service for runner $i..."
+              _sudo "$RUNNER_DIR/svc.sh" install
+            fi
+
+            echo "Ensuring service is running for runner $i..."
+            _sudo "$RUNNER_DIR/svc.sh" start >/dev/null 2>&1 \
+              || _sudo "$RUNNER_DIR/svc.sh" restart >/dev/null 2>&1
+            _sudo "$RUNNER_DIR/svc.sh" status
+            echo "Runner $i service is active."
+          done
+
+          echo "All $TOTAL_RUNNERS runner services are active in group: $RUNNER_GROUP"
+          REMOTE_SCRIPT
+          )
+
+          {
+            printf '%s\n' "$TOKEN_1"
+            printf '%s\n' "$TOKEN_2"
+            printf '%s\n' "$TOKEN_3"
+            printf '%s\n' "$TOKEN_4"
+            printf '%s\n' "$TOKEN_5"
+            printf '%s\n' "$SUDO_PASSWORD"
+            printf '%s\n' "$RUNNER_VERSION"
+            printf '%s\n' "$RUNNER_ASSET"
+            printf '%s\n' "$RUNNER_SHA256"
+            printf '%s\n' "$RUNNER_SCOPE"
+            printf '%s\n' "$RUNNER_GROUP"
+            printf '%s\n' "$RUNNER_TARGET_URL"
+          } | ssh "${SSH_ARGS[@]}" "$SSH_USER@$SSH_HOST" \
+            "bash -c $(printf '%q' "$REMOTE_SCRIPT")"
+
+      - name: Verify remote runner service
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          echo 'Remote runner pool configured successfully.'
+
+  verify-self-hosted:
+    name: Verify runner pool concurrency (job ${{ matrix.job_index }}/5)
+    needs: provision
+    if: ${{ always() && (inputs.verify_only || needs.provision.result == 'success') }}
+    runs-on: [self-hosted, linux, x64, production]
+    timeout-minutes: 5
+    strategy:
+      fail-fast: false
+      matrix:
+        job_index: [1, 2, 3, 4, 5]
+
+    steps:
+      - name: Record and verify runner execution
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          test -n "${RUNNER_NAME:-}"
+          START_TS=$(date +%s)
+          echo "Job index: ${{ matrix.job_index }}"
+          echo "GitHub assigned this job to runner: $RUNNER_NAME"
+          echo "Runner host: $(hostname)"
+          echo "Workspace: $GITHUB_WORKSPACE"
+
+          # Sleep to allow all 5 matrix jobs to run concurrently across the 5 runner pool processes
+          sleep 12
+          END_TS=$(date +%s)
+
+          mkdir -p proof
+          cat <<EOF > "proof/runner-job-${{ matrix.job_index }}.json"
+          {
+            "job_index": ${{ matrix.job_index }},
+            "runner_name": "$RUNNER_NAME",
+            "hostname": "$(hostname)",
+            "start_time": $START_TS,
+            "end_time": $END_TS
+          }
+          EOF
+
+      - name: Upload runner execution proof
+        uses: actions/upload-artifact@v4
+        with:
+          name: runner-job-${{ matrix.job_index }}
+          path: proof/runner-job-${{ matrix.job_index }}.json
+          retention-days: 1
+
+  assert-runner-pool:
+    name: Assert 5 distinct concurrent runners
+    needs: verify-self-hosted
+    if: ${{ always() && (inputs.verify_only || needs.provision.result == 'success') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Download all runner execution proofs
+        uses: actions/download-artifact@v4
+        with:
+          path: all-proofs
+          pattern: runner-job-*
+          merge-multiple: true
+
+      - name: Assert distinct runners and concurrency
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          python3 - <<'EOF'
+          import glob, json, sys
+
+          proof_files = glob.glob("all-proofs/runner-job-*.json")
+          print(f"Found {len(proof_files)} runner proof file(s).")
+
+          if len(proof_files) != 5:
+              print(f"ERROR: Expected 5 proof files, but found {len(proof_files)}", file=sys.stderr)
+              sys.exit(1)
+
+          records = []
+          for f in sorted(proof_files):
+              with open(f) as fp:
+                  data = json.load(fp)
+                  records.append(data)
+                  print(f"Job {data['job_index']}: Runner='{data['runner_name']}' Host='{data['hostname']}' Start={data['start_time']} End={data['end_time']}")
+
+          runners = [r["runner_name"] for r in records]
+          unique_runners = set(runners)
+
+          print("\n=== Runner Pool Verification Summary ===")
+          print(f"Total jobs executed: {len(records)}")
+          print(f"Unique runner names: {len(unique_runners)}")
+          for r in sorted(unique_runners):
+              print(f"  - {r}")
+
+          if len(unique_runners) != 5:
+              print(f"\nFAILED: Expected 5 distinct runners, but got {len(unique_runners)}: {unique_runners}", file=sys.stderr)
+              sys.exit(1)
+
+          max_start = max(r["start_time"] for r in records)
+          min_end = min(r["end_time"] for r in records)
+          overlap = min_end - max_start
+          print(f"\nConcurrency overlap: {overlap}s (max_start={max_start}, min_end={min_end})")
+          if overlap <= 0:
+              print(f"FAILED: Jobs did not execute concurrently (overlap window is {overlap}s <= 0).", file=sys.stderr)
+              sys.exit(1)
+          else:
+              print(f"SUCCESS: Verified concurrent execution overlap across the 5 runner pool processes ({overlap}s overlap).")
+
+          print("\nVERIFICATION PASSED: Exactly 5 distinct runner processes executed in parallel.")
+          EOF

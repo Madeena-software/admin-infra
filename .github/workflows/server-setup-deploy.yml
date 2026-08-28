@@ -1,0 +1,163 @@
+name: Server — Setup Deploy Permissions
+
+# One-time workflow to configure passwordless sudo for deployment commands.
+# After running this, the deploy-swarm.yml workflow will no longer need SUDO_PASSWORD
+# for directory creation/ownership on the HDD mount or the deployment root.
+#
+# USAGE: Run this once per server. Safe to re-run (idempotent).
+
+on:
+  workflow_dispatch:
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  setup:
+    name: Configure Deploy Permissions
+    runs-on: [self-hosted, linux, x64, production]
+    permissions:
+      contents: read
+
+    steps:
+      - name: Setup passwordless sudo for deploy commands
+        env:
+          SUDO_PASSWORD: ${{ secrets.SUDO_PASSWORD }}
+          SSH_USER: ${{ secrets.SSH_USER }}
+          REMOTE_PATH: ${{ secrets.REMOTE_PATH }}
+          NEXTCLOUD_USERNAME: ${{ secrets.NEXTCLOUD_USERNAME }}
+        run: |
+          set -euo pipefail
+
+          echo "===> Setting up passwordless sudo for deploy commands..."
+          
+          # Validate sudo password first (caches for subsequent commands)
+          echo "$SUDO_PASSWORD" | sudo -S -v -p '' 2>&1 > /dev/null || {
+            echo "❌ FATAL: SUDO_PASSWORD is incorrect or user is not in sudoers."
+            exit 1
+          }
+
+          # Create sudoers drop-in file for the deploy user.
+          # This grants passwordless sudo for mkdir and chown only — the minimum
+          # privilege needed for CI/CD to manage storage directories on the HDD.
+          SUDOERS_FILE="/etc/sudoers.d/madeena-deploy"
+
+          echo "$SUDO_PASSWORD" | sudo -S -p '' tee "$SUDOERS_FILE" > /dev/null <<'SUDOERS_EOF'
+          # Madeena CI/CD — Passwordless sudo for deployment directory management
+          # Installed by: server-setup-deploy.yml (GitHub Actions)
+          # Commands allowed without password:
+          #   - mkdir: create storage/data directories on HDD
+          #   - chown: set correct ownership for containers
+          SUDOERS_EOF
+
+          # Write the actual rule (using printf to safely inject the username)
+          echo "$SUDO_PASSWORD" | sudo -S -p '' sh -c "printf '%s ALL=(ALL) NOPASSWD: /usr/bin/mkdir, /usr/bin/chown\n' '$SSH_USER' >> '$SUDOERS_FILE'"
+
+          # Set correct permissions (sudoers files MUST be 0440)
+          echo "$SUDO_PASSWORD" | sudo -S -p '' chmod 0440 "$SUDOERS_FILE"
+
+          # Validate the sudoers file (visudo -c exits non-zero on syntax errors)
+          echo "$SUDO_PASSWORD" | sudo -S -p '' visudo -c || {
+            echo "❌ FATAL: sudoers syntax check failed! Removing broken file..."
+            echo "$SUDO_PASSWORD" | sudo -S -p '' rm -f "$SUDOERS_FILE"
+            exit 1
+          }
+
+          echo "✅ Sudoers configured: $SUDOERS_FILE"
+          echo ""
+
+          # ── Verify passwordless sudo works ────────────────────────────────────
+          echo "===> Verifying passwordless sudo..."
+          if sudo -n mkdir --help > /dev/null 2>&1; then
+            echo "  ✅ mkdir: passwordless sudo works"
+          else
+            echo "  ❌ mkdir: passwordless sudo FAILED"
+            exit 1
+          fi
+
+          if sudo -n chown --help > /dev/null 2>&1; then
+            echo "  ✅ chown: passwordless sudo works"
+          else
+            echo "  ❌ chown: passwordless sudo FAILED"
+            exit 1
+          fi
+
+          # ── Pre-create deployment root ───────────────────────────────────────
+          echo ""
+          echo "===> Pre-creating deployment root..."
+          if [ -z "${REMOTE_PATH:-}" ]; then
+            echo "  ❌ FATAL: REMOTE_PATH secret is missing or empty"
+            exit 1
+          fi
+
+          if [ -z "${NEXTCLOUD_USERNAME:-}" ]; then
+            echo "  ❌ FATAL: NEXTCLOUD_USERNAME secret is missing or empty"
+            exit 1
+          fi
+
+          APP_STORAGE_HOST_PATH="/var/lib/simama/storage"
+          APP_LOGS_HOST_PATH="/media/nextcloud-data/data/${NEXTCLOUD_USERNAME}/files/simama_laravel_logs"
+          MYSQL_DATA_HOST_PATH="/var/lib/simama/mysql"
+
+          if [ "$REMOTE_PATH" = "/var/www" ] || [ "$REMOTE_PATH" = "/srv" ] || [ "$REMOTE_PATH" = "/opt" ] || [ "$REMOTE_PATH" = "/var" ]; then
+            echo "  ❌ FATAL: REMOTE_PATH must be a dedicated app directory, not a shared root."
+            echo "  Example: /var/www/tmp or /srv/tmp"
+            exit 1
+          fi
+
+          sudo mkdir -p "$REMOTE_PATH"
+          sudo chown -R "$SSH_USER":"$SSH_USER" "$REMOTE_PATH"
+          sudo chmod -R u+rwX,go+rX "$REMOTE_PATH"
+          echo "  ✅ $REMOTE_PATH (owner: $SSH_USER)"
+
+          # ── Pre-create deployment directories ─────────────────────────────────
+          echo ""
+          echo "===> Pre-creating deployment directories..."
+
+          sudo mkdir -p "$APP_STORAGE_HOST_PATH"/{app/private,app/public}
+          sudo chown -R www-data:www-data "$APP_STORAGE_HOST_PATH"
+          echo "  ✅ $APP_STORAGE_HOST_PATH (Laravel app storage owner: www-data)"
+
+          sudo mkdir -p "$APP_LOGS_HOST_PATH"
+          sudo chown -R www-data:www-data "$APP_LOGS_HOST_PATH"
+          echo "  ✅ $APP_LOGS_HOST_PATH (Laravel log storage owner: www-data)"
+
+          sudo mkdir -p "$MYSQL_DATA_HOST_PATH"
+          sudo chown -R 999:999 "$MYSQL_DATA_HOST_PATH"
+          echo "  ✅ $MYSQL_DATA_HOST_PATH (owner: 999 [mysql])"
+
+          echo ""
+          echo "══════════════════════════════════════════════════════════"
+          echo "  ✅  Server setup complete!"
+          echo ""
+          echo "  You can now optionally remove SUDO_PASSWORD from GitHub"
+          echo "  Secrets — the deploy workflow will work without it."
+          echo "══════════════════════════════════════════════════════════"
+
+      - name: Publish summary
+        if: always()
+        env:
+          WORKFLOW_NAME: ${{ github.workflow }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_NUMBER: ${{ github.run_number }}
+          REF_NAME: ${{ github.ref_name }}
+          ACTOR: ${{ github.actor }}
+          JOB_STATUS: ${{ job.status }}
+          SSH_USER: ${{ secrets.SSH_USER }}
+          REMOTE_PATH: ${{ secrets.REMOTE_PATH }}
+        run: |
+          set -euo pipefail
+
+          {
+            echo "# ${WORKFLOW_NAME} Summary"
+            echo ""
+            echo "| Field | Value |"
+            echo "|---|---|"
+            echo "| status | ${JOB_STATUS} |"
+            echo "| ssh user | ${SSH_USER} |"
+            echo "| remote path | ${REMOTE_PATH} |"
+            echo "| run number | ${RUN_NUMBER} |"
+            echo "| run id | ${RUN_ID} |"
+            echo "| ref | ${REF_NAME} |"
+            echo "| actor | ${ACTOR} |"
+          } >> "$GITHUB_STEP_SUMMARY"

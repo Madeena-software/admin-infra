@@ -1,0 +1,102 @@
+name: "Server — Apply Nextcloud Upload Fixes"
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Madeena Standard CI/CD — Nextcloud Server Upload Limit Fix
+#
+# This workflow automatically configures Nginx client body size limits and 
+# buffering on the host, sets the Nextcloud snap PHP settings, and restarts 
+# services to apply the fixes.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+on:
+  workflow_dispatch:
+
+jobs:
+  apply-fixes:
+    name: Apply Upload Limit & Buffering Fixes
+    runs-on: [self-hosted, linux, x64, production]
+    timeout-minutes: 10
+
+    steps:
+      - name: Update Host Nginx Configuration
+        run: |
+          set -x
+          echo "=== Modifying Host Nginx Config ==="
+          
+          # Run safe inline Python replacement on sites-available/root-domain.conf
+          sudo python3 -c '
+          import re
+          path = "/etc/nginx/sites-available/root-domain.conf"
+          
+          with open(path, "r") as f:
+              content = f.read()
+              
+          if "client_max_body_size" not in content:
+              pattern = r"(server_name\s+mhcsgo\.cloud\s*;)"
+              # Insert size limit removal and request/response buffering off right below server_name
+              replacement = r"\1\n\n      # Upload optimizations\n      client_max_body_size 0;\n      proxy_request_buffering off;\n      proxy_buffering off;"
+              updated_content = re.sub(pattern, replacement, content)
+              
+              # Back up original
+              with open(path + ".bak", "w") as f_bak:
+                  f_bak.write(content)
+              
+              # Write new file content
+              with open(path, "w") as f_out:
+                  f_out.write(updated_content)
+              print("✅ Configuration updated successfully. Original backed up to root-domain.conf.bak")
+          else:
+              print("ℹ️ client_max_body_size is already configured.")
+          '
+
+      - name: Update Nextcloud Snap PHP Settings
+        run: |
+          set -x
+          echo "=== Setting PHP Limits in Snap ==="
+          if command -v snap >/dev/null 2>&1; then
+            # Set the upload size parameters and memory limit in Snap Nextcloud
+            sudo snap set nextcloud php.memory-limit=2048M
+            sudo snap set nextcloud php.upload-max-filesize=16G
+            sudo snap set nextcloud php.post-max-size=16G
+            echo "✅ Snap PHP limits updated."
+          else
+            echo "⚠️ snap command not found on host."
+          fi
+
+      - name: Reload Nginx and Restart Nextcloud Snap
+        run: |
+          set -x
+          echo "=== Verifying Nginx Syntax ==="
+          if ! sudo nginx -t; then
+            echo "❌ Nginx syntax check FAILED! Rolling back config..."
+            BACKUP="/etc/nginx/sites-available/root-domain.conf.bak"
+            if [ -f "$BACKUP" ]; then
+              sudo cp "$BACKUP" /etc/nginx/sites-available/root-domain.conf
+              echo "✅ Rollback complete. Original config restored."
+            else
+              echo "⚠️ No backup file found to rollback!"
+            fi
+            exit 1
+          fi
+          
+          echo "=== Reloading Nginx ==="
+          sudo systemctl reload nginx
+          echo "✅ Nginx reloaded."
+          
+          echo "=== Restarting Nextcloud snap service ==="
+          sudo snap restart nextcloud
+          echo "Waiting 5 seconds for Nextcloud to come back online..."
+          sleep 5
+          echo "✅ Nextcloud snap restarted."
+
+      - name: Verify Post-Fix Configurations
+        run: |
+          set -x
+          echo "=== Active Nginx site configuration ==="
+          sudo cat /etc/nginx/sites-available/root-domain.conf
+          
+          echo "=== Active Nextcloud Snap configs ==="
+          sudo snap get nextcloud || true
+          
+          echo "=== Probe Nextcloud site headers ==="
+          curl -I -L https://mhcsgo.cloud || true

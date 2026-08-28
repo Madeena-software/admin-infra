@@ -1,0 +1,401 @@
+name: "Server — Verify Swarm to Host MinIO"
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Madeena Standard CI/CD — Swarm-to-Host MinIO Connectivity & CRUD Test
+#
+# This workflow verifies that containers running inside the Docker Swarm overlay
+# network can reach the MinIO instance listening on the host's port 9000
+# (via host.docker.internal or physical IP) and perform full S3 CRUD operations.
+#
+# RUNNER: Must run on 'self-hosted' (targets the production server directly).
+# ═══════════════════════════════════════════════════════════════════════════════
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: verify-swarm-minio
+  cancel-in-progress: true
+
+jobs:
+  verify-swarm-minio:
+    name: Verify Swarm to MinIO Connectivity
+    runs-on: [self-hosted, linux, x64, production]
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Run Host Pre-flight Checks
+        run: |
+          set -euo pipefail
+          echo "================================================================"
+          echo "           RUNNING HOST PRE-FLIGHT DIAGNOSTICS                  "
+          echo "================================================================"
+
+          # 1. Docker installation check
+          if command -v docker >/dev/null 2>&1; then
+            echo "  ✅ PASS: Docker CLI is available: $(docker --version)"
+          else
+            echo "  ❌ FAIL: Docker is not installed or not in PATH!"
+            exit 1
+          fi
+
+          # 2. Docker Swarm state check
+          SWARM_STATE=$(docker info --format '{{.Swarm.LocalNodeState}}' 2>/dev/null || echo "unknown")
+          SWARM_MANAGER=$(docker info --format '{{.Swarm.ControlAvailable}}' 2>/dev/null || echo "false")
+          echo "  Docker Swarm State: $SWARM_STATE"
+          echo "  Docker Swarm Manager: $SWARM_MANAGER"
+
+          if [ "$SWARM_STATE" != "active" ]; then
+            echo "  ❌ FAIL: Docker Swarm is NOT active on this host! Run 'docker swarm init' first."
+            exit 1
+          fi
+
+          # 3. MinIO local port connection check
+          echo "  Checking if local MinIO is listening on host port 9000..."
+          if timeout 3 bash -c "</dev/tcp/127.0.0.1/9000" 2>/dev/null; then
+            echo "  ✅ PASS: MinIO API is actively listening on host's 127.0.0.1:9000."
+          else
+            echo "❌ FAIL: Local MinIO is not running or port 9000 is not reachable from the host!"
+            exit 1
+          fi
+
+      - name: Run Server Storage & Network Performance Diagnostics
+        env:
+          SUDO_PASSWORD: ${{ secrets.SUDO_PASSWORD }}
+        run: |
+          set -euo pipefail
+          echo "================================================================"
+          echo "         SERVER STORAGE & NETWORK PERFORMANCE DIAGNOSTICS      "
+          echo "================================================================"
+
+          # 1. Print network interface details and routing table
+          echo "▶ Active network interfaces and MTU configuration:"
+          ip addr show
+          echo ""
+          echo "▶ Active routing table:"
+          ip route show
+          echo ""
+
+          # 2. Test disk performance on the MinIO native directory (4TB HDD)
+          MINIO_DATA_DIR="/media/nextcloud-data/minio-data"
+          if [ -d "$MINIO_DATA_DIR" ]; then
+            echo "▶ Testing HDD Disk Write Performance on $MINIO_DATA_DIR..."
+            if echo "$SUDO_PASSWORD" | sudo -S dd if=/dev/zero of="$MINIO_DATA_DIR/test-speed-write.tmp" bs=1M count=21 oflag=direct status=progress; then
+              echo "  ✅ HDD Disk Write Test Succeeded."
+            else
+              echo "  ❌ HDD Disk Write Test Failed!"
+            fi
+            
+            echo "▶ Testing HDD Disk Read Performance..."
+            if echo "$SUDO_PASSWORD" | sudo -S dd if="$MINIO_DATA_DIR/test-speed-write.tmp" of=/dev/null bs=1M count=21 iflag=direct status=progress; then
+              echo "  ✅ HDD Disk Read Test Succeeded."
+            else
+              echo "  ❌ HDD Disk Read Test Failed!"
+            fi
+            
+            # Clean up
+            echo "$SUDO_PASSWORD" | sudo -S rm -f "$MINIO_DATA_DIR/test-speed-write.tmp"
+          else
+            echo "  ⚠️ MinIO native data directory $MINIO_DATA_DIR does not exist. Skipping disk test."
+          fi
+
+      - name: Prepare Network & Pull S3 Client Image
+        id: prep
+        run: |
+          set -euo pipefail
+          echo "================================================================"
+          echo "               PREPARING TEST ENVIRONMENT                       "
+          echo "================================================================"
+
+          # 1. Detect Host IP
+          HOST_IP=$(hostname -I | awk '{print $1}')
+          echo "  Detected Physical Host IP: $HOST_IP"
+          echo "HOST_IP=$HOST_IP" >> "$GITHUB_ENV"
+
+          # 2. Network verification
+          NETWORK_NAME="simama_network"
+          if docker network inspect "$NETWORK_NAME" >/dev/null 2>&1; then
+            echo "  ✅ Overlay network '$NETWORK_NAME' already exists."
+            echo "created_temp_network=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "  ℹ️ Network '$NETWORK_NAME' not found. Creating a temporary attachable overlay network..."
+            docker network create --driver=overlay --attachable "$NETWORK_NAME"
+            echo "  ✅ Temporary overlay network '$NETWORK_NAME' created."
+            echo "created_temp_network=true" >> "$GITHUB_OUTPUT"
+          fi
+
+          # 3. Pre-pull test client image to avoid Swarm task pull timeouts
+          echo "  Pulling minio/mc:latest client image..."
+          docker pull minio/mc:latest
+          echo "  ✅ Image pulled successfully."
+
+      - name: Deploy Swarm Probe & Execute CRUD Test
+        id: test
+        env:
+          SECRET_USER: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          SECRET_PASS: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          SECRET_BUCKET: ${{ secrets.AWS_BUCKET }}
+          SECRET_ENDPOINT: ${{ secrets.AWS_ENDPOINT }}
+        run: |
+          set -euo pipefail
+          echo "================================================================"
+          echo "              DEPLOYING SWARM DIAGNOSTIC SERVICE                "
+          echo "================================================================"
+
+          # Resolve S3 credentials
+          MINIO_USER="${SECRET_USER:-}"
+          if [ -z "$MINIO_USER" ]; then
+            MINIO_USER="minioadmin"
+          fi
+
+          MINIO_PASS="${SECRET_PASS:-}"
+          if [ -z "$MINIO_PASS" ]; then
+            MINIO_PASS="minioadmin"
+          fi
+
+          MINIO_BUCKET="${SECRET_BUCKET:-}"
+          if [ -z "$MINIO_BUCKET" ]; then
+            MINIO_BUCKET="swarm-crud-test"
+          fi
+
+          # Resolve S3 endpoint
+          MINIO_ENDPOINT="${SECRET_ENDPOINT:-}"
+          if [ -z "$MINIO_ENDPOINT" ]; then
+            MINIO_ENDPOINT="http://host.docker.internal:9000"
+          fi
+
+          # Export for step summary
+          echo "FINAL_MINIO_ENDPOINT=$MINIO_ENDPOINT" >> "$GITHUB_ENV"
+
+          # Mask passwords in runner output logs
+          echo "::add-mask::$MINIO_PASS"
+
+          # Export variables for docker stack deploy compose expansion
+          export MINIO_ENDPOINT MINIO_USER MINIO_PASS MINIO_BUCKET
+
+          # Write temporary compose file for Swarm service deployment
+          COMPOSE_FILE="/tmp/simama-minio-probe-compose-${{ github.run_id }}.yml"
+          echo "  Writing temporary compose definition to $COMPOSE_FILE..."
+          
+          cat << 'EOF' > "$COMPOSE_FILE"
+          version: '3.8'
+          services:
+            probe:
+              image: minio/mc:latest
+              deploy:
+                replicas: 1
+                restart_policy:
+                  condition: none
+              networks:
+                - simama_network
+              extra_hosts:
+                - "host.docker.internal:host-gateway"
+              environment:
+                MINIO_ENDPOINT: "${MINIO_ENDPOINT}"
+                MINIO_USER: "${MINIO_USER}"
+                MINIO_PASS: "${MINIO_PASS}"
+                MINIO_BUCKET: "${MINIO_BUCKET}"
+                HOST_IP: "${HOST_IP}"
+              entrypoint: ["/bin/sh", "-c"]
+              command:
+                - |
+                  set -e
+                  echo "Connecting to MinIO endpoint: $$MINIO_ENDPOINT..."
+                  
+                  echo "1. Testing TCP socket connectivity to host.docker.internal:9000..."
+                  if mc alias set test_dns "$$MINIO_ENDPOINT" "$$MINIO_USER" "$$MINIO_PASS"; then
+                    echo "✅ Success: Connected to MinIO using $$MINIO_ENDPOINT"
+                    
+                    # Resolve Bucket & Test existence
+                    if mc ls "test_dns/$$MINIO_BUCKET" >/dev/null 2>&1; then
+                      echo "Bucket '$$MINIO_BUCKET' already exists. Skipping creation."
+                      IS_TEMP_BUCKET=false
+                    else
+                      echo "Creating test bucket: $$MINIO_BUCKET..."
+                      mc mb "test_dns/$$MINIO_BUCKET"
+                      IS_TEMP_BUCKET=true
+                    fi
+                    
+                    echo "Uploading test object..."
+                    echo "Test payload from Swarm container on network simama_network" > /tmp/test-crud.txt
+                    mc cp /tmp/test-crud.txt "test_dns/$$MINIO_BUCKET/test-crud.txt"
+                    
+                    echo "Reading test object..."
+                    mc cat "test_dns/$$MINIO_BUCKET/test-crud.txt"
+                    
+                    echo "Deleting test object..."
+                    mc rm "test_dns/$$MINIO_BUCKET/test-crud.txt"
+
+                    echo "================================================================"
+                    echo "          PERFORMING LARGE FILE LOOPBACK SPEED TEST             "
+                    echo "================================================================"
+                    echo "Generating 21MB dummy DICOM file inside container..."
+                    dd if=/dev/zero of=/tmp/test-large.dcm bs=1M count=21
+                    
+                    echo "Uploading 21MB file to MinIO over Docker loopback..."
+                    time mc cp /tmp/test-large.dcm "test_dns/$$MINIO_BUCKET/test-large.dcm"
+                    
+                    echo "Deleting large test object..."
+                    mc rm "test_dns/$$MINIO_BUCKET/test-large.dcm"
+                    rm -f /tmp/test-large.dcm
+                    echo "================================================================"
+                    
+                     if [ "$$IS_TEMP_BUCKET" = "true" ]; then
+                       echo "Deleting temporary test bucket..."
+                       mc rb "test_dns/$$MINIO_BUCKET"
+                     else
+                       echo "Skipping bucket deletion because it already existed."
+                     fi
+                     
+                     echo "✅ Success: All S3 CRUD operations completed successfully!"
+                   else
+                     echo "❌ Failed to connect using $$MINIO_ENDPOINT"
+                     
+                     if [ -n "$$HOST_IP" ]; then
+                       echo "2. Backup Check: Testing connection via physical Host IP ($$HOST_IP:9000)..."
+                       if mc alias set test_ip "http://$$HOST_IP:9000" "$$MINIO_USER" "$$MINIO_PASS"; then
+                         echo "✅ Success: Connected using physical Host IP ($$HOST_IP)"
+                         echo "ℹ️ Tip: The physical host IP worked, but the container DNS resolution for host.docker.internal failed. Review extra_hosts or firewall settings."
+                       else
+                         echo "❌ Failed to connect using physical Host IP ($$HOST_IP) too."
+                       fi
+                     fi
+                     exit 1
+                   fi
+          networks:
+            simama_network:
+              external: true
+          EOF
+
+          echo "=== COMPOSE FILE CONTENT ==="
+          python3 -c "for i, l in enumerate(open('$COMPOSE_FILE')): print(f'{i+1:3d}: {repr(l)}')"
+          echo "============================="
+
+          STACK_NAME="simama-minio-probe-${{ github.run_id }}"
+          echo "STACK_NAME=$STACK_NAME" >> "$GITHUB_ENV"
+          echo "COMPOSE_FILE=$COMPOSE_FILE" >> "$GITHUB_ENV"
+
+          # Deploy Stack
+          echo "  Deploying stack '$STACK_NAME' to Swarm..."
+          docker stack deploy -c "$COMPOSE_FILE" "$STACK_NAME"
+          
+          # Poll Task
+          SERVICE_NAME="${STACK_NAME}_probe"
+          echo "  Waiting for service '$SERVICE_NAME' to complete task..."
+          
+          PROBE_STATUS="unknown"
+          TASK_ERROR=""
+          
+          for i in $(seq 1 60); do
+            # Inspect first task state and errors
+            TASK_INFO=$(docker service ps "$SERVICE_NAME" --format "{{.CurrentState}} | {{.Error}}" | head -n 1)
+            echo "    [Poll $i/60] State: $TASK_INFO"
+            
+            if echo "$TASK_INFO" | grep -q "Complete"; then
+              PROBE_STATUS="success"
+              break
+            fi
+            
+            if echo "$TASK_INFO" | grep -qE "Failed|Rejected|Shutdown"; then
+              PROBE_STATUS="failed"
+              TASK_ERROR=$(echo "$TASK_INFO" | cut -d'|' -f2 | xargs)
+              break
+            fi
+            sleep 2
+          done
+
+          echo "================================================================"
+          echo "                 SWARM TASK EXECUTION LOGS                      "
+          echo "================================================================"
+          docker service logs "$SERVICE_NAME" || echo "  (Could not fetch service logs)"
+          echo "================================================================"
+
+          # Verify overall status
+          if [ "$PROBE_STATUS" = "success" ]; then
+            echo "✅ Connectivity and S3 CRUD test PASSED."
+            echo "test_result=PASSED" >> "$GITHUB_OUTPUT"
+            echo "test_message=Connectivity and S3 CRUD operations completed successfully." >> "$GITHUB_OUTPUT"
+          else
+            echo "❌ Connectivity and S3 CRUD test FAILED."
+            echo "  Reason: ${TASK_ERROR:-Task timed out or exited with non-zero code}"
+            echo "test_result=FAILED" >> "$GITHUB_OUTPUT"
+            echo "test_message=${TASK_ERROR:-Task timed out or exited with non-zero code}" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+
+      - name: Clean up Swarm Resources
+        if: always()
+        run: |
+          set -euo pipefail
+          echo "================================================================"
+          echo "                    CLEANING UP RESOURCES                       "
+          echo "================================================================"
+
+          # 1. Remove Stack
+          if [ -n "${STACK_NAME:-}" ]; then
+            echo "  Removing Swarm stack '$STACK_NAME'..."
+            docker stack rm "$STACK_NAME" || true
+            
+            # Wait for stack services to be fully removed from network to avoid overlay network busy error
+            echo "  Waiting for services to clear..."
+            sleep 5
+          fi
+
+          # 2. Clean up temp compose file
+          if [ -n "${COMPOSE_FILE:-}" ] && [ -f "$COMPOSE_FILE" ]; then
+            echo "  Removing temporary compose file..."
+            rm -f "$COMPOSE_FILE"
+          fi
+
+          # 3. Clean up network if created dynamically
+          if [ "${{ steps.prep.outputs.created_temp_network }}" = "true" ]; then
+            echo "  Removing temporary overlay network 'simama_network'..."
+            docker network rm simama_network || true
+          fi
+          echo "  ✅ Clean up finished."
+
+      - name: Generate Workflow Step Summary Report
+        if: always()
+        run: |
+          set -euo pipefail
+          
+          RESULT="${{ steps.test.outputs.test_result || 'FAILED (Pre-flight)' }}"
+          MSG="${{ steps.test.outputs.test_message || 'Workflow step failed during execution.' }}"
+          
+          ICON="❌"
+          if [ "$RESULT" = "PASSED" ]; then
+            ICON="✅"
+          fi
+
+          {
+            echo "# Docker Swarm to Host MinIO Connection Audit"
+            echo ""
+            echo "### Status: ${ICON} ${RESULT}"
+            echo ""
+            echo "| Parameter | Value |"
+            echo "|---|---|"
+            echo "| **Tested Endpoint** | \`${{ env.FINAL_MINIO_ENDPOINT }}\` |"
+            echo "| **Overlay Network** | \`simama_network\` |"
+            echo "| **Swarm Manager Node** | \`active\` |"
+            echo "| **Host IP Detected** | \`${{ env.HOST_IP }}\` |"
+            echo "| **Test Result Summary** | ${MSG} |"
+            echo ""
+            
+            if [ "$RESULT" = "PASSED" ]; then
+              echo "> [!NOTE]"
+              echo "> **Successful S3 lifecycle validated:** The Swarm container resolved the host address, initialized the MinIO Client, created a bucket, successfully performed read/write tests, and cleaned up the test environment."
+            else
+              echo "> [!CAUTION]"
+              echo "> **Access Denied or Connection Timeout:** Swarm containers could not connect to port 9000 on the host. Please inspect:"
+              echo "> 1. Host firewall rules (e.g. UFW blocking traffic from the Docker overlay network)."
+              echo "> 2. MinIO configuration (ensure it binds to all interfaces \`0.0.0.0\`, not just loopback \`127.0.0.1\`)."
+              echo "> 3. Docker daemon settings (ensure gateway routing is healthy)."
+            fi
+            
+            echo ""
+            echo "---"
+            echo "*Diagnostics executed dynamically via self-hosted runner on the production server.*"
+          } >> "$GITHUB_STEP_SUMMARY"

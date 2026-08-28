@@ -1,0 +1,51 @@
+name: "Server — Dump Full Nginx Configuration"
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Madeena Standard CI/CD — Full Nginx Debugging
+#
+# This workflow dumps all Nginx configurations on the host to verify every detail
+# of the active server blocks, global limits, and folder mappings.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+on:
+  workflow_dispatch:
+
+jobs:
+  dump-nginx:
+    name: Dump Nginx Configuration
+    runs-on: [self-hosted, linux, x64, production]
+    timeout-minutes: 5
+
+    steps:
+      - name: Audit Nginx Configuration Files and Directories
+        run: |
+          set -x
+          echo "=== Nginx Config Directory Structure ==="
+          ls -la /etc/nginx/ || true
+          
+          echo "=== Nginx sites-enabled Directory ==="
+          ls -la /etc/nginx/sites-enabled/ || true
+          
+          echo "=== Nginx conf.d Directory ==="
+          ls -la /etc/nginx/conf.d/ || true
+
+      - name: Print main nginx.conf
+        run: |
+          set -x
+          echo "=== /etc/nginx/nginx.conf ==="
+          if [ -f "/etc/nginx/nginx.conf" ]; then
+            cat /etc/nginx/nginx.conf
+          else
+            echo "nginx.conf not found!"
+          fi
+
+      - name: Run Full Nginx -T Dump
+        run: |
+          set -x
+          echo "=== Full Nginx -T Dump ==="
+          if command -v nginx >/dev/null 2>&1; then
+            # Dump the entire active compiled Nginx config to standard output
+            sudo nginx -T || true
+          else
+            echo "Nginx not found!"
+          fi

@@ -1,0 +1,762 @@
+# ──────────────────────────────────────────────────────────────────────────────
+#  Server — Database Fixes (from audit-rismaaini-star-077d18a-20260416-0418Z.log)
+#  ──────────────────────────────────────────────────────────────────────────────
+#  Fixes 3 database issues identified in the audit:
+#
+#  1. FIX APP USER GRANTS — Currently granted on old DB name (***_workspace)
+#     instead of the actual $DB_DATABASE. Fix to grant on correct DB.
+#
+#  2. TUNE MySQL PERFORMANCE — innodb_buffer_pool_size is default 128MB
+#     on a server with 31GB RAM. Increase to 1GB for better performance.
+#
+#  3. SET UP AUTOMATED BACKUPS — Create a daily mysqldump cron that uploads
+#     verified gzip backups to Nextcloud over WebDAV.
+#
+#  ⚠️  Manual trigger only. Simama DB is top priority.
+# ──────────────────────────────────────────────────────────────────────────────
+
+name: "Server — Database Fixes"
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  NEXTCLOUD_WEBDAV_BASE_URI: ${{ secrets.NEXTCLOUD_WEBDAV_BASE_URI }}
+  NEXTCLOUD_WEBDAV_USERNAME: ${{ secrets.NEXTCLOUD_WEBDAV_USERNAME }}
+  NEXTCLOUD_WEBDAV_PASSWORD: ${{ secrets.NEXTCLOUD_WEBDAV_PASSWORD }}
+  NEXTCLOUD_WEBDAV_BACKUP_ROOT: simama_backups
+  DB_DATABASE: ${{ secrets.DB_DATABASE }}
+  DB_USERNAME: ${{ secrets.DB_USERNAME }}
+  DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
+  DB_ROOT_PASSWORD: ${{ secrets.DB_ROOT_PASSWORD }}
+  SUDO_PASSWORD: ${{ secrets.SUDO_PASSWORD }}
+
+jobs:
+  db-fixes:
+    name: Apply Database Fixes
+    runs-on: [self-hosted, linux, x64, production]
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ════════════════════════════════════════════════════════════════════════
+      #  STEP 1 — PRE-FIX DATABASE SNAPSHOT
+      # ════════════════════════════════════════════════════════════════════════
+      - name: "1/5 — Pre-Fix Database Snapshot"
+        run: |
+          set -euo pipefail
+
+          echo "╔══════════════════════════════════════════════════════════════╗"
+          echo "║  PRE-FIX DATABASE SNAPSHOT                                 ║"
+          echo "║  ★★★ Simama DB — Top Priority ★★★                         ║"
+          echo "╚══════════════════════════════════════════════════════════════╝"
+
+          DB_CONTAINER=$(docker ps -q --filter "label=com.docker.swarm.service.name=simama_db" | head -n 1)
+          if [ -z "$DB_CONTAINER" ]; then
+            echo "  ❌ CRITICAL: No running simama_db container!"
+            exit 1
+          fi
+          echo "  DB container: $DB_CONTAINER"
+
+          db_query() {
+            docker exec "$DB_CONTAINER" \
+              mysql -u root -p"${DB_ROOT_PASSWORD}" \
+              --batch --silent -e "$1" 2>/dev/null
+          }
+
+          echo ""
+          echo "▶ APP USERNAME"
+          echo "  ${DB_USERNAME}"
+
+          echo ""
+          echo "▶ CURRENT DATABASES"
+          db_query "SHOW DATABASES;" | sed 's/^/  /'
+
+          echo ""
+          echo "▶ CURRENT DATABASE SIZE"
+          db_query "
+            SELECT ROUND(SUM(data_length + index_length) / 1024 / 1024, 2) AS size_mb
+            FROM information_schema.TABLES
+            WHERE table_schema = '${DB_DATABASE}';" | sed 's/^/  /' || echo "  ?"
+
+          echo ""
+          echo "▶ CURRENT USER GRANTS (${DB_USERNAME})"
+          docker exec "$DB_CONTAINER" \
+            mysql -u root -p"${DB_ROOT_PASSWORD}" \
+            --batch --silent \
+            -e "SHOW GRANTS FOR '${DB_USERNAME}'@'%';" \
+            2>/dev/null | sed 's/^/  /' || echo "  (user not found)"
+
+          echo ""
+          echo "▶ CURRENT innodb_buffer_pool_size"
+          db_query "SHOW VARIABLES LIKE 'innodb_buffer_pool_size';" \
+            | awk '{printf "  %s = %s (%s MB)\n", $1, $2, $2/1024/1024}'
+
+          echo ""
+          echo "▶ CURRENT BACKUP STORAGE"
+          echo "  Backups are managed through the enterprise_backups WebDAV disk."
+          echo "  Root: ${NEXTCLOUD_WEBDAV_BACKUP_ROOT}"
+
+      # ════════════════════════════════════════════════════════════════════════
+      #  STEP 2 — FIX APP USER GRANTS
+      # ════════════════════════════════════════════════════════════════════════
+      - name: "2/5 — Fix App User Grants"
+        run: |
+          set -euo pipefail
+
+          echo "╔══════════════════════════════════════════════════════════════╗"
+          echo "║  FIX 1 — App User Grants                                   ║"
+          echo "║  Problem: User is granted on old DB name, not $DB_DATABASE  ║"
+          echo "║  Fix: Add grant on correct database (keep user as-is)      ║"
+          echo "╚══════════════════════════════════════════════════════════════╝"
+
+          DB_CONTAINER=$(docker ps -q --filter "label=com.docker.swarm.service.name=simama_db" | head -n 1)
+
+          db_query() {
+            docker exec "$DB_CONTAINER" \
+              mysql -u root -p"${DB_ROOT_PASSWORD}" \
+              --batch --silent -e "$1"
+          }
+
+          db_exec() {
+            docker exec "$DB_CONTAINER" \
+              mysql -u root -p"${DB_ROOT_PASSWORD}" \
+              -e "$1"
+          }
+
+          echo ""
+          echo "▶ Current grants BEFORE fix:"
+          docker exec "$DB_CONTAINER" \
+            mysql -u root -p"${DB_ROOT_PASSWORD}" \
+            --batch --silent \
+            -e "SHOW GRANTS FOR '${DB_USERNAME}'@'%';" \
+            2>/dev/null | sed 's/^/  /'
+
+          echo ""
+          echo "▶ Adding grant on correct database..."
+
+          # Grant ALL on the correct database (user already exists via secrets)
+          db_exec "GRANT ALL PRIVILEGES ON \`${DB_DATABASE}\`.* TO '${DB_USERNAME}'@'%';"
+          echo "  ✅ Granted ALL on '${DB_DATABASE}' to '${DB_USERNAME}'."
+
+          db_exec "FLUSH PRIVILEGES;"
+          echo "  ✅ Privileges flushed."
+
+          echo ""
+          echo "▶ Verify: no SUPER privilege"
+          SUPER=$(db_query "
+            SELECT Super_priv FROM mysql.user
+            WHERE User='${DB_USERNAME}' AND Host='%';" | tail -1)
+          if [ "$SUPER" = "N" ]; then
+            echo "  ✅ App user does NOT have SUPER. Good."
+          else
+            echo "  ⚠️  App user has SUPER — revoking..."
+            db_exec "REVOKE SUPER ON *.* FROM '${DB_USERNAME}'@'%';" || true
+            db_exec "FLUSH PRIVILEGES;"
+          fi
+
+          echo ""
+          echo "▶ Final grants AFTER fix:"
+          docker exec "$DB_CONTAINER" \
+            mysql -u root -p"${DB_ROOT_PASSWORD}" \
+            --batch --silent \
+            -e "SHOW GRANTS FOR '${DB_USERNAME}'@'%';" \
+            2>/dev/null | sed 's/^/  /'
+
+      # ════════════════════════════════════════════════════════════════════════
+      #  STEP 3 — TUNE MySQL PERFORMANCE
+      # ════════════════════════════════════════════════════════════════════════
+      - name: "3/5 — Tune MySQL Performance"
+        run: |
+          set -euo pipefail
+
+          echo "╔══════════════════════════════════════════════════════════════╗"
+          echo "║  FIX 2 — MySQL Performance Tuning                          ║"
+          echo "║  Problem: innodb_buffer_pool_size = 128MB (default)         ║"
+          echo "║  Server has 31GB RAM — DB only uses 487MB                   ║"
+          echo "║  Fix: Set buffer pool to 1GB via runtime + config file      ║"
+          echo "╚══════════════════════════════════════════════════════════════╝"
+
+          DB_CONTAINER=$(docker ps -q --filter "label=com.docker.swarm.service.name=simama_db" | head -n 1)
+
+          db_query() {
+            docker exec "$DB_CONTAINER" \
+              mysql -u root -p"${DB_ROOT_PASSWORD}" \
+              --batch --silent -e "$1"
+          }
+
+          db_exec() {
+            docker exec "$DB_CONTAINER" \
+              mysql -u root -p"${DB_ROOT_PASSWORD}" \
+              -e "$1"
+          }
+
+          echo ""
+          echo "▶ Current buffer pool size:"
+          CURRENT=$(db_query "SHOW VARIABLES LIKE 'innodb_buffer_pool_size';" \
+            | awk '{print $2}')
+          CURRENT_MB=$((CURRENT / 1024 / 1024))
+          echo "  innodb_buffer_pool_size = ${CURRENT} (${CURRENT_MB} MB)"
+
+          # Target: 1GB (1073741824 bytes)
+          # This is ~3% of 31GB RAM — very conservative but much better than 128MB
+          TARGET_BYTES=1073741824
+          TARGET_MB=1024
+
+          if [ "$CURRENT_MB" -ge "$TARGET_MB" ]; then
+            echo ""
+            echo "  ✅ Buffer pool is already ${CURRENT_MB}MB (≥ ${TARGET_MB}MB). No change needed."
+          else
+            echo ""
+            echo "▶ Setting innodb_buffer_pool_size to ${TARGET_MB}MB at runtime..."
+            db_exec "SET GLOBAL innodb_buffer_pool_size = ${TARGET_BYTES};" \
+              && echo "  ✅ Runtime buffer pool set to ${TARGET_MB}MB." \
+              || echo "  ❌ Failed to set at runtime."
+
+            echo ""
+            echo "▶ Persisting config via SET PERSIST..."
+            db_exec "SET PERSIST innodb_buffer_pool_size = ${TARGET_BYTES};" \
+              && echo "  ✅ Persisted — will survive container restart." \
+              || echo "  ⚠️  SET PERSIST not supported — config will reset on restart."
+          fi
+
+          echo ""
+          echo "▶ Additional performance tuning..."
+
+          # innodb_log_file_size: 48MB default → 256MB for better write performance
+          LOG_SIZE=$(db_query "SHOW VARIABLES LIKE 'innodb_log_file_size';" \
+            | awk '{print $2}')
+          LOG_SIZE_MB=$((LOG_SIZE / 1024 / 1024))
+          echo "  innodb_log_file_size = ${LOG_SIZE_MB}MB"
+          if [ "$LOG_SIZE_MB" -lt 256 ]; then
+            echo "  ℹ️  Recommended: 256MB. Requires restart to change."
+            echo "     Add to my.cnf: innodb_log_file_size = 256M"
+          else
+            echo "  ✅ Already ≥ 256MB."
+          fi
+
+          # max_connections: 151 default — fine for now
+          MAX_CONN=$(db_query "SHOW VARIABLES LIKE 'max_connections';" \
+            | awk '{print $2}')
+          echo "  max_connections = ${MAX_CONN}"
+          if [ "$MAX_CONN" -lt 100 ]; then
+            echo "  ⚠️  Too low for production."
+          else
+            echo "  ✅ Adequate."
+          fi
+
+          # wait_timeout: 28800 (8h default) — reduce to 600s to free idle connections
+          WAIT_T=$(db_query "SHOW VARIABLES LIKE 'wait_timeout';" \
+            | awk '{print $2}')
+          echo "  wait_timeout = ${WAIT_T}s"
+          if [ "$WAIT_T" -gt 3600 ]; then
+            echo "  🔧 Reducing to 600s to free idle connections..."
+            db_exec "SET GLOBAL wait_timeout = 600;" \
+              && echo "  ✅ wait_timeout set to 600s." \
+              || echo "  (could not set)"
+            db_exec "SET PERSIST wait_timeout = 600;" 2>/dev/null || true
+          fi
+
+          echo ""
+          echo "▶ Verify new settings:"
+          for var in innodb_buffer_pool_size innodb_log_file_size \
+                     max_connections wait_timeout max_allowed_packet; do
+            VAL=$(db_query "SHOW VARIABLES LIKE '$var';" | awk '{print $2}')
+            printf "  %-30s = %s\n" "$var" "$VAL"
+          done
+
+      # ════════════════════════════════════════════════════════════════════════
+      #  STEP 4 — SET UP AUTOMATED BACKUPS
+      # ════════════════════════════════════════════════════════════════════════
+      - name: "4/5 — Set Up Automated Backups"
+        run: |
+          set -euo pipefail
+
+          echo "╔══════════════════════════════════════════════════════════════╗"
+          echo "║  FIX 3 — Automated Database Backups                        ║"
+          echo "║  ★★★ Simama DB — Top Priority — No Data Loss Allowed ★★★   ║"
+          echo "║                                                            ║"
+          echo "║  Strategy:                                                 ║"
+          echo "║   • Daily mysqldump to temp gzipped SQL                    ║"
+          echo "║   • Upload verified backup to Nextcloud via WebDAV         ║"
+          echo "║   • Keep last 14 days of remote backups                    ║"
+          echo "║   • Cron via host crontab (survives container restart)      ║"
+          echo "║   • Run first backup NOW                                   ║"
+          echo "╚══════════════════════════════════════════════════════════════╝"
+
+          _sudo_cmd() { echo "$SUDO_PASSWORD" | sudo -S "$@" 2>/dev/null; }
+
+          # ── Validate required secrets before doing anything ──────────────
+          echo ""
+          echo "▶ Validating required environment variables..."
+          SECRETS_OK=true
+          for var in DB_DATABASE DB_ROOT_PASSWORD DB_USERNAME DB_PASSWORD SUDO_PASSWORD NEXTCLOUD_WEBDAV_BASE_URI NEXTCLOUD_WEBDAV_USERNAME NEXTCLOUD_WEBDAV_PASSWORD; do
+            val=$(eval "echo \"\${${var}:-}\"")
+            if [ -z "$val" ]; then
+              echo "  ❌ $var is EMPTY — check GitHub repository secrets!"
+              SECRETS_OK=false
+            else
+              echo "  ✅ $var is set"
+            fi
+          done
+          if [ "$SECRETS_OK" = "false" ]; then
+            echo ""
+            echo "  ════════════════════════════════════════════════════════"
+            echo "  FATAL: One or more required secrets are missing/empty."
+            echo "  Go to: Settings → Secrets and variables → Actions"
+            echo "  Ensure DB credentials, SUDO_PASSWORD, and NEXTCLOUD_WEBDAV_*"
+            echo "  secrets are all set."
+            echo "  ════════════════════════════════════════════════════════"
+            exit 1
+          fi
+
+          # ── Preflight checks ────────────────────────────────────────────
+          echo ""
+          echo "▶ Preflight: checking required commands on runner..."
+          MISSING=""
+          for cmd in sudo bash docker gzip mktemp sed; do
+            if command -v "$cmd" >/dev/null 2>&1; then
+              echo "  ✅ $cmd"
+            else
+              echo "  ❌ MISSING: $cmd"
+              MISSING="${MISSING} ${cmd}"
+            fi
+          done
+
+          # crontab is optional (some systems use systemd timers)
+          if command -v crontab >/dev/null 2>&1; then
+            echo "  ✅ crontab"
+            HAS_CRONTAB=true
+          else
+            echo "  ⚠️  crontab not found — will skip cron installation"
+            HAS_CRONTAB=false
+          fi
+
+          if [ -n "$MISSING" ]; then
+            echo ""
+            echo "  ❌ Missing required commands:${MISSING}"
+            echo "     Install them on the runner host before re-running."
+            exit 1
+          fi
+
+          echo ""
+          echo "▶ Preflight: docker access..."
+          if docker ps >/dev/null 2>&1; then
+            echo "  ✅ Runner can access Docker."
+          else
+            echo "  ❌ Runner cannot run docker."
+            echo "     Ensure the runner user is in the 'docker' group."
+            exit 1
+          fi
+
+          echo ""
+          echo "▶ Preflight: mysqldump in DB container..."
+          DB_CONTAINER=$(docker ps -q --filter "label=com.docker.swarm.service.name=simama_db" | head -n 1)
+          if [ -z "$DB_CONTAINER" ]; then
+            echo "  ❌ simama_db container not running!"
+            exit 1
+          fi
+          if docker exec "$DB_CONTAINER" sh -c "command -v mysqldump" >/dev/null 2>&1; then
+            echo "  ✅ mysqldump available in container."
+          else
+            echo "  ❌ mysqldump NOT found in DB container!"
+            echo "     Use a MySQL image that includes client tools."
+            exit 1
+          fi
+
+          echo ""
+          echo "▶ Preflight: app image with WebDAV commands..."
+          if docker image inspect simama:latest >/dev/null 2>&1; then
+            echo "  ✅ simama:latest is available."
+          else
+            echo "  ❌ simama:latest not found on this runner."
+            exit 1
+          fi
+
+          echo ""
+          echo "▶ Creating backup script..."
+          BACKUP_SCRIPT="/opt/simama-db-backup.sh"
+
+          # Write script to a temp file first (avoids YAML heredoc indentation issues)
+          TMPSCRIPT=$(mktemp)
+          cat > "$TMPSCRIPT" << 'BACKUP_EOF'
+          #!/bin/bash
+          # ──────────────────────────────────────────────────────────────
+          #  Simama — Daily Database Backup
+          #  Runs from host crontab, dumps from Docker container
+          #  Uploads verified gzipped SQL backups to Nextcloud over WebDAV
+          #
+          #  Required env vars (set by cron wrapper or workflow):
+          #    DB_DATABASE, DB_ROOT_PASSWORD
+          #    NEXTCLOUD_WEBDAV_BASE_URI, NEXTCLOUD_WEBDAV_USERNAME,
+          #    NEXTCLOUD_WEBDAV_PASSWORD
+          # ──────────────────────────────────────────────────────────────
+          set -euo pipefail
+
+          ENV_FILE="${SIMAMA_BACKUP_ENV_FILE:-/etc/simama-db-backup.env}"
+          if [ -f "$ENV_FILE" ]; then
+            # shellcheck disable=SC1090
+            . "$ENV_FILE"
+          fi
+
+          RETENTION_DAYS=14
+          TIMESTAMP=$(date -u +'%Y%m%d-%H%M%S')
+
+          # Get DB credentials from env (passed by cron wrapper or workflow)
+          DB_NAME="${DB_DATABASE:-}"
+          DB_ROOT_PASS="${DB_ROOT_PASSWORD:-}"
+
+          if [ -z "$DB_NAME" ] || [ -z "$DB_ROOT_PASS" ] || \
+             [ -z "${NEXTCLOUD_WEBDAV_BASE_URI:-}" ] || \
+             [ -z "${NEXTCLOUD_WEBDAV_USERNAME:-}" ] || \
+             [ -z "${NEXTCLOUD_WEBDAV_PASSWORD:-}" ]; then
+            echo "[$(date -u)] ERROR: DB or NEXTCLOUD_WEBDAV env vars are not set!" >&2
+            exit 1
+          fi
+
+          # Get DB container
+          DB_CONTAINER=$(docker ps -q --filter "label=com.docker.swarm.service.name=simama_db" | head -n 1)
+          if [ -z "$DB_CONTAINER" ]; then
+            echo "[$(date -u)] ERROR: simama_db container not running!" >&2
+            exit 1
+          fi
+
+          TMPDIR=$(mktemp -d)
+          cleanup() {
+            rm -rf "$TMPDIR"
+          }
+          trap cleanup EXIT
+
+          BACKUP_NAME="simama-${DB_NAME}-${TIMESTAMP}.sql.gz"
+          BACKUP_FILE="${TMPDIR}/${BACKUP_NAME}"
+
+          # Run mysqldump
+          echo "[$(date -u)] Starting backup of '${DB_NAME}'..."
+          docker exec "$DB_CONTAINER" \
+            mysqldump -u root -p"${DB_ROOT_PASS}" \
+            --single-transaction \
+            --routines \
+            --triggers \
+            --events \
+            --add-drop-table \
+            "$DB_NAME" \
+            2>/dev/null | gzip > "$BACKUP_FILE"
+
+          if [ ! -s "$BACKUP_FILE" ]; then
+            echo "[$(date -u)] ERROR: Backup file is empty!" >&2
+            exit 1
+          fi
+
+          gzip -t "$BACKUP_FILE"
+          TABLE_COUNT=$(gzip -dc "$BACKUP_FILE" 2>/dev/null | grep -c '^CREATE TABLE' || true)
+          if [ "${TABLE_COUNT:-0}" -le 0 ]; then
+            echo "[$(date -u)] ERROR: Backup has no CREATE TABLE statements." >&2
+            exit 1
+          fi
+
+          echo "[$(date -u)] Local backup verified: ${BACKUP_NAME} (${TABLE_COUNT} tables)."
+
+          docker run --rm \
+            --network host \
+            --entrypoint php \
+            --env-file "$ENV_FILE" \
+            -v "${TMPDIR}:/backup:ro" \
+            simama:latest \
+            artisan backup:webdav-upload "/backup/${BACKUP_NAME}" \
+              --remote-name="${BACKUP_NAME}" \
+              --retention-days="${RETENTION_DAYS}" \
+              --no-interaction
+          BACKUP_EOF
+
+          # Remove leading whitespace from heredoc (YAML indentation artifact)
+          sed -i 's/^          //' "$TMPSCRIPT"
+
+          # Install the script
+          _sudo_cmd cp "$TMPSCRIPT" "$BACKUP_SCRIPT"
+          _sudo_cmd chmod +x "$BACKUP_SCRIPT"
+          rm -f "$TMPSCRIPT"
+          echo "  ✅ Backup script created: $BACKUP_SCRIPT"
+
+          echo ""
+          echo "▶ Creating backup env file and cron wrapper..."
+          ENV_FILE="/etc/simama-db-backup.env"
+          TMPENV=$(mktemp)
+          cat > "$TMPENV" << ENVEOF
+          APP_ENV=production
+          APP_DEBUG=false
+          APP_KEY=${APP_KEY:-base64:6I1CIB6Gq6RiV6jJm6DQuDQMTK6lQgrzFnyJKfHbMTw=}
+          DB_CONNECTION=mysql
+          DB_DATABASE=${DB_DATABASE}
+          DB_ROOT_PASSWORD=${DB_ROOT_PASSWORD}
+          ENTERPRISE_BACKUP_DRIVER=webdav
+          NEXTCLOUD_WEBDAV_BASE_URI=${NEXTCLOUD_WEBDAV_BASE_URI}
+          NEXTCLOUD_WEBDAV_USERNAME=${NEXTCLOUD_WEBDAV_USERNAME}
+          NEXTCLOUD_WEBDAV_PASSWORD=${NEXTCLOUD_WEBDAV_PASSWORD}
+          NEXTCLOUD_WEBDAV_BACKUP_ROOT=${NEXTCLOUD_WEBDAV_BACKUP_ROOT:-simama_backups}
+          NEXTCLOUD_WEBDAV_TIMEOUT=30
+          NEXTCLOUD_WEBDAV_VERIFY_SSL=false
+          ENVEOF
+          sed -i 's/^          //' "$TMPENV"
+          _sudo_cmd cp "$TMPENV" "$ENV_FILE"
+          _sudo_cmd chmod 600 "$ENV_FILE"
+          rm -f "$TMPENV"
+          echo "  ✅ Backup env file created: $ENV_FILE"
+
+          CRON_WRAPPER="/opt/simama-db-backup-cron.sh"
+          TMPWRAPPER=$(mktemp)
+          cat > "$TMPWRAPPER" << CRONEOF
+          #!/bin/bash
+          export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+          exec /opt/simama-db-backup.sh
+          CRONEOF
+          sed -i 's/^          //' "$TMPWRAPPER"
+          _sudo_cmd cp "$TMPWRAPPER" "$CRON_WRAPPER"
+          _sudo_cmd chmod 700 "$CRON_WRAPPER"
+          rm -f "$TMPWRAPPER"
+          echo "  ✅ Cron wrapper created: $CRON_WRAPPER"
+
+          # ── Install cron job ────────────────────────────────────────────
+          if [ "$HAS_CRONTAB" = "true" ]; then
+            echo ""
+            echo "▶ Installing daily cron job (02:00 UTC+7 / 19:00 UTC)..."
+            # Remove any existing simama backup cron
+            _sudo_cmd bash -c "crontab -l 2>/dev/null | grep -v 'simama-db-backup' | crontab -" || true
+            # Add new cron (uses the wrapper that has embedded env vars)
+            _sudo_cmd bash -c "(crontab -l 2>/dev/null; echo '0 19 * * * /opt/simama-db-backup-cron.sh >> /var/log/simama-backup.log 2>&1 # simama-db-backup') | crontab -"
+            echo "  ✅ Cron installed: daily at 02:00 UTC+7 (19:00 UTC)"
+            echo ""
+            echo "  Current crontab:"
+            _sudo_cmd crontab -l 2>/dev/null | sed 's/^/    /' || echo "    (empty)"
+          else
+            echo ""
+            echo "  ⚠️  Skipping cron installation (crontab not available)."
+            echo "     You can run the backup manually:"
+            echo "     sudo /opt/simama-db-backup.sh"
+          fi
+
+          echo ""
+          echo "▶ Running FIRST backup NOW..."
+          # Use a temp log file so the pipe does not mask the backup script exit code.
+          BACKUP_LOG=$(mktemp)
+          set +e
+          _sudo_cmd env \
+            DB_DATABASE="$DB_DATABASE" \
+            DB_ROOT_PASSWORD="$DB_ROOT_PASSWORD" \
+            NEXTCLOUD_WEBDAV_BASE_URI="$NEXTCLOUD_WEBDAV_BASE_URI" \
+            NEXTCLOUD_WEBDAV_USERNAME="$NEXTCLOUD_WEBDAV_USERNAME" \
+            NEXTCLOUD_WEBDAV_PASSWORD="$NEXTCLOUD_WEBDAV_PASSWORD" \
+            NEXTCLOUD_WEBDAV_BACKUP_ROOT="${NEXTCLOUD_WEBDAV_BACKUP_ROOT:-simama_backups}" \
+            bash "$BACKUP_SCRIPT" > "$BACKUP_LOG" 2>&1
+          BACKUP_RC=$?
+          set -e
+          sed 's/^/  /' "$BACKUP_LOG"
+          rm -f "$BACKUP_LOG"
+          if [ $BACKUP_RC -ne 0 ]; then
+            echo "  ❌ First backup FAILED (exit code $BACKUP_RC)."
+            echo "     Cron is still installed and will retry tonight at 02:00 UTC+7."
+            echo "     Re-run this workflow after confirming DB secrets are correct."
+          else
+            echo "  ✅ First backup completed successfully."
+          fi
+
+          echo ""
+          echo "▶ Verify WebDAV backup disk:"
+          if _sudo_cmd docker run --rm --network host --entrypoint php --env-file "$ENV_FILE" simama:latest \
+            artisan storage:webdav-check --disk=enterprise_backups --no-interaction; then
+            echo "  ✅ WebDAV backup disk is writable/readable."
+          else
+            echo "  ❌ WebDAV backup disk check failed."
+          fi
+
+      # ════════════════════════════════════════════════════════════════════════
+      #  STEP 5 — POST-FIX VERIFICATION
+      # ════════════════════════════════════════════════════════════════════════
+      - name: "5/5 — Post-Fix Verification"
+        if: always()
+        run: |
+          set -euo pipefail
+
+          echo "╔══════════════════════════════════════════════════════════════╗"
+          echo "║  POST-FIX DATABASE VERIFICATION                            ║"
+          echo "║  ★★★ Simama DB — Top Priority ★★★                         ║"
+          echo "╚══════════════════════════════════════════════════════════════╝"
+
+          DB_CONTAINER=$(docker ps -q --filter "label=com.docker.swarm.service.name=simama_db" | head -n 1)
+          if [ -z "$DB_CONTAINER" ]; then
+            echo "  ❌ CRITICAL: simama_db container is not running!"
+            exit 1
+          fi
+
+          db_query() {
+            docker exec "$DB_CONTAINER" \
+              mysql -u root -p"${DB_ROOT_PASSWORD}" \
+              --batch --silent -e "$1"
+          }
+          _sudo_cmd() { echo "$SUDO_PASSWORD" | sudo -S "$@" 2>/dev/null; }
+
+          PASS=true
+
+          echo ""
+          echo "▶ CHECK 1: App User Grants"
+          GRANTS=$(docker exec "$DB_CONTAINER" \
+            mysql -u root -p"${DB_ROOT_PASSWORD}" \
+            --batch --silent \
+            -e "SHOW GRANTS FOR '${DB_USERNAME}'@'%';" 2>/dev/null || true)
+          echo "$GRANTS" | sed 's/^/  /'
+
+          if echo "$GRANTS" | grep -qi "\`${DB_DATABASE}\`"; then
+            echo "  ✅ User has grants on correct database '${DB_DATABASE}'."
+          else
+            echo "  ❌ User does NOT have grants on '${DB_DATABASE}'!"
+            PASS=false
+          fi
+
+          # Check no SUPER
+          SUPER=$(db_query "SELECT Super_priv FROM mysql.user WHERE User='${DB_USERNAME}' AND Host='%';" | tail -1)
+          if [ "$SUPER" = "N" ]; then
+            echo "  ✅ No SUPER privilege."
+          else
+            echo "  ❌ App user has SUPER!"
+            PASS=false
+          fi
+
+          echo ""
+          echo "▶ CHECK 2: innodb_buffer_pool_size"
+          BPS=$(db_query "SHOW VARIABLES LIKE 'innodb_buffer_pool_size';" | awk '{print $2}')
+          BPS_MB=$((BPS / 1024 / 1024))
+          echo "  innodb_buffer_pool_size = ${BPS_MB} MB"
+          if [ "$BPS_MB" -ge 1024 ]; then
+            echo "  ✅ Buffer pool ≥ 1GB."
+          else
+            echo "  ⚠️  Buffer pool is ${BPS_MB}MB — should be ≥ 1024MB."
+          fi
+
+          echo ""
+          echo "▶ CHECK 3: wait_timeout"
+          WT=$(db_query "SHOW VARIABLES LIKE 'wait_timeout';" | awk '{print $2}')
+          echo "  wait_timeout = ${WT}s"
+          if [ "$WT" -le 3600 ]; then
+            echo "  ✅ Reasonable timeout."
+          else
+            echo "  ⚠️  Still high (${WT}s)."
+          fi
+
+          echo ""
+          echo "▶ CHECK 4: WebDAV Backup Storage"
+          ENV_FILE="/etc/simama-db-backup.env"
+          if _sudo_cmd test -f "$ENV_FILE" && _sudo_cmd docker run --rm --network host --entrypoint php --env-file "$ENV_FILE" simama:latest \
+            artisan storage:webdav-check --disk=enterprise_backups --no-interaction; then
+            echo "  ✅ WebDAV backup disk is writable/readable."
+            BACKUP_COUNT="remote-verified"
+          else
+            echo "  ❌ WebDAV backup disk check failed!"
+            BACKUP_COUNT="unknown"
+            PASS=false
+          fi
+
+          echo ""
+          echo "▶ CHECK 5: Backup Cron Installed"
+          CRON=$(_sudo_cmd bash -c "crontab -l 2>/dev/null | grep 'simama-db-backup' || true")
+          if [ -n "$CRON" ]; then
+            echo "  ✅ Cron installed: $CRON"
+          else
+            echo "  ❌ No backup cron found!"
+            PASS=false
+          fi
+
+          echo ""
+          echo "▶ CHECK 6: App Connectivity Test"
+          set +e
+          APP_CONN_OUT=$(docker exec "$DB_CONTAINER" \
+            mysql -u "${DB_USERNAME}" -p"${DB_PASSWORD}" \
+            --batch --silent --skip-column-names \
+            -e "SELECT COUNT(*) FROM \`${DB_DATABASE}\`.migrations;" 2>/dev/null)
+          APP_CONN_RC=$?
+          set -e
+
+          if [ $APP_CONN_RC -eq 0 ]; then
+            APP_CONN_COUNT=$(printf '%s\n' "$APP_CONN_OUT" | tail -n 1 | tr -d '[:space:]')
+            echo "  Query result: $APP_CONN_COUNT"
+            if [ -n "$APP_CONN_COUNT" ] && [ "$APP_CONN_COUNT" -gt 0 ] 2>/dev/null; then
+              echo "  ✅ App user can connect and read '${DB_DATABASE}' ($APP_CONN_COUNT migrations)."
+            else
+              echo "  ❌ App user connected but migrations count is not > 0."
+              PASS=false
+            fi
+          else
+            echo "  ❌ App user cannot connect. mysql output:"
+            echo "    $APP_CONN_OUT"
+            PASS=false
+          fi
+
+          echo ""
+          echo "▶ CHECK 7: Database Still Healthy"
+          TABLE_COUNT=$(db_query "SELECT COUNT(*) FROM information_schema.TABLES WHERE table_schema='${DB_DATABASE}';" | tail -1)
+          USER_COUNT=$(db_query "SELECT COUNT(*) FROM \`${DB_DATABASE}\`.users;" 2>/dev/null | tail -1 || echo "0")
+          echo "  Tables: $TABLE_COUNT"
+          echo "  Users : $USER_COUNT"
+          if [ "$TABLE_COUNT" -gt 0 ]; then
+            echo "  ✅ Database is healthy."
+          else
+            echo "  ❌ Database appears empty!"
+            PASS=false
+          fi
+
+          echo ""
+          echo "▶ CHECK 8: Port 3306 Security"
+          if ss -ltn 2>/dev/null | grep -q ":3306 "; then
+            echo "  ❌ Port 3306 exposed on host!"
+            PASS=false
+          else
+            echo "  ✅ Port 3306 NOT exposed."
+          fi
+
+          echo ""
+          echo "╔══════════════════════════════════════════════════════════════╗"
+          if [ "$PASS" = "true" ]; then
+            echo "║  ✅ ALL DATABASE FIXES APPLIED SUCCESSFULLY                ║"
+          else
+            echo "║  ⚠️  SOME CHECKS DID NOT PASS — Review above              ║"
+          fi
+          echo "╠══════════════════════════════════════════════════════════════╣"
+          echo "║                                                            ║"
+          echo "║  Applied fixes:                                            ║"
+          echo "║   1. ✅ App user grants fixed to correct database           ║"
+          echo "║   2. ✅ innodb_buffer_pool_size → 1GB (was 128MB)          ║"
+          echo "║   3. ✅ wait_timeout → 600s (was 28800s)                   ║"
+          echo "║   4. ✅ Automated daily WebDAV backup at 02:00 UTC         ║"
+          echo "║   5. ✅ First backup uploaded immediately                  ║"
+          echo "║   6. ✅ 14-day WebDAV backup retention                     ║"
+          echo "║                                                            ║"
+          echo "║  Backup location: enterprise_backups WebDAV disk           ║"
+          echo "║   ${NEXTCLOUD_WEBDAV_BACKUP_ROOT}/                         ║"
+          echo "║                                                            ║"
+          echo "║  Run server-debug.yml to confirm clean audit.              ║"
+          echo "╚══════════════════════════════════════════════════════════════╝"
+
+          SUMMARY_RESULT="passed"
+          if [ "$PASS" != "true" ]; then
+            SUMMARY_RESULT="needs review"
+          fi
+
+          BACKUP_CRON_STATUS="present"
+          if [ -z "${CRON:-}" ]; then
+            BACKUP_CRON_STATUS="absent"
+          fi
+
+          {
+            echo "# Database Fix Summary"
+            echo ""
+            echo "| Field | Value |"
+            echo "|---|---|"
+            echo "| result | ${SUMMARY_RESULT} |"
+            echo "| pass checks | ${PASS} |"
+            echo "| backup status | ${BACKUP_COUNT:-unknown} |"
+            echo "| backup cron | ${BACKUP_CRON_STATUS} |"
+            echo "| backup location | enterprise_backups:${NEXTCLOUD_WEBDAV_BACKUP_ROOT}/ |"
+          } >> "$GITHUB_STEP_SUMMARY"

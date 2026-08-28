@@ -1,0 +1,97 @@
+name: "Server — Diagnose Nextcloud Upload Limits"
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Madeena Standard CI/CD — Nextcloud Server Upload Limit Diagnostic
+#
+# This workflow runs diagnostics on the self-hosted runner to find out where
+# the HTTP 413 "Payload Too Large" error is originating on the Nextcloud server.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+on:
+  workflow_dispatch:
+
+jobs:
+  diagnose-nextcloud:
+    name: Diagnose Nextcloud Limits
+    runs-on: [self-hosted, linux, x64, production]
+    timeout-minutes: 5
+
+    steps:
+      - name: System Web Server Diagnostics
+        run: |
+          set -x
+          echo "=== Nginx Active Configuration Check ==="
+          if command -v nginx >/dev/null 2>&1; then
+            echo "✅ Nginx is installed on the host."
+            echo "Searching for client_max_body_size in Nginx configuration..."
+            sudo grep -rn "client_max_body_size" /etc/nginx/ || echo "⚠️ client_max_body_size not set in Nginx configuration (defaults to 1M!)"
+            
+            echo "Checking Nginx process state..."
+            ps aux | grep nginx | grep -v grep || true
+          else
+            echo "⚠️ Nginx not installed on host."
+          fi
+
+          echo "=== Apache Active Configuration Check ==="
+          if command -v apache2 >/dev/null 2>&1; then
+            echo "✅ Apache is installed on the host."
+            sudo grep -rn "LimitRequestBody" /etc/apache2/ || echo "✅ LimitRequestBody not restricted (default)."
+          else
+            echo "⚠️ Apache not installed on host."
+          fi
+
+      - name: PHP Config Diagnostics
+        run: |
+          set -x
+          echo "=== Active CLI PHP Configuration ==="
+          php -i | grep -E "upload_max_filesize|post_max_size|memory_limit|max_execution_time" || true
+          
+          echo "=== Searching for FPM php.ini file ==="
+          sudo find /etc/php/ -name "php.ini" -exec echo "Found config file: {}" \; -exec sudo grep -H -E "upload_max_filesize|post_max_size" {} \; || true
+
+      - name: Docker Container Check (If Nextcloud runs in Docker)
+        run: |
+          set -x
+          echo "=== Docker Container Check ==="
+          if command -v docker >/dev/null 2>&1; then
+            echo "✅ Docker is installed."
+            echo "Listing running containers related to Nextcloud, Nginx, Proxy, or Caddy:"
+            docker ps -a --filter "name=nextcloud" --filter "name=nginx" --filter "name=caddy" --filter "name=proxy" --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}" || true
+            
+            # Inspect environment variables or volumes of nextcloud container if exists
+            NEXTCLOUD_CONTAINER=$(docker ps -q --filter "name=nextcloud" | head -n 1)
+            if [ -n "$NEXTCLOUD_CONTAINER" ]; then
+              echo "Inspecting PHP settings in container $NEXTCLOUD_CONTAINER:"
+              docker exec "$NEXTCLOUD_CONTAINER" php -i 2>/dev/null | grep -E "upload_max_filesize|post_max_size" || echo "⚠️ Could not run php -i inside container."
+            fi
+          else
+            echo "⚠️ Docker not installed."
+          fi
+
+      - name: Nextcloud Configuration Check
+        run: |
+          set -x
+          echo "=== Nextcloud OCC and Config check ==="
+          # Search for nextcloud directories on host
+          NC_DIR=""
+          for path in /var/www/nextcloud /var/www/html/nextcloud /var/www/nextcloud-aio /var/snap/nextcloud; do
+            if [ -d "$path" ]; then
+              NC_DIR="$path"
+              break
+            fi
+          done
+
+          if [ -n "$NC_DIR" ]; then
+            echo "✅ Found Nextcloud path: $NC_DIR"
+            if [ -f "$NC_DIR/config/config.php" ]; then
+              sudo grep -E "upload_max_filesize|post_max_size" "$NC_DIR/config/config.php" || true
+            fi
+          else
+            echo "⚠️ Could not locate Nextcloud installation path on the host system."
+          fi
+
+      - name: HTTP Response Headers Probe
+        run: |
+          set -x
+          echo "=== Probing Nextcloud HTTP Response Headers ==="
+          curl -I -L https://mhcsgo.cloud || true

@@ -1,0 +1,108 @@
+name: "Server — Deep Nextcloud Diagnostics"
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Madeena Standard CI/CD — Nextcloud Deep Server Diagnostic
+#
+# This workflow runs deep diagnostics on the self-hosted runner to find out details
+# about Nginx configs, Snap services, PHP configuration, and Nextcloud app settings.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+on:
+  workflow_dispatch:
+
+jobs:
+  diagnose-deep:
+    name: Deep Nextcloud Diagnostics
+    runs-on: [self-hosted, linux, x64, production]
+    timeout-minutes: 10
+
+    steps:
+      - name: Nginx Host Config Inspection
+        run: |
+          set -x
+          echo "=== Nginx Active configuration for mhcsgo.cloud ==="
+          if command -v nginx >/dev/null 2>&1; then
+            echo "✅ Nginx is installed."
+            
+            # Find all files mentioning mhcsgo.cloud (excluding backups)
+            FILES=$(sudo grep -rl "mhcsgo.cloud" /etc/nginx/ | grep -v "madeena-backups" || true)
+            if [ -n "$FILES" ]; then
+              for f in $FILES; do
+                echo "--- File: $f ---"
+                sudo cat "$f"
+                echo "----------------"
+              done
+            else
+              echo "⚠️ No active Nginx configuration files mentioning mhcsgo.cloud found."
+            fi
+            
+            # Dump Nginx's view of active configs (grepping for client_max_body_size and server_name)
+            echo "=== Nginx -T Dump (Filtered) ==="
+            sudo nginx -T 2>&1 | grep -E "server_name|client_max_body_size|proxy_pass|listen" || true
+          else
+            echo "⚠️ Nginx command not found on host."
+          fi
+
+      - name: Nextcloud Snap Config Audit
+        run: |
+          set -x
+          echo "=== Nextcloud Snap Config & Services ==="
+          if command -v snap >/dev/null 2>&1; then
+            echo "✅ snap CLI is installed."
+            
+            echo "Listing snap services..."
+            sudo snap services nextcloud || sudo snap services || true
+            
+            echo "Querying nextcloud snap config..."
+            sudo snap get nextcloud || true
+          else
+            echo "⚠️ snap command not found on host."
+          fi
+
+      - name: Nextcloud config.php Inspection
+        run: |
+          set -x
+          echo "=== config.php files ==="
+          
+          # Find all config.php files under snap directories
+          CONFIG_FILES=$(sudo find /var/snap/nextcloud/ -name "config.php" || true)
+          if [ -n "$CONFIG_FILES" ]; then
+            for f in $CONFIG_FILES; do
+              echo "--- File: $f ---"
+              # Cat file but filter out sensitive credentials
+              sudo cat "$f" | grep -v -E "password|secret|salt|dbpassword|instanceid" || true
+              echo "----------------"
+            done
+          else
+            echo "⚠️ No config.php found in /var/snap/nextcloud/"
+          fi
+
+      - name: Nextcloud OCC Config Audit
+        run: |
+          set -x
+          echo "=== nextcloud.occ configuration list ==="
+          
+          # Determine the occ command path
+          OCC_CMD=""
+          if command -v nextcloud.occ >/dev/null 2>&1; then
+            OCC_CMD="nextcloud.occ"
+          elif [ -f "/snap/bin/nextcloud.occ" ]; then
+            OCC_CMD="/snap/bin/nextcloud.occ"
+          fi
+          
+          if [ -n "$OCC_CMD" ]; then
+            echo "✅ OCC command found: $OCC_CMD"
+            echo "Running occ config:list..."
+            sudo $OCC_CMD config:list || true
+          else
+            echo "⚠️ nextcloud.occ command not found."
+          fi
+
+      - name: System Space and Memory Status
+        run: |
+          set -x
+          echo "=== System Space ==="
+          df -h || true
+          
+          echo "=== System Memory ==="
+          free -m || true

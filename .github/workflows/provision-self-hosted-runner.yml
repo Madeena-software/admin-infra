@@ -419,7 +419,7 @@ jobs:
           echo "Workspace: $GITHUB_WORKSPACE"
 
           # Sleep to allow all 5 matrix jobs to run concurrently across the 5 runner pool processes
-          sleep 12
+          sleep 60
           END_TS=$(date +%s)
 
           mkdir -p proof

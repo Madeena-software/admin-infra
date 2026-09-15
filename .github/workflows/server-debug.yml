@@ -60,11 +60,11 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: "1. Service Authority Mapping (madeena-monitor.service)"
+      - name: "1. Service Authority & Configuration Mapping (madeena-monitor.service)"
         timeout-minutes: 2
         run: |
           set -euo pipefail
-          echo "=== SYSTEMD SERVICE AUTHORITY MAPPING ==="
+          echo "=== SYSTEMD SERVICE AUTHORITY & CONFIGURATION MAPPING ==="
           if ! command -v systemctl >/dev/null 2>&1; then
             echo "COMMAND UNAVAILABLE (systemctl not found)"
             exit 0
@@ -85,7 +85,9 @@ jobs:
           echo "Group: $svc_group"
           echo "WorkingDirectory: $svc_cwd"
 
-          # EnvironmentFiles: output PATH(s) only
+          mkdir -p .diag_meta
+
+          # EnvironmentFiles: output PATH(s) only (handle multiple paths cleanly)
           raw_env_files=$(systemctl show madeena-monitor.service -p EnvironmentFiles --value 2>/dev/null || true)
           parsed_env_paths=""
           if [ -n "$raw_env_files" ]; then
@@ -94,27 +96,95 @@ jobs:
           else
             echo "EnvironmentFiles: NONE"
           fi
+          echo "${parsed_env_paths:-NONE}" > .diag_meta/env_files
+
+          # Direct Environment property: strictly parse allowlisted threshold keys only
+          raw_direct_env=$(systemctl show madeena-monitor.service -p Environment --value 2>/dev/null || true)
+          echo ""
+          echo "--- Direct systemd Environment Property Inspection ---"
+          direct_found="false"
+          direct_key="none"
+          direct_val="none"
+
+          if [ -n "$raw_direct_env" ]; then
+            direct_matches=$(printf '%s\n' "$raw_direct_env" | awk -v RS='[[:space:]]+' -F= '
+              NF >= 2 {
+                k = $1; v = substr($0, index($0, "=") + 1);
+                gsub(/^["\x27]|["\x27]$/, "", v);
+                uk = toupper(k);
+                if (uk ~ /DISK/ && (uk ~ /THRESHOLD/ || uk ~ /CRITICAL/)) {
+                  if (v ~ /^[0-9]+([.][0-9]+)?%?$/) {
+                    print k "=" v;
+                  } else {
+                    print k "=<non-numeric-redacted>";
+                  }
+                }
+              }
+            ' || true)
+
+            if [ -n "$direct_matches" ]; then
+              direct_found="true"
+              echo "$direct_matches" | while read -r line; do
+                echo "  direct_env_threshold: $line"
+              done
+              direct_key=$(echo "$direct_matches" | head -1 | cut -d= -f1)
+              direct_val=$(echo "$direct_matches" | head -1 | cut -d= -f2)
+            else
+              echo "  direct_env_threshold_found=false (No matching threshold variables in systemd Environment)"
+            fi
+          else
+            echo "  direct_env_threshold_found=false (Environment property is empty)"
+          fi
+          echo "$direct_found" > .diag_meta/direct_env_threshold_found
+          echo "$direct_key" > .diag_meta/direct_env_threshold_key
+          echo "$direct_val" > .diag_meta/direct_env_threshold_value
 
           # MainPID
           main_pid=$(systemctl show madeena-monitor.service -p MainPID --value 2>/dev/null || echo '0')
           echo "MainPID: $main_pid"
+          echo "$main_pid" > .diag_meta/main_pid
 
-          # ExecStart: extract executable pathname only, without argv
+          # ExecStart: extract executable pathname only and parse allowlisted CLI threshold arguments safely
           raw_exec_start=$(systemctl show madeena-monitor.service -p ExecStart --value 2>/dev/null || true)
           exec_path="UNRESOLVED"
+          exec_arg_found="false"
+          exec_arg_name="none"
+          exec_arg_val="none"
+
           if [ -n "$raw_exec_start" ]; then
             exec_path=$(echo "$raw_exec_start" | grep -oE 'path=[^ ;]+' | cut -d= -f2 || echo "UNRESOLVED")
             echo "ExecStart executable path: ${exec_path:-UNRESOLVED}"
+
+            # Safely parse allowlisted CLI arguments without echoing arbitrary argv
+            arg_matches=$(printf '%s\n' "$raw_exec_start" | awk '{
+              for (i = 1; i <= NF; i++) {
+                if ($i ~ /^--disk[-_]?(critical[-_]?)?threshold=[0-9]+([.][0-9]+)?%?$/) {
+                  split($i, kv, "=");
+                  print kv[1] "=" kv[2];
+                } else if ($i ~ /^--disk[-_]?(critical[-_]?)?threshold$/ && (i+1) <= NF && $(i+1) ~ /^[0-9]+([.][0-9]+)?%?$/) {
+                  print $i "=" $(i+1);
+                }
+              }
+            }' || true)
+
+            if [ -n "$arg_matches" ]; then
+              exec_arg_found="true"
+              exec_arg_name=$(echo "$arg_matches" | head -1 | cut -d= -f1)
+              exec_arg_val=$(echo "$arg_matches" | head -1 | cut -d= -f2)
+              echo "ExecStart allowlisted threshold argument: $exec_arg_name=$exec_arg_val"
+            else
+              echo "ExecStart threshold argument: exec_arg_threshold_found=false"
+            fi
           else
             echo "ExecStart executable path: UNRESOLVED"
+            echo "ExecStart threshold argument: EXECSTART THRESHOLD ARGUMENT INSPECTION UNRESOLVED"
           fi
 
-          # Persist discovered authority metadata for downstream step gates
-          mkdir -p .diag_meta
           echo "$exec_path" > .diag_meta/exec_path
           echo "$svc_cwd" > .diag_meta/svc_cwd
-          echo "$main_pid" > .diag_meta/main_pid
-          echo "${parsed_env_paths:-NONE}" > .diag_meta/env_files
+          echo "$exec_arg_found" > .diag_meta/exec_arg_threshold_found
+          echo "$exec_arg_name" > .diag_meta/exec_arg_name
+          echo "$exec_arg_val" > .diag_meta/exec_arg_val
 
       - name: "2. Running-Process Identity Mapping & Authority Verification"
         timeout-minutes: 1
@@ -283,7 +353,6 @@ jobs:
               fi
             else
               echo "Authoritative executable is binary; inspecting sanitized identifier counts only (NO raw strings):"
-              # Count allowlisted identifier occurrences without echoing raw strings
               for tok in "dotenv" "environmentfile" "disk_threshold" "disk_critical"; do
                 cnt=$(strings -n 4 "$exec_path" 2>/dev/null | grep -ciF "$tok" || true)
                 if [ "$cnt" -gt 0 ]; then
@@ -305,7 +374,6 @@ jobs:
           set -euo pipefail
           echo "=== ENVIRONMENT-FILE AUTHORITY GATING & THRESHOLD INSPECTION ==="
 
-          # Safe non-interactive sudo helper
           _sudo() {
             if [ -n "${SUDO_PASSWORD:-}" ]; then
               printf '%s\n' "$SUDO_PASSWORD" | sudo -S -p '' -- "$@" 2>/dev/null
@@ -315,78 +383,123 @@ jobs:
           }
 
           auth_conflict=$(cat .diag_meta/authority_conflict 2>/dev/null || echo 'false')
-          env_files_meta=$(cat .diag_meta/env_files 2>/dev/null || echo 'NONE')
+          raw_env_files=$(cat .diag_meta/env_files 2>/dev/null || echo 'NONE')
           program_linked_file=$(cat .diag_meta/program_linked_file 2>/dev/null || echo '')
 
-          linkage_state="NOT_AUTHORITATIVELY_LINKED"
-          authoritative_env_target=""
+          # Discovered threshold state initialization
+          env_threshold_found="false"
+          env_threshold_source_path="none"
+          env_threshold_key="none"
+          env_threshold_numeric_value="none"
+          env_definitions_count=0
+
+          program_config_threshold_found="false"
+          program_config_path="none"
+          program_config_threshold_key="none"
+          program_config_threshold_value="none"
 
           if [ "$auth_conflict" = "true" ]; then
             echo "AUTHORITY CONFLICT: Process/service mismatch detected. Skipping environment file inspection."
             echo "ENV SOURCE NOT AUTHORITATIVELY LINKED"
-            exit 0
-          fi
+          else
+            # Part 1: Process ALL systemd EnvironmentFiles in order
+            if [ -n "$raw_env_files" ] && [ "$raw_env_files" != "NONE" ]; then
+              echo "--- Inspecting systemd EnvironmentFiles in discovered order ---"
+              for env_file in $raw_env_files; do
+                echo "Inspecting EnvironmentFile: $env_file"
+                echo "  linked=true"
+                if [ ! -e "$env_file" ]; then
+                  echo "  exists=false readable_directly=false threshold_key=none threshold_value=none"
+                  continue
+                fi
+                is_readable="false"
+                if [ -r "$env_file" ]; then is_readable="true"; fi
+                echo "  exists=true readable_directly=$is_readable"
 
-          # 1. Evaluate Path A: systemd linkage
-          if [ -n "$env_files_meta" ] && [ "$env_files_meta" != "NONE" ]; then
-            first_env=$(echo "$env_files_meta" | awk '{print $1}')
-            if [ -n "$first_env" ] && [ -e "$first_env" ]; then
-              linkage_state="SYSTEMD_LINKED"
-              authoritative_env_target="$first_env"
-              echo "Linkage evaluation: SYSTEMD_LINKED ($first_env referenced in service EnvironmentFiles)"
+                # Parse strictly through allowlist using _sudo
+                parsed_thresholds=$(_sudo cat "$env_file" 2>/dev/null | awk -F= '
+                  !/^[[:space:]]*(#|$)/ && NF >= 2 {
+                    k = $1; sub(/^[[:space:]]+/, "", k); sub(/[[:space:]]+$/, "", k);
+                    v = substr($0, index($0, "=") + 1); sub(/^[[:space:]]+/, "", v); sub(/[[:space:]]+$/, "", v);
+                    gsub(/^["\x27]|["\x27]$/, "", v);
+                    uk = toupper(k);
+                    if (uk ~ /DISK/ && (uk ~ /THRESHOLD/ || uk ~ /CRITICAL/)) {
+                      if (v ~ /^[0-9]+([.][0-9]+)?%?$/) {
+                        print k "=" v;
+                      } else {
+                        print k "=<non-numeric-redacted>";
+                      }
+                    }
+                  }
+                ' || true)
+
+                if [ -n "$parsed_thresholds" ]; then
+                  while read -r match_line; do
+                    [ -n "$match_line" ] || continue
+                    env_definitions_count=$((env_definitions_count + 1))
+                    tk=$(echo "$match_line" | cut -d= -f1)
+                    tv=$(echo "$match_line" | cut -d= -f2)
+                    echo "  threshold_key=$tk threshold_value=$tv"
+                    if [ "$env_threshold_found" = "false" ]; then
+                      env_threshold_found="true"
+                      env_threshold_source_path="$env_file"
+                      env_threshold_key="$tk"
+                      env_threshold_numeric_value="$tv"
+                    fi
+                  done <<< "$parsed_thresholds"
+                else
+                  echo "  threshold_key=none threshold_value=none"
+                fi
+              done
             fi
-          fi
 
-          # 2. Evaluate Path B: program-level linkage if not systemd linked
-          if [ "$linkage_state" = "NOT_AUTHORITATIVELY_LINKED" ] && [ -n "$program_linked_file" ]; then
-            if [ -e "$program_linked_file" ]; then
-              linkage_state="PROGRAM_LINKED"
-              authoritative_env_target="$program_linked_file"
-              echo "Linkage evaluation: PROGRAM_LINKED ($program_linked_file positively verified from program metadata)"
-            fi
-          fi
-
-          echo "Final Linkage State: $linkage_state"
-          echo "$linkage_state" > .diag_meta/linkage_state
-          echo "$authoritative_env_target" > .diag_meta/authoritative_env_target
-
-          # Gating enforcement: NEVER sudo-read unless authoritatively linked
-          if [ "$linkage_state" != "SYSTEMD_LINKED" ] && [ "$linkage_state" != "PROGRAM_LINKED" ]; then
-            echo "ENV SOURCE NOT AUTHORITATIVELY LINKED"
-            echo "Skipping privileged inspection: no verified consumption link exists."
-            exit 0
-          fi
-
-          echo "Target Authoritative Config: $authoritative_env_target"
-          echo "File permissions: $(stat -c '%a %U:%G' "$authoritative_env_target" 2>/dev/null || echo 'UNKNOWN')"
-
-          # Secret-safe allowlist parser
-          echo ""
-          echo "--- Allowlisted Disk Threshold Variables ---"
-          if ! _sudo cat "$authoritative_env_target" 2>/dev/null | awk -F= '
-            BEGIN { match_count = 0 }
-            !/^[[:space:]]*(#|$)/ && NF >= 2 {
-              k = $1; sub(/^[[:space:]]+/, "", k); sub(/[[:space:]]+$/, "", k);
-              v = substr($0, index($0, "=") + 1); sub(/^[[:space:]]+/, "", v); sub(/[[:space:]]+$/, "", v);
-              gsub(/^["\x27]|["\x27]$/, "", v);
-              uk = toupper(k);
-              if (uk ~ /DISK/ && (uk ~ /THRESHOLD/ || uk ~ /CRITICAL/)) {
-                match_count++;
-                if (v ~ /^[0-9]+([.][0-9]+)?%?$/) {
-                  print k "=" v;
-                } else {
-                  print k "=<non-numeric-redacted>";
+            # Part 2: Process program-linked config file if positively linked
+            if [ -n "$program_linked_file" ] && [ -e "$program_linked_file" ]; then
+              echo ""
+              echo "--- Inspecting positively verified program-linked config: $program_linked_file ---"
+              program_config_path="$program_linked_file"
+              parsed_prog_thresholds=$(_sudo cat "$program_linked_file" 2>/dev/null | awk -F= '
+                !/^[[:space:]]*(#|$)/ && NF >= 2 {
+                  k = $1; sub(/^[[:space:]]+/, "", k); sub(/[[:space:]]+$/, "", k);
+                  v = substr($0, index($0, "=") + 1); sub(/^[[:space:]]+/, "", v); sub(/[[:space:]]+$/, "", v);
+                  gsub(/^["\x27]|["\x27]$/, "", v);
+                  uk = toupper(k);
+                  if (uk ~ /DISK/ && (uk ~ /THRESHOLD/ || uk ~ /CRITICAL/)) {
+                    if (v ~ /^[0-9]+([.][0-9]+)?%?$/) {
+                      print k "=" v;
+                    } else {
+                      print k "=<non-numeric-redacted>";
+                    }
+                  }
                 }
-              }
-            }
-            END {
-              if (match_count == 0) {
-                print "FOUND: 0 matching disk threshold variables in environment file";
-              }
-            }
-          '; then
-            echo "READ FAILED / PRIVILEGE INSUFFICIENT"
+              ' || true)
+
+              if [ -n "$parsed_prog_thresholds" ]; then
+                program_config_threshold_found="true"
+                program_config_threshold_key=$(echo "$parsed_prog_thresholds" | head -1 | cut -d= -f1)
+                program_config_threshold_value=$(echo "$parsed_prog_thresholds" | head -1 | cut -d= -f2)
+                echo "  program_config_threshold_found=true key=$program_config_threshold_key value=$program_config_threshold_value"
+              else
+                echo "  program_config_threshold_found=false (No threshold variables in program-linked config)"
+              fi
+            fi
+
+            if [ "$env_definitions_count" -gt 1 ]; then
+              echo "WARNING: MULTIPLE THRESHOLD DEFINITIONS — PRECEDENCE REVIEW REQUIRED (Found $env_definitions_count definitions across EnvironmentFiles)"
+            fi
           fi
+
+          # Persist discovered environment threshold metadata
+          echo "$env_threshold_found" > .diag_meta/env_threshold_found
+          echo "$env_threshold_source_path" > .diag_meta/env_threshold_source_path
+          echo "$env_threshold_key" > .diag_meta/env_threshold_key
+          echo "$env_threshold_numeric_value" > .diag_meta/env_threshold_numeric_value
+          echo "$env_definitions_count" > .diag_meta/env_definitions_count
+
+          echo "$program_config_threshold_found" > .diag_meta/program_config_threshold_found
+          echo "$program_config_path" > .diag_meta/program_config_path
+          echo "$program_config_threshold_key" > .diag_meta/program_config_threshold_key
+          echo "$program_config_threshold_value" > .diag_meta/program_config_threshold_value
 
       - name: "6. Monitor Executable/Script Threshold Inspection"
         timeout-minutes: 2
@@ -532,48 +645,102 @@ jobs:
             fi
           done
 
-      - name: "7. Threshold Source Classification Synthesis"
+      - name: "7. Effective Threshold Source Synthesis"
         timeout-minutes: 1
         run: |
           set -euo pipefail
-          echo "=== THRESHOLD SOURCE CLASSIFICATION SYNTHESIS ==="
+          echo "=== EFFECTIVE THRESHOLD SOURCE SYNTHESIS ==="
 
           auth_conflict=$(cat .diag_meta/authority_conflict 2>/dev/null || echo 'false')
-          linkage_state=$(cat .diag_meta/linkage_state 2>/dev/null || echo 'NOT_AUTHORITATIVELY_LINKED')
-          env_target=$(cat .diag_meta/authoritative_env_target 2>/dev/null || echo '')
           exec_path=$(cat .diag_meta/exec_path 2>/dev/null || echo 'UNRESOLVED')
+          exec_arg_found=$(cat .diag_meta/exec_arg_threshold_found 2>/dev/null || echo 'false')
+          exec_arg_name=$(cat .diag_meta/exec_arg_name 2>/dev/null || echo 'none')
+          exec_arg_val=$(cat .diag_meta/exec_arg_val 2>/dev/null || echo 'none')
+
+          direct_found=$(cat .diag_meta/direct_env_threshold_found 2>/dev/null || echo 'false')
+          direct_key=$(cat .diag_meta/direct_env_threshold_key 2>/dev/null || echo 'none')
+          direct_val=$(cat .diag_meta/direct_env_threshold_value 2>/dev/null || echo 'none')
+
+          env_thresh_found=$(cat .diag_meta/env_threshold_found 2>/dev/null || echo 'false')
+          env_source_path=$(cat .diag_meta/env_threshold_source_path 2>/dev/null || echo 'none')
+          env_key=$(cat .diag_meta/env_threshold_key 2>/dev/null || echo 'none')
+          env_val=$(cat .diag_meta/env_threshold_numeric_value 2>/dev/null || echo 'none')
+          env_def_count=$(cat .diag_meta/env_definitions_count 2>/dev/null || echo '0')
+
+          prog_thresh_found=$(cat .diag_meta/program_config_threshold_found 2>/dev/null || echo 'false')
+          prog_path=$(cat .diag_meta/program_config_path 2>/dev/null || echo 'none')
+          prog_key=$(cat .diag_meta/program_config_threshold_key 2>/dev/null || echo 'none')
+          prog_val=$(cat .diag_meta/program_config_threshold_value 2>/dev/null || echo 'none')
+
           thresh_found=$(cat .diag_meta/threshold_evidence_found 2>/dev/null || echo 'false')
           thresh_type=$(cat .diag_meta/threshold_source_type 2>/dev/null || echo 'none')
           thresh_num=$(cat .diag_meta/threshold_numeric_evidence 2>/dev/null || echo 'none')
 
-          echo "Authority Conflict: $auth_conflict"
-          echo "Linkage State: $linkage_state"
-          echo "Authoritative Environment File: ${env_target:-NONE}"
-          echo "Authoritative Executable: $exec_path"
-          echo "Authoritative Target Threshold Evidence Found: $thresh_found"
-          echo "Authoritative Threshold Source Type: $thresh_type"
-          echo "Authoritative Numeric Evidence: $thresh_num"
+          echo "Discovered Evidence Summary:"
+          echo "  Authority Conflict: $auth_conflict"
+          echo "  ExecStart Argument Threshold Found: $exec_arg_found ($exec_arg_name=$exec_arg_val)"
+          echo "  Direct systemd Environment Threshold Found: $direct_found ($direct_key=$direct_val)"
+          echo "  systemd EnvironmentFiles Threshold Found: $env_thresh_found ($env_source_path: $env_key=$env_val, total_defs=$env_def_count)"
+          echo "  Program-Linked Config Threshold Found: $prog_thresh_found ($prog_path: $prog_key=$prog_val)"
+          echo "  Authoritative Target Threshold Evidence Found: $thresh_found (type=$thresh_type, value=$thresh_num)"
 
           echo ""
-          echo "Classification Result:"
+          echo "Effective Threshold Evaluation:"
+
           if [ "$auth_conflict" = "true" ]; then
-            echo "CLASSIFICATION: E. AUTHORITY CONFLICT"
-            echo "Reason: Runtime/configuration evidence materially contradicts the service authority chain."
-          elif [ "$linkage_state" = "SYSTEMD_LINKED" ]; then
-            echo "CLASSIFICATION: A. SYSTEMD ENVIRONMENT FILE"
-            echo "Evidence: Service EnvironmentFiles explicitly defines $env_target"
-          elif [ "$linkage_state" = "PROGRAM_LINKED" ]; then
-            echo "CLASSIFICATION: B. PROGRAM-LOADED ENVIRONMENT / CONFIG FILE"
-            echo "Evidence: Program metadata positively verified to load $env_target"
+            echo "Effective Threshold Source: AUTHORITY_CONFLICT"
+            echo "Effective Threshold Value: UNRESOLVED"
+            echo "Evidence Path: Runtime/configuration evidence materially contradicts the service authority chain."
+          elif [ "$env_def_count" -gt 1 ]; then
+            echo "Effective Threshold Source: UNRESOLVED"
+            echo "Effective Threshold Value: UNRESOLVED"
+            echo "Evidence Path: MULTIPLE THRESHOLD DEFINITIONS — PRECEDENCE REVIEW REQUIRED ($env_def_count definitions in EnvironmentFiles)"
+          elif [ "$exec_arg_found" = "true" ]; then
+            echo "Effective Threshold Source: SYSTEMD_EXECSTART_ARGUMENT"
+            echo "Effective Threshold Value: $exec_arg_val"
+            echo "Evidence Path:"
+            echo "madeena-monitor.service"
+            echo "  -> ExecStart=$exec_path"
+            echo "  -> $exec_arg_name=$exec_arg_val"
+          elif [ "$direct_found" = "true" ]; then
+            echo "Effective Threshold Source: SYSTEMD_DIRECT_ENVIRONMENT"
+            echo "Effective Threshold Value: $direct_val"
+            echo "Evidence Path:"
+            echo "madeena-monitor.service"
+            echo "  -> Environment: $direct_key=$direct_val"
+          elif [ "$env_thresh_found" = "true" ]; then
+            echo "Effective Threshold Source: SYSTEMD_ENVIRONMENT_FILE"
+            echo "Effective Threshold Value: $env_val"
+            echo "Evidence Path:"
+            echo "madeena-monitor.service"
+            echo "  -> EnvironmentFiles=$env_source_path"
+            echo "  -> $env_key=$env_val"
+          elif [ "$prog_thresh_found" = "true" ]; then
+            echo "Effective Threshold Source: PROGRAM_LINKED_CONFIG"
+            echo "Effective Threshold Value: $prog_val"
+            echo "Evidence Path:"
+            echo "madeena-monitor.service"
+            echo "  -> ExecStart=$exec_path"
+            echo "  -> Program-linked config=$prog_path"
+            echo "  -> $prog_key=$prog_val"
           elif [ "$thresh_found" = "true" ] && [ "$thresh_type" = "text" ]; then
-            echo "CLASSIFICATION: C. MONITOR SCRIPT / CONFIG VALUE"
-            echo "Evidence: Authoritative ExecStart is text/script and safe scan yielded affirmative disk-threshold evidence (numeric: $thresh_num)."
+            echo "Effective Threshold Source: MONITOR_SCRIPT_DEFAULT"
+            echo "Effective Threshold Value: $thresh_num"
+            echo "Evidence Path:"
+            echo "madeena-monitor.service"
+            echo "  -> ExecStart=$exec_path"
+            echo "  -> Authoritative text script affirmative threshold evidence=$thresh_num"
           elif [ "$thresh_found" = "true" ] && [ "$thresh_type" = "binary" ]; then
-            echo "CLASSIFICATION: D. EMBEDDED / DEFAULT EXECUTABLE VALUE"
-            echo "Evidence: Authoritative ExecStart is binary and yielded affirmative co-located threshold evidence (numeric: $thresh_num)."
+            echo "Effective Threshold Source: EMBEDDED_BINARY_DEFAULT"
+            echo "Effective Threshold Value: $thresh_num"
+            echo "Evidence Path:"
+            echo "madeena-monitor.service"
+            echo "  -> ExecStart=$exec_path"
+            echo "  -> Authoritative binary affirmative threshold evidence=$thresh_num"
           else
-            echo "CLASSIFICATION: F. UNRESOLVED"
-            echo "Evidence: Threshold source cannot be deterministically established from verified evidence."
+            echo "Effective Threshold Source: UNRESOLVED"
+            echo "Effective Threshold Value: UNRESOLVED"
+            echo "Evidence Path: No affirmative threshold evidence could be established from safe evidence."
           fi
           echo "Completed at: $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
   full-audit:

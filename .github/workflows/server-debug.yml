@@ -209,21 +209,27 @@ jobs:
             exit 1
           fi
 
-          mod_path=$(echo "$build_meta" | awk '$1 == "mod" {print $2}' | head -1 || echo 'UNKNOWN')
-          vcs_rev=$(echo "$build_meta" | awk '$1 == "build" && $2 == "vcs.revision" {print $3}' | head -1 || echo 'UNKNOWN')
-          vcs_mod=$(echo "$build_meta" | awk '$1 == "build" && $2 == "vcs.modified" {print $3}' | head -1 || echo 'UNKNOWN')
+          mod_path=$(printf '%s\n' "$build_meta" | awk '$1=="mod" {print $2; exit}' || echo '')
+          vcs_rev=$(printf '%s\n' "$build_meta" | awk '$1=="build" && $2 ~ /^vcs[.]revision=/ { sub(/^vcs[.]revision=/, "", $2); print $2; exit }' || echo '')
+          vcs_mod=$(printf '%s\n' "$build_meta" | awk '$1=="build" && $2 ~ /^vcs[.]modified=/ { sub(/^vcs[.]modified=/, "", $2); print $2; exit }' || echo '')
 
-          echo "Binary module path: $mod_path"
-          echo "Binary vcs.revision: $vcs_rev"
-          echo "Binary vcs.modified: $vcs_mod"
+          echo "Binary module path: ${mod_path:-MISSING}"
+          echo "Binary vcs.revision: ${vcs_rev:-MISSING}"
+          echo "Binary vcs.modified: ${vcs_mod:-MISSING}"
 
+          expected_mod="github.com/Madeena-software/madeena-server-monitor"
           expected_rev="a9be2681f07e9f5cea45de6b51f39b20f929dc1f"
-          if [ "$vcs_mod" = "true" ]; then
-            echo "FATAL: Binary was built from dirty working tree (vcs.modified=true)" >&2
+
+          if [ -z "$mod_path" ] || [ "$mod_path" != "$expected_mod" ]; then
+            echo "FATAL: Binary module path mismatch: expected $expected_mod, got '$mod_path'" >&2
             exit 1
           fi
-          if [ "$vcs_rev" != "$expected_rev" ]; then
-            echo "FATAL: Binary vcs.revision ($vcs_rev) does not match reviewed source revision ($expected_rev)" >&2
+          if [ -z "$vcs_rev" ] || [ "$vcs_rev" != "$expected_rev" ]; then
+            echo "FATAL: Binary vcs.revision mismatch: expected $expected_rev, got '$vcs_rev'" >&2
+            exit 1
+          fi
+          if [ -z "$vcs_mod" ] || [ "$vcs_mod" != "false" ]; then
+            echo "FATAL: Binary vcs.modified mismatch: expected false, got '$vcs_mod'" >&2
             exit 1
           fi
 
@@ -241,24 +247,55 @@ jobs:
             exit 1
           fi
 
-          # Allowlisted parse of DATA_PARTITIONS only (do NOT dump .env)
-          data_part_line=$(grep -E '^[[:space:]]*DATA_PARTITIONS=' "$env_file" || true)
-          if [ -n "$data_part_line" ]; then
-            echo "DATA_PARTITIONS key present: true"
-            raw_val=$(printf '%s\n' "$data_part_line" | head -1 | cut -d= -f2-)
-            # strip leading/trailing quotes and spaces
-            cleaned_val=$(printf '%s\n' "$raw_val" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e 's/^["']//' -e 's/["']$//')
-            if [ -n "$cleaned_val" ]; then
-              echo "FATAL: DATA_PARTITIONS is non-empty: '$cleaned_val'. Changing ROOT_DISK_THRESHOLD would affect data disks, which is out of scope." >&2
-              exit 1
-            else
-              echo "ACTIVE DATA_PARTITIONS: NONE (empty string)"
-            fi
-          else
-            echo "DATA_PARTITIONS key present: false"
-            echo "ACTIVE DATA_PARTITIONS: NONE"
+          # 1. Allowlisted parse of DATA_PARTITIONS in .env without dumping file
+          data_part_env_line=$(grep -E '^[[:space:]]*DATA_PARTITIONS=' "$env_file" || true)
+          env_dp_present="false"
+          env_dp_val=""
+          if [ -n "$data_part_env_line" ]; then
+            env_dp_present="true"
+            raw_val=$(printf '%s\n' "$data_part_env_line" | head -1 | cut -d= -f2-)
+            env_dp_val=$(printf '%s\n' "$raw_val" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e 's/^["']//' -e 's/["']$//')
           fi
 
+          # 2. Allowlisted parse of DATA_PARTITIONS in direct systemd Environment
+          raw_direct_env=$(systemctl show madeena-monitor.service -p Environment --value 2>/dev/null || true)
+          direct_dp_present="false"
+          direct_dp_val=""
+          if [ -n "$raw_direct_env" ]; then
+            direct_dp_match=$(printf '%s\n' "$raw_direct_env" | awk -v RS='[[:space:]]+' -F= '
+              $1 == "DATA_PARTITIONS" {
+                v = substr($0, index($0, "=") + 1);
+                gsub(/^["']|["']$/, "", v);
+                print v;
+                exit;
+              }
+            ' || true)
+            if [ -n "$direct_dp_match" ]; then
+              direct_dp_present="true"
+              direct_dp_val=$(printf '%s\n' "$direct_dp_match" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+            fi
+          fi
+
+          echo "EnvironmentFile DATA_PARTITIONS present: $env_dp_present"
+          echo "Direct systemd Environment DATA_PARTITIONS present: $direct_dp_present"
+
+          # 3. Check for ambiguity / dual definition
+          if [ "$env_dp_present" = "true" ] && [ "$direct_dp_present" = "true" ]; then
+            echo "FATAL: Ambiguous DATA_PARTITIONS configuration: defined in both .env and direct systemd Environment" >&2
+            exit 1
+          fi
+
+          # 4. Fail-closed if either source defines a non-empty value
+          if [ "$env_dp_present" = "true" ] && [ -n "$env_dp_val" ]; then
+            echo "FATAL: DATA_PARTITIONS is configured in .env with non-empty value: '$env_dp_val'. Halting before mutation to prevent affecting data partitions." >&2
+            exit 1
+          fi
+          if [ "$direct_dp_present" = "true" ] && [ -n "$direct_dp_val" ]; then
+            echo "FATAL: DATA_PARTITIONS is configured in direct systemd Environment with non-empty value: '$direct_dp_val'. Halting before mutation to prevent affecting data partitions." >&2
+            exit 1
+          fi
+
+          echo "ACTIVE DATA_PARTITIONS: NONE"
           echo "Preflight 3 (Root-vs-Data Scope Gate): PASSED"
 
       - name: "4. Fail-Closed Preflight: Threshold State & Single-Definition Gate"
@@ -362,14 +399,15 @@ jobs:
 
           echo "Preflight 6 (Synthetic Comparator Verification): PASSED"
 
-      - name: "7. Prepared Atomic Mutation with Rollback Protection"
-        timeout-minutes: 2
+      - name: "7. Transactional Production Change & In-Process Rollback"
+        timeout-minutes: 4
         env:
           SUDO_PASSWORD: ${{ secrets.SUDO_PASSWORD }}
         run: |
           set -euo pipefail
-          echo "=== 7. ATOMIC MUTATION & ROLLBACK PREPARATION ==="
+          echo "=== 7. TRANSACTIONAL PRODUCTION MUTATION, RESTART & VERIFICATION ==="
 
+          # Safe sudo wrapper: strictly executes commands as arguments (no stdin piping)
           _sudo() {
             if [ -n "${SUDO_PASSWORD:-}" ]; then
               printf '%s\n' "$SUDO_PASSWORD" | sudo -S -p '' -- "$@" 2>/dev/null
@@ -379,248 +417,228 @@ jobs:
           }
 
           env_file="/var/www/madeena-server-monitor/.env"
-          backup_dir="/var/www/madeena-server-monitor/.backup_mutation"
-          backup_file="$backup_dir/.env.bak.$(date +%s)"
+          initial_pid=$(cat .mutation_meta/initial_pid 2>/dev/null || echo '0')
 
-          # 1. Capture exact file ownership and permissions
+          # 1. Capture exact original file metadata
           orig_stat=$(_sudo stat -c '%u:%g:%a' "$env_file")
           orig_uid=$(echo "$orig_stat" | cut -d: -f1)
           orig_gid=$(echo "$orig_stat" | cut -d: -f2)
           orig_mode=$(echo "$orig_stat" | cut -d: -f3)
-          echo "Original .env ownership: $orig_uid:$orig_gid, mode: $orig_mode"
+          echo "Original .env metadata: uid=$orig_uid, gid=$orig_gid, mode=$orig_mode"
 
-          # 2. Create secure isolated backup
-          _sudo mkdir -p "$backup_dir"
+          # 2. Create secure isolated temporary directory for backup
+          backup_dir=$(_sudo mktemp -d /var/www/madeena-server-monitor/.backup_trans_XXXXXX)
           _sudo chmod 700 "$backup_dir"
-          _sudo cp -a "$env_file" "$backup_file"
+          backup_file="$backup_dir/.env.bak"
+          _sudo cp -p "$env_file" "$backup_file"
           _sudo chmod 600 "$backup_file"
-          echo "$backup_file" > .mutation_meta/backup_file
 
-          # 3. Create mutated file in temporary path with identical ownership/mode
-          tmp_file="/var/www/madeena-server-monitor/.env.tmp.$$"
-          # Perform single-key targeted substitution using awk
-          _sudo awk '
-            BEGIN { replaced = 0 }
-            /^[[:space:]]*ROOT_DISK_THRESHOLD[[:space:]]*=/ {
-              sub(/ROOT_DISK_THRESHOLD[[:space:]]*=.*/, "ROOT_DISK_THRESHOLD=80")
-              replaced++
-            }
-            { print }
-            END {
-              if (replaced != 1) {
-                exit 42
+          mutation_applied="false"
+
+          # In-process transactional rollback trap handler
+          cleanup_and_rollback() {
+            local exit_code=$?
+            trap - EXIT ERR INT TERM
+
+            if [ "$mutation_applied" = "true" ]; then
+              echo "=== IN-PROCESS ROLLBACK TRIGGERED (Exit code: $exit_code) ==="
+              local rollback_ok="true"
+
+              if [ -n "${backup_file:-}" ] && _sudo test -f "$backup_file"; then
+                echo "Restoring original .env from backup..."
+                _sudo cp -p "$backup_file" "$env_file" || rollback_ok="false"
+                _sudo chown "$orig_uid:$orig_gid" "$env_file" || rollback_ok="false"
+                _sudo chmod "$orig_mode" "$env_file" || rollback_ok="false"
+              else
+                echo "ERROR: Backup file missing during rollback!" >&2
+                rollback_ok="false"
+              fi
+
+              echo "Restoring madeena-monitor.service..."
+              _sudo systemctl restart madeena-monitor.service || rollback_ok="false"
+              sleep 2
+
+              # Authoritative verification of rollback
+              rb_state=$(systemctl show madeena-monitor.service -p ActiveState --value 2>/dev/null || echo 'UNKNOWN')
+              rb_pid=$(systemctl show madeena-monitor.service -p MainPID --value 2>/dev/null || echo '0')
+              rb_exe=$(readlink -f "/proc/$rb_pid/exe" 2>/dev/null || echo '')
+              rb_cwd=$(readlink -f "/proc/$rb_pid/cwd" 2>/dev/null || echo '')
+              rb_val=$(_sudo awk -F= '
+                !/^[[:space:]]*(#|$)/ && NF >= 2 {
+                  k = $1; sub(/^[[:space:]]+/, "", k); sub(/[[:space:]]+$/, "", k);
+                  v = substr($0, index($0, "=") + 1); sub(/^[[:space:]]+/, "", v); sub(/[[:space:]]+$/, "", v);
+                  gsub(/^["']|["']$/, "", v);
+                  if (k == "ROOT_DISK_THRESHOLD") print v;
+                }
+              ' "$env_file" || echo 'UNKNOWN')
+
+              echo "Rollback Verification:"
+              echo "  ActiveState: $rb_state"
+              echo "  MainPID: $rb_pid"
+              echo "  /proc/<pid>/exe: $rb_exe"
+              echo "  /proc/<pid>/cwd: $rb_cwd"
+              echo "  ROOT_DISK_THRESHOLD: $rb_val"
+
+              if [ "$rb_state" != "active" ] || [ "$rb_pid" = "0" ] || [ "$rb_exe" != "/var/www/madeena-server-monitor/monitor" ] || [ "$rb_cwd" != "/var/www/madeena-server-monitor" ] || [ "$rb_val" != "50" ]; then
+                rollback_ok="false"
+              fi
+
+              if [ "$rollback_ok" = "true" ]; then
+                echo "Rollback state verified: Original configuration and service restored."
+              else
+                echo "FATAL: ROLLBACK FAILED! Manual operational intervention required." >&2
+              fi
+            else
+              echo "Transaction ended before mutation: No service restart or file restoration required."
+            fi
+
+            # Clean up backup directory if it exists
+            if [ -n "${backup_dir:-}" ] && _sudo test -d "$backup_dir"; then
+              _sudo rm -rf "$backup_dir" || true
+            fi
+
+            exit "$exit_code"
+          }
+
+          trap 'cleanup_and_rollback' EXIT ERR INT TERM
+
+          # 3. Create modified .env inside privileged shell without stdin pipe
+          tmp_file="$backup_dir/.env.tmp"
+          _sudo sh -c '
+            set -eu
+            src="$1"
+            dst="$2"
+            awk "
+              BEGIN { replaced = 0 }
+              /^[[:space:]]*ROOT_DISK_THRESHOLD[[:space:]]*=/ {
+                sub(/ROOT_DISK_THRESHOLD[[:space:]]*=.*/, \"ROOT_DISK_THRESHOLD=80\")
+                replaced++
               }
-            }
-          ' "$env_file" | _sudo tee "$tmp_file" >/dev/null
+              { print }
+              END {
+                if (replaced != 1) {
+                  exit 42
+                }
+              }
+            " "$src" > "$dst"
+          ' -- "$env_file" "$tmp_file"
 
           _sudo chown "$orig_uid:$orig_gid" "$tmp_file"
           _sudo chmod "$orig_mode" "$tmp_file"
 
-          # 4. Verify line-count parity between original and mutated temporary file
+          # 4. Line count parity check
           orig_lines=$(_sudo wc -l < "$env_file")
           tmp_lines=$(_sudo wc -l < "$tmp_file")
           if [ "$orig_lines" -ne "$tmp_lines" ]; then
-            echo "FATAL: Line count mismatch between original ($orig_lines) and modified ($tmp_lines)" >&2
-            _sudo rm -f "$tmp_file"
+            echo "FATAL: Line count mismatch between original ($orig_lines) and transformed ($tmp_lines)" >&2
             exit 1
           fi
 
-          # 5. Verify allowlisted difference: only ROOT_DISK_THRESHOLD may differ
-          diff_keys=$(_sudo diff -u "$env_file" "$tmp_file" | grep -E '^[+-][^+-]' || true)
-          echo "Mutated diff keys:"
-          printf '%s\n' "$diff_keys"
-          bad_keys=$(printf '%s\n' "$diff_keys" | grep -v 'ROOT_DISK_THRESHOLD' || true)
-          if [ -n "$bad_keys" ]; then
-            echo "FATAL: Unrelated keys modified in diff: $bad_keys" >&2
-            _sudo rm -f "$tmp_file"
-            exit 1
-          fi
+          # 5. Structural diff audit: report only safe metadata (NO raw diff lines)
+          diff_audit=$(_sudo sh -c '
+            set -eu
+            f1="$1"
+            f2="$2"
+            diff_lines=$(diff -U0 "$f1" "$f2" | grep -E "^[+-][^+-]" || true)
+            changed_keys=$(printf "%s\n" "$diff_lines" | sed -E "s/^[+-][[:space:]]*//" | awk -F= "{print \$1}" | sort -u | grep -v "^[[:space:]]*$" || true)
+            key_count=$(printf "%s\n" "$changed_keys" | grep -c . || true)
+            bad_keys=$(printf "%s\n" "$changed_keys" | grep -v "^ROOT_DISK_THRESHOLD$" || true)
+
+            old_thresh=$(printf "%s\n" "$diff_lines" | grep -E "^-" | sed -E "s/^-//" | awk -F= "\$1 ~ /^ROOT_DISK_THRESHOLD$/ {print \$2}")
+            new_thresh=$(printf "%s\n" "$diff_lines" | grep -E "^\+" | sed -E "s/^\+//" | awk -F= "\$1 ~ /^ROOT_DISK_THRESHOLD$/ {print \$2}")
+
+            echo "changed_key_count=$key_count"
+            echo "changed_keys=$(printf "%s\n" "$changed_keys" | paste -sd, -)"
+            echo "old_threshold=$old_thresh"
+            echo "new_threshold=$new_thresh"
+
+            if [ -n "$bad_keys" ]; then
+              echo "bad_keys=$(printf "%s\n" "$bad_keys" | paste -sd, -)"
+              exit 10
+            fi
+            if [ "$key_count" -ne 1 ] || [ "$old_thresh" != "50" ] || [ "$new_thresh" != "80" ]; then
+              exit 11
+            fi
+          ' -- "$env_file" "$tmp_file")
+
+          echo "Diff Audit Metadata:"
+          printf '%s\n' "$diff_audit"
 
           # 6. Atomic replacement
           _sudo mv "$tmp_file" "$env_file"
-          echo "Mutation: Atomic move into $env_file completed successfully"
+          mutation_applied="true"
+          echo "Mutation applied: Atomic move to $env_file completed successfully"
 
-      - name: "8. Apply EnvironmentFile Change: Service Restart"
-        timeout-minutes: 2
-        env:
-          SUDO_PASSWORD: ${{ secrets.SUDO_PASSWORD }}
-        run: |
-          set -euo pipefail
-          echo "=== 8. APPLY ENVIRONMENTFILE: SERVICE RESTART ==="
-
-          _sudo() {
-            if [ -n "${SUDO_PASSWORD:-}" ]; then
-              printf '%s\n' "$SUDO_PASSWORD" | sudo -S -p '' -- "$@" 2>/dev/null
-            else
-              sudo -n "$@" 2>/dev/null
-            fi
-          }
-
-          # Notice: NO systemctl daemon-reload (unit file is untouched)
+          # 7. Apply EnvironmentFile change: Service Restart (NO daemon-reload)
           echo "Restarting madeena-monitor.service..."
-          if ! _sudo systemctl restart madeena-monitor.service; then
-            echo "FATAL: systemctl restart madeena-monitor.service failed" >&2
-            echo "TRIGGER_ROLLBACK=true" > .mutation_meta/trigger_rollback
-            exit 1
-          fi
+          _sudo systemctl restart madeena-monitor.service
 
           sleep 3
           active_state=$(systemctl show madeena-monitor.service -p ActiveState --value 2>/dev/null || echo 'UNKNOWN')
           echo "Post-restart ActiveState: $active_state"
           if [ "$active_state" != "active" ]; then
-            echo "FATAL: madeena-monitor.service is not active after restart (state: $active_state)" >&2
-            echo "TRIGGER_ROLLBACK=true" > .mutation_meta/trigger_rollback
+            echo "FATAL: madeena-monitor.service is not active after restart ($active_state)" >&2
             exit 1
           fi
 
           new_pid=$(systemctl show madeena-monitor.service -p MainPID --value 2>/dev/null || echo '0')
           echo "New MainPID: $new_pid"
-          initial_pid=$(cat .mutation_meta/initial_pid 2>/dev/null || echo '0')
           if [ -z "$new_pid" ] || [ "$new_pid" = "0" ] || [ "$new_pid" = "$initial_pid" ]; then
             echo "FATAL: MainPID was not updated on restart (old: $initial_pid, new: $new_pid)" >&2
-            echo "TRIGGER_ROLLBACK=true" > .mutation_meta/trigger_rollback
             exit 1
           fi
 
-          echo "$new_pid" > .mutation_meta/restarted_pid
-          echo "Service restart verified successfully."
-
-      - name: "9. Post-Change Verification"
-        timeout-minutes: 2
-        env:
-          SUDO_PASSWORD: ${{ secrets.SUDO_PASSWORD }}
-        run: |
-          set -euo pipefail
-          echo "=== 9. POST-CHANGE VERIFICATION ==="
-
-          _sudo() {
-            if [ -n "${SUDO_PASSWORD:-}" ]; then
-              printf '%s\n' "$SUDO_PASSWORD" | sudo -S -p '' -- "$@" 2>/dev/null
-            else
-              sudo -n "$@" 2>/dev/null
-            fi
-          }
-
-          env_file="/var/www/madeena-server-monitor/.env"
-          new_pid=$(cat .mutation_meta/restarted_pid 2>/dev/null || echo '0')
-
-          # 1. Verify service ActiveState
-          active_state=$(systemctl show madeena-monitor.service -p ActiveState --value 2>/dev/null || echo 'UNKNOWN')
-          if [ "$active_state" != "active" ]; then
-            echo "FATAL: Verification failed: Service not active ($active_state)" >&2
-            echo "TRIGGER_ROLLBACK=true" > .mutation_meta/trigger_rollback
-            exit 1
-          fi
-
-          # 2. Verify /proc/<pid>/exe and cwd
+          # 8. Post-Change Verification
+          # a. Verify /proc/<pid>/exe and /proc/<pid>/cwd
           proc_exe=$(readlink -f "/proc/$new_pid/exe" 2>/dev/null || echo '')
           proc_cwd=$(readlink -f "/proc/$new_pid/cwd" 2>/dev/null || echo '')
-          expected_exec="/var/www/madeena-server-monitor/monitor"
-          expected_cwd="/var/www/madeena-server-monitor"
-
-          echo "Process /proc/$new_pid/exe: $proc_exe"
-          echo "Process /proc/$new_pid/cwd: $proc_cwd"
-          if [ "$proc_exe" != "$expected_exec" ] || [ "$proc_cwd" != "$expected_cwd" ]; then
-            echo "FATAL: Process mapping verification failed: exe=$proc_exe cwd=$proc_cwd" >&2
-            echo "TRIGGER_ROLLBACK=true" > .mutation_meta/trigger_rollback
+          echo "Verified /proc/$new_pid/exe: $proc_exe"
+          echo "Verified /proc/$new_pid/cwd: $proc_cwd"
+          if [ "$proc_exe" != "/var/www/madeena-server-monitor/monitor" ] || [ "$proc_cwd" != "/var/www/madeena-server-monitor" ]; then
+            echo "FATAL: Process mapping mismatch after restart" >&2
             exit 1
           fi
 
-          # 3. Verify .env file allowlisted content: ROOT_DISK_THRESHOLD=80 exactly
-          env_val=$(awk -F= '
+          # b. Verify .env file content: ROOT_DISK_THRESHOLD=80 exactly
+          env_val=$(_sudo awk -F= '
             !/^[[:space:]]*(#|$)/ && NF >= 2 {
               k = $1; sub(/^[[:space:]]+/, "", k); sub(/[[:space:]]+$/, "", k);
               v = substr($0, index($0, "=") + 1); sub(/^[[:space:]]+/, "", v); sub(/[[:space:]]+$/, "", v);
               gsub(/^["']|["']$/, "", v);
-              if (k == "ROOT_DISK_THRESHOLD") {
-                print v;
-              }
+              if (k == "ROOT_DISK_THRESHOLD") print v;
             }
-          ' "$env_file" || true)
-
-          echo "Verified .env ROOT_DISK_THRESHOLD value: $env_val"
+          ' "$env_file" || echo 'UNKNOWN')
+          echo "Verified .env ROOT_DISK_THRESHOLD: $env_val"
           if [ "$env_val" != "80" ]; then
-            echo "FATAL: Verification failed: .env ROOT_DISK_THRESHOLD is '$env_val', expected '80'" >&2
-            echo "TRIGGER_ROLLBACK=true" > .mutation_meta/trigger_rollback
+            echo "FATAL: .env ROOT_DISK_THRESHOLD is '$env_val', expected '80'" >&2
             exit 1
           fi
 
-          # 4. Process environment variable verification (allowlisted key only, NO dump)
-          proc_env_val=$(_sudo tr '\0' '\n' < "/proc/$new_pid/environ" 2>/dev/null | awk -F= '$1 == "ROOT_DISK_THRESHOLD" {print $2}' || true)
-          echo "Target process environment ROOT_DISK_THRESHOLD: ${proc_env_val:-NOT_IN_PROC_ENV}"
-          if [ -n "$proc_env_val" ] && [ "$proc_env_val" != "80" ]; then
-            echo "FATAL: Verification failed: Process environment ROOT_DISK_THRESHOLD is '$proc_env_val', expected '80'" >&2
-            echo "TRIGGER_ROLLBACK=true" > .mutation_meta/trigger_rollback
+          # c. Mandatory process environment verification from /proc/<pid>/environ (allowlisted extraction only)
+          proc_env_val=$(_sudo sh -c '
+            pid="$1"
+            tr "\0" "\n" < "/proc/$pid/environ" | awk -F= "$1 == \"ROOT_DISK_THRESHOLD\" { print \$2; exit }"
+          ' -- "$new_pid")
+          echo "Target process environment ROOT_DISK_THRESHOLD: ${proc_env_val:-MISSING}"
+          if [ -z "$proc_env_val" ] || [ "$proc_env_val" != "80" ]; then
+            echo "FATAL: Process environment ROOT_DISK_THRESHOLD is '${proc_env_val:-MISSING}', expected exactly '80'" >&2
             exit 1
           fi
 
-          # 5. Root disk usage remains below 80%
+          # d. Verify root usage remains below 80%
           root_pct=$(df -P / | tail -1 | awk '{print $(NF-1)}' | tr -d '%')
           echo "Current root disk usage post-restart: ${root_pct}%"
           is_ge_80=$(awk -v u="$root_pct" 'BEGIN { if (u >= 80.0) print "true"; else print "false"; }')
           if [ "$is_ge_80" = "true" ]; then
             echo "FATAL: Root disk usage reached ${root_pct}% (>= 80%)" >&2
-            echo "TRIGGER_ROLLBACK=true" > .mutation_meta/trigger_rollback
             exit 1
           fi
 
-          # 6. Clean up temporary backup after successful post-change verification
-          backup_file=$(cat .mutation_meta/backup_file 2>/dev/null || echo '')
-          if [ -n "$backup_file" ] && [ -f "$backup_file" ]; then
-            _sudo rm -f "$backup_file"
-            _sudo rmdir "/var/www/madeena-server-monitor/.backup_mutation" 2>/dev/null || true
-            echo "Backup file cleaned up successfully."
-          fi
-
-          echo "Post-Change Verification: ALL CHECKS PASSED (Threshold 80% active)"
-
-      - name: "10. Automatic Rollback Handler"
-        if: failure()
-        timeout-minutes: 2
-        env:
-          SUDO_PASSWORD: ${{ secrets.SUDO_PASSWORD }}
-        run: |
-          set -euo pipefail
-          echo "=== 10. AUTOMATIC ROLLBACK HANDLER TRIGGERED ==="
-
-          _sudo() {
-            if [ -n "${SUDO_PASSWORD:-}" ]; then
-              printf '%s\n' "$SUDO_PASSWORD" | sudo -S -p '' -- "$@" 2>/dev/null
-            else
-              sudo -n "$@" 2>/dev/null
-            fi
-          }
-
-          backup_file=$(cat .mutation_meta/backup_file 2>/dev/null || echo '')
-          env_file="/var/www/madeena-server-monitor/.env"
-
-          if [ -n "$backup_file" ] && [ -f "$backup_file" ]; then
-            echo "Restoring .env from backup file..."
-            _sudo cp -a "$backup_file" "$env_file"
-            _sudo rm -f "$backup_file"
-            _sudo rmdir "/var/www/madeena-server-monitor/.backup_mutation" 2>/dev/null || true
-
-            echo "Restoring madeena-monitor.service state..."
-            _sudo systemctl restart madeena-monitor.service || true
-            sleep 2
-            rb_state=$(systemctl show madeena-monitor.service -p ActiveState --value 2>/dev/null || echo 'UNKNOWN')
-            rb_val=$(awk -F= '
-              !/^[[:space:]]*(#|$)/ && NF >= 2 {
-                k = $1; sub(/^[[:space:]]+/, "", k); sub(/[[:space:]]+$/, "", k);
-                v = substr($0, index($0, "=") + 1); sub(/^[[:space:]]+/, "", v); sub(/[[:space:]]+$/, "", v);
-                gsub(/^["']|["']$/, "", v);
-                if (k == "ROOT_DISK_THRESHOLD") {
-                  print v;
-                }
-              }
-            ' "$env_file" || echo 'UNKNOWN')
-
-            echo "Rollback verification: ActiveState=$rb_state, ROOT_DISK_THRESHOLD=$rb_val"
-          else
-            echo "No backup file found to rollback."
-          fi
-
-          echo "Rollback completed. Returning failure to Planner/Reviewer."
+          # Disarm rollback trap on complete verification success
+          trap - EXIT ERR INT TERM
+          _sudo rm -rf "$backup_dir"
+          echo "Backup directory cleaned up successfully."
+          echo "=== TRANSACTION COMPLETE: ROOT_DISK_THRESHOLD=80 ACTIVATED & VERIFIED ==="
   full-audit:
     name: "Full Server Audit"
     if: github.ref_name != 'task/server-disk-alert-threshold-80'

@@ -81,115 +81,220 @@ jobs:
           echo "=== ROOT USAGE PERCENTAGE ==="
           df -P / | awk 'NR==2 {print "Root (/):", $5, "used of", $2, "(Available:", $4 ")"}'
 
-      - name: "3. Crontab Inspection (All Users & System Cron)"
+      - name: "3. Crontab Metadata Inspection (Secret-Safe)"
         timeout-minutes: 2
         run: |
           set -euo pipefail
-          echo "=== USER CRONTABS ==="
-          for user in root $(awk -F: '$3 >= 1000 && $3 < 65534 {print $1}' /etc/passwd 2>/dev/null || true); do
-            CRON_CONTENT=$(crontab -l -u "$user" 2>/dev/null | grep -v '^[[:space:]]*#' | grep -v '^[[:space:]]*$' || true)
-            if [ -n "$CRON_CONTENT" ]; then
-              echo "--- crontab for: $user ---"
-              echo "$CRON_CONTENT"
-            fi
-          done
-
-          echo ""
-          echo "=== SYSTEM CRON DIRECTORIES ==="
-          ls -la /etc/cron* 2>/dev/null || true
-
-          echo ""
-          echo "=== /etc/crontab ==="
-          if [ -f /etc/crontab ]; then
-            grep -v '^[[:space:]]*#' /etc/crontab | grep -v '^[[:space:]]*$' || true
-          fi
-
-          echo ""
-          echo "=== /etc/cron.d/ ENTRIES ==="
-          if [ -d /etc/cron.d ]; then
-            for f in /etc/cron.d/*; do
-              if [ -f "$f" ]; then
-                echo "--- File: $f ---"
-                grep -v '^[[:space:]]*#' "$f" 2>/dev/null | grep -v '^[[:space:]]*$' || true
+          echo "=== USER CRONTABS (METADATA ONLY — NO COMMAND BODIES) ==="
+          if [ ! -r /etc/passwd ]; then
+            echo "/etc/passwd: UNREADABLE / PERMISSION DENIED"
+          else
+            USERS=$(awk -F: '$3 == 0 || ($3 >= 1000 && $3 < 65534) {print $1}' /etc/passwd 2>/dev/null || echo "root")
+            for user in $USERS; do
+              if ! cron_out=$(crontab -l -u "$user" 2>&1); then
+                if echo "$cron_out" | grep -qi "no crontab"; then
+                  echo "User $user: crontab_present=false"
+                elif echo "$cron_out" | grep -qiE "permission|must be|not allowed"; then
+                  echo "User $user: crontab_present=unknown (UNREADABLE / PERMISSION DENIED)"
+                else
+                  echo "User $user: crontab_present=false"
+                fi
+              else
+                active_entries=$(echo "$cron_out" | grep -cvE '^\s*(#|$)' || true)
+                match_lines=$(echo "$cron_out" | grep -nE -i 'monitor|disk|alert|check|notify|server|madeena' | grep -vE '^\s*[0-9]+:\s*#' | cut -d: -f1 | paste -sd, - || true)
+                echo "User $user: crontab_present=true, active_entries=$active_entries, monitor_related_lines=${match_lines:-none}"
               fi
             done
           fi
+
+          echo ""
+          echo "=== /etc/crontab (METADATA ONLY) ==="
+          if [ ! -e /etc/crontab ]; then
+            echo "/etc/crontab: NOT FOUND"
+          elif [ ! -r /etc/crontab ]; then
+            echo "/etc/crontab: UNREADABLE / PERMISSION DENIED"
+          else
+            active_entries=$(grep -cvE '^\s*(#|$)' /etc/crontab || true)
+            match_lines=$(grep -nE -i 'monitor|disk|alert|check|notify|server|madeena' /etc/crontab 2>/dev/null | grep -vE '^\s*[0-9]+:\s*#' | cut -d: -f1 | paste -sd, - || true)
+            echo "/etc/crontab: readable=true, active_entries=$active_entries, monitor_related_lines=${match_lines:-none}"
+          fi
+
+          echo ""
+          echo "=== /etc/cron.d/ ENTRIES (METADATA ONLY) ==="
+          if [ ! -e /etc/cron.d ]; then
+            echo "/etc/cron.d: NOT FOUND"
+          elif [ ! -r /etc/cron.d ] || [ ! -x /etc/cron.d ]; then
+            echo "/etc/cron.d: UNREADABLE / PERMISSION DENIED"
+          else
+            for f in /etc/cron.d/*; do
+              [ -e "$f" ] || continue
+              if [ ! -f "$f" ]; then
+                continue
+              elif [ ! -r "$f" ]; then
+                echo "$f: UNREADABLE / PERMISSION DENIED"
+              else
+                active_entries=$(grep -cvE '^\s*(#|$)' "$f" 2>/dev/null || true)
+                match_lines=$(grep -nE -i 'monitor|disk|alert|check|notify|server|madeena' "$f" 2>/dev/null | grep -vE '^\s*[0-9]+:\s*#' | cut -d: -f1 | paste -sd, - || true)
+                echo "$f: readable=true, active_entries=$active_entries, monitor_related_lines=${match_lines:-none}"
+              fi
+            done
+          fi
+
+          echo ""
+          echo "=== SYSTEM CRON DIRECTORIES STATUS ==="
+          for cron_dir in /etc/cron.hourly /etc/cron.daily /etc/cron.weekly /etc/cron.monthly; do
+            if [ ! -e "$cron_dir" ]; then
+              echo "$cron_dir: NOT FOUND"
+            elif [ ! -r "$cron_dir" ] || [ ! -x "$cron_dir" ]; then
+              echo "$cron_dir: UNREADABLE / PERMISSION DENIED"
+            else
+              file_list=$(ls -1 "$cron_dir" 2>/dev/null | paste -sd, - || true)
+              echo "$cron_dir: readable=true, files=${file_list:-none}"
+            fi
+          done
 
       - name: "4. Systemd Timers and Services Inspection"
         timeout-minutes: 2
         run: |
           set -euo pipefail
-          echo "=== ALL ACTIVE & INACTIVE SYSTEMD TIMERS ==="
-          systemctl list-timers --all --no-pager 2>/dev/null || true
+          echo "=== ACTIVE & INACTIVE SYSTEMD TIMERS ==="
+          if ! command -v systemctl >/dev/null 2>&1; then
+            echo "COMMAND UNAVAILABLE (systemctl not found)"
+          else
+            systemctl list-timers --all --no-pager 2>&1 || echo "SYSTEMCTL TIMERS: UNREADABLE / PERMISSION DENIED"
+          fi
 
           echo ""
           echo "=== SYSTEMD SERVICES MATCHING MONITOR / DISK / ALERT / CHECK ==="
-          systemctl list-unit-files --type=service,timer --no-pager 2>/dev/null \
-            | grep -iE 'monitor|disk|alert|check|watch|notify|tele' || echo "No obvious unit-file name matches"
+          if command -v systemctl >/dev/null 2>&1; then
+            matching_units=$(systemctl list-unit-files --type=service,timer --no-pager 2>/dev/null \
+              | grep -iE 'monitor|disk|alert|check|watch|notify|tele' || true)
+            if [ -n "$matching_units" ]; then
+              echo "$matching_units"
+            else
+              echo "FOUND: 0 matching unit files"
+            fi
 
-          echo ""
-          echo "=== RUNNING SERVICES MATCHING MONITOR / DISK / ALERT / CHECK ==="
-          systemctl list-units --type=service --state=running --no-pager 2>/dev/null \
-            | grep -iE 'monitor|disk|alert|check|watch|notify|tele' || echo "No obvious running service matches"
+            echo ""
+            echo "=== RUNNING SERVICES MATCHING MONITOR / DISK / ALERT / CHECK ==="
+            running_matches=$(systemctl list-units --type=service --state=running --no-pager 2>/dev/null \
+              | grep -iE 'monitor|disk|alert|check|watch|notify|tele' || true)
+            if [ -n "$running_matches" ]; then
+              echo "$running_matches"
+            else
+              echo "FOUND: 0 running matching services"
+            fi
+          fi
 
-      - name: "5. Running Processes Inspection"
+      - name: "5. Running Processes Inspection (Executable Names Only — No Argv)"
         timeout-minutes: 2
         run: |
           set -euo pipefail
-          echo "=== RUNNING PROCESSES MATCHING MONITOR / DISK / ALERT / SCRIPT / PYTHON / BASH / SH / PHP ==="
-          ps aux | grep -iE 'monitor|disk|alert|df|check|notify|telegram|webhook' | grep -v 'grep' || echo "No matching processes found"
+          echo "=== RUNNING PROCESSES (PID AND COMM ONLY — NO ARGV) ==="
+          if ! command -v ps >/dev/null 2>&1; then
+            echo "COMMAND UNAVAILABLE (ps not found)"
+          else
+            matched_procs=$(ps -eo pid=,comm= 2>/dev/null | grep -iE 'monitor|disk|alert|check|notify|tele|agent|watch' || true)
+            if [ -n "$matched_procs" ]; then
+              echo "$matched_procs" | awk '{printf "  PID=%-7s COMM=%s\n", $1, $2}'
+            else
+              echo "FOUND: 0 matching processes by comm name"
+            fi
+          fi
 
-      - name: "6. Docker Container & Compose Inspection"
+      - name: "6. Docker Container & Swarm Inspection"
         timeout-minutes: 2
         run: |
           set -euo pipefail
-          echo "=== RUNNING DOCKER CONTAINERS ==="
-          docker ps --format "table {{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}" 2>/dev/null || echo "docker ps not available"
+          echo "=== DOCKER CONTAINERS STATUS ==="
+          if ! command -v docker >/dev/null 2>&1; then
+            echo "COMMAND UNAVAILABLE (docker not found)"
+          elif ! docker ps >/dev/null 2>&1; then
+            echo "DOCKER STATUS: UNREADABLE / PERMISSION DENIED (runner user cannot query docker daemon)"
+          else
+            docker ps --format "table {{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}"
+            echo ""
+            echo "=== DOCKER CONTAINERS MATCHING MONITOR / ALERT / WATCH / DISK ==="
+            mon_containers=$(docker ps -a --format "table {{.Names}}\t{{.Image}}\t{{.Status}}" \
+              | grep -iE 'monitor|alert|watch|disk|agent' || true)
+            if [ -n "$mon_containers" ]; then
+              echo "$mon_containers"
+            else
+              echo "FOUND: 0 matching containers"
+            fi
 
-          echo ""
-          echo "=== DOCKER CONTAINERS MATCHING MONITOR / ALERT / WATCH ==="
-          docker ps -a --format "table {{.Names}}\t{{.Image}}\t{{.Status}}" 2>/dev/null \
-            | grep -iE 'monitor|alert|watch|disk|agent' || echo "No container name matches"
+            echo ""
+            echo "=== DOCKER SWARM SERVICES ==="
+            docker service ls 2>&1 || echo "Swarm not active or query failed"
+          fi
 
-          echo ""
-          echo "=== DOCKER STACKS / SERVICES ==="
-          docker service ls 2>/dev/null || echo "Swarm not active or no services"
-
-      - name: "7. Targeted Filesystem Search for Monitor & Threshold 50%"
+      - name: "7. Targeted Candidate File Search (Paths & Line Numbers Only — No Raw Lines)"
         timeout-minutes: 3
         run: |
           set -euo pipefail
-          echo "=== TARGETED FILE SEARCH IN /etc, /usr/local/bin, /opt, /var/www, /home ==="
+          echo "=== TARGETED CANDIDATE FILE SEARCH (METADATA ONLY) ==="
 
-          echo ""
-          echo "▶ Step 7a: Custom scripts in /usr/local/bin, /usr/local/sbin, /opt"
-          ls -la /usr/local/bin /usr/local/sbin /opt 2>/dev/null || true
+          CANDIDATE_DIRS="/usr/local/bin /usr/local/sbin /opt /etc/systemd/system /etc/cron.d"
 
-          echo ""
-          echo "▶ Step 7b: Files matching monitor / alert / disk in script directories"
-          find /usr/local/bin /usr/local/sbin /opt /etc/systemd/system -maxdepth 3 -type f \
-            \( -iname "*monitor*" -o -iname "*disk*" -o -iname "*alert*" -o -iname "*check*" \) 2>/dev/null || true
+          for d in $CANDIDATE_DIRS; do
+            if [ ! -e "$d" ]; then
+              echo "Directory $d: NOT FOUND"
+              continue
+            elif [ ! -r "$d" ] || [ ! -x "$d" ]; then
+              echo "Directory $d: UNREADABLE / PERMISSION DENIED"
+              continue
+            fi
 
-          echo ""
-          echo "▶ Step 7c: Grep for alert keywords ('Madeena Server Monitor', 'Peringatan Kritis Server', '50.0%', 'threshold 50', 'Disk /=')"
-          # Search specific bounded configuration and script directories only. Redact sensitive values.
-          SEARCH_DIRS=""
-          for d in /etc/systemd/system /etc/cron* /usr/local/bin /usr/local/sbin /opt /var/www; do
-            [ -d "$d" ] && SEARCH_DIRS="$SEARCH_DIRS $d"
+            echo "Scanning directory: $d"
+            while IFS= read -r f; do
+              [ -f "$f" ] || continue
+              if [ ! -r "$f" ]; then
+                echo "  File $f: UNREADABLE / PERMISSION DENIED"
+                continue
+              fi
+
+              header_count=$(grep -ciE "Madeena Server Monitor|Peringatan Kritis Server|Peringatan Kritis|Disk /=" "$f" 2>/dev/null || true)
+              thresh_count=$(grep -ciE "threshold.*50|50%.*disk|disk.*50%|df.*50" "$f" 2>/dev/null || true)
+
+              if [ "$header_count" -gt 0 ] || [ "$thresh_count" -gt 0 ]; then
+                echo "  CANDIDATE FOUND: $f"
+                if [ "$header_count" -gt 0 ]; then
+                  h_lines=$(grep -niE "Madeena Server Monitor|Peringatan Kritis Server|Peringatan Kritis|Disk /=" "$f" 2>/dev/null | cut -d: -f1 | paste -sd, - || true)
+                  echo "    alert-header matches ($header_count): lines $h_lines"
+                fi
+                if [ "$thresh_count" -gt 0 ]; then
+                  t_lines=$(grep -niE "threshold.*50|50%.*disk|disk.*50%|df.*50" "$f" 2>/dev/null | cut -d: -f1 | paste -sd, - || true)
+                  echo "    threshold-pattern matches ($thresh_count): lines $t_lines"
+                fi
+              fi
+            done < <(find "$d" -maxdepth 3 -type f 2>/dev/null || true)
           done
 
-          echo "Searching in: $SEARCH_DIRS"
-          grep -rniIE --exclude-dir=".git" --exclude-dir="node_modules" --exclude-dir="vendor" \
-            "Madeena Server Monitor|Peringatan Kritis Server|Peringatan Kritis|Disk /=" \
-            $SEARCH_DIRS 2>/dev/null \
-            | sed -E 's/(token|secret|password|key|auth)[=:][^ ]+/\1=***/I' | head -50 || echo "No matches for alert header keywords"
-
           echo ""
-          echo "▶ Step 7d: Grep for threshold 50 / 50% in scripts"
-          grep -rniIE --exclude-dir=".git" --exclude-dir="node_modules" --exclude-dir="vendor" \
-            "threshold.*50|50%.*disk|disk.*50%|df.*50" \
-            $SEARCH_DIRS 2>/dev/null \
-            | sed -E 's/(token|secret|password|key|auth)[=:][^ ]+/\1=***/I' | head -50 || echo "No matches for threshold 50 keywords"
+          echo "=== CHECKING /var/www CANDIDATE SCRIPT NAMES (DEPTH 2) ==="
+          if [ ! -e /var/www ]; then
+            echo "/var/www: NOT FOUND"
+          elif [ ! -r /var/www ] || [ ! -x /var/www ]; then
+            echo "/var/www: UNREADABLE / PERMISSION DENIED"
+          else
+            found_scripts=$(find /var/www -maxdepth 2 -type f \( -iname "*monitor*" -o -iname "*disk*" -o -iname "*alert*" \) 2>/dev/null || true)
+            if [ -n "$found_scripts" ]; then
+              for sf in $found_scripts; do
+                echo "  Candidate script name: $sf"
+                if [ -r "$sf" ]; then
+                  h_cnt=$(grep -ciE "Madeena Server Monitor|Peringatan Kritis Server|Peringatan Kritis|Disk /=" "$sf" 2>/dev/null || true)
+                  t_cnt=$(grep -ciE "threshold.*50|50%.*disk|disk.*50%|df.*50" "$sf" 2>/dev/null || true)
+                  if [ "$h_cnt" -gt 0 ] || [ "$t_cnt" -gt 0 ]; then
+                    echo "    alert-header matches: $h_cnt | threshold-pattern matches: $t_cnt"
+                  fi
+                else
+                  echo "    UNREADABLE / PERMISSION DENIED"
+                fi
+              done
+            else
+              echo "FOUND: 0 matching monitor/disk/alert script names in /var/www (depth 2)"
+            fi
+          fi
 
       - name: "8. Summary Report"
         timeout-minutes: 2

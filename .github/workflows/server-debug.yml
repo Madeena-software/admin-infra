@@ -44,6 +44,15 @@ jobs:
     if: github.ref_name == 'task/server-disk-alert-threshold-80'
     runs-on: [self-hosted, linux, x64, production]
     timeout-minutes: 6
+    env:
+      # Narrow job environment: neutralize inherited workflow-level storage/backup secrets
+      NEXTCLOUD_USERNAME: ""
+      SIMAMA_DB_DATA_DIR: ""
+      SIMAMA_STORAGE_DIR: ""
+      SIMAMA_BACKUP_DIR: ""
+      MADEENA_CP_DB_DATA_DIR: ""
+      MADEENA_CP_STORAGE_DIR: ""
+      MADEENA_CP_BACKUP_DIR: ""
     permissions:
       contents: read
 
@@ -62,15 +71,23 @@ jobs:
           fi
 
           echo "Service: madeena-monitor.service"
-          echo "ActiveState: $(systemctl show madeena-monitor.service -p ActiveState --value 2>/dev/null || echo 'UNKNOWN')"
-          echo "UnitFileState: $(systemctl show madeena-monitor.service -p UnitFileState --value 2>/dev/null || echo 'UNKNOWN')"
-          echo "FragmentPath: $(systemctl show madeena-monitor.service -p FragmentPath --value 2>/dev/null || echo 'UNKNOWN')"
-          echo "User: $(systemctl show madeena-monitor.service -p User --value 2>/dev/null || echo 'UNKNOWN')"
-          echo "Group: $(systemctl show madeena-monitor.service -p Group --value 2>/dev/null || echo 'UNKNOWN')"
-          echo "WorkingDirectory: $(systemctl show madeena-monitor.service -p WorkingDirectory --value 2>/dev/null || echo 'UNKNOWN')"
+          active_state=$(systemctl show madeena-monitor.service -p ActiveState --value 2>/dev/null || echo 'UNKNOWN')
+          unit_state=$(systemctl show madeena-monitor.service -p UnitFileState --value 2>/dev/null || echo 'UNKNOWN')
+          frag_path=$(systemctl show madeena-monitor.service -p FragmentPath --value 2>/dev/null || echo 'UNKNOWN')
+          svc_user=$(systemctl show madeena-monitor.service -p User --value 2>/dev/null || echo 'UNKNOWN')
+          svc_group=$(systemctl show madeena-monitor.service -p Group --value 2>/dev/null || echo 'UNKNOWN')
+          svc_cwd=$(systemctl show madeena-monitor.service -p WorkingDirectory --value 2>/dev/null || echo 'UNKNOWN')
+
+          echo "ActiveState: $active_state"
+          echo "UnitFileState: $unit_state"
+          echo "FragmentPath: $frag_path"
+          echo "User: $svc_user"
+          echo "Group: $svc_group"
+          echo "WorkingDirectory: $svc_cwd"
 
           # EnvironmentFiles: output PATH(s) only
           raw_env_files=$(systemctl show madeena-monitor.service -p EnvironmentFiles --value 2>/dev/null || true)
+          parsed_env_paths=""
           if [ -n "$raw_env_files" ]; then
             parsed_env_paths=$(echo "$raw_env_files" | grep -oE '/[^ ;\)#]+' | paste -sd' ' - || echo "$raw_env_files")
             echo "EnvironmentFiles: ${parsed_env_paths:-NONE}"
@@ -84,35 +101,73 @@ jobs:
 
           # ExecStart: extract executable pathname only, without argv
           raw_exec_start=$(systemctl show madeena-monitor.service -p ExecStart --value 2>/dev/null || true)
+          exec_path="UNRESOLVED"
           if [ -n "$raw_exec_start" ]; then
-            parsed_exec=$(echo "$raw_exec_start" | grep -oE 'path=[^ ;]+' | cut -d= -f2 || echo "UNRESOLVED")
-            echo "ExecStart executable path: ${parsed_exec:-UNRESOLVED}"
+            exec_path=$(echo "$raw_exec_start" | grep -oE 'path=[^ ;]+' | cut -d= -f2 || echo "UNRESOLVED")
+            echo "ExecStart executable path: ${exec_path:-UNRESOLVED}"
           else
             echo "ExecStart executable path: UNRESOLVED"
           fi
 
-      - name: "2. Running-Process Identity Mapping (/proc/<pid>)"
+          # Persist discovered authority metadata for downstream step gates
+          mkdir -p .diag_meta
+          echo "$exec_path" > .diag_meta/exec_path
+          echo "$svc_cwd" > .diag_meta/svc_cwd
+          echo "$main_pid" > .diag_meta/main_pid
+          echo "${parsed_env_paths:-NONE}" > .diag_meta/env_files
+
+      - name: "2. Running-Process Identity Mapping & Authority Verification"
         timeout-minutes: 1
         run: |
           set -euo pipefail
-          echo "=== RUNNING PROCESS IDENTITY MAPPING ==="
-          if ! command -v systemctl >/dev/null 2>&1; then
-            echo "COMMAND UNAVAILABLE (systemctl not found)"
-            exit 0
-          fi
+          echo "=== RUNNING PROCESS IDENTITY MAPPING & AUTHORITY CHECK ==="
 
-          main_pid=$(systemctl show madeena-monitor.service -p MainPID --value 2>/dev/null || echo '0')
-          echo "MainPID: $main_pid"
+          main_pid=$(cat .diag_meta/main_pid 2>/dev/null || echo '0')
+          exec_path=$(cat .diag_meta/exec_path 2>/dev/null || echo 'UNRESOLVED')
+          svc_cwd=$(cat .diag_meta/svc_cwd 2>/dev/null || echo '')
+
+          echo "Target MainPID: $main_pid"
+          echo "Systemd ExecStart: $exec_path"
+          echo "Systemd WorkingDirectory: $svc_cwd"
+
+          authority_conflict="false"
 
           if [ -z "$main_pid" ] || [ "$main_pid" = "0" ]; then
             echo "Process state: NOT RUNNING or PID 0"
+            authority_conflict="true"
           elif [ ! -d "/proc/$main_pid" ]; then
             echo "Process directory /proc/$main_pid: NOT FOUND"
+            authority_conflict="true"
           else
             exe_target=$(readlink -f "/proc/$main_pid/exe" 2>/dev/null || echo "UNREADABLE / PERMISSION DENIED")
             cwd_target=$(readlink -f "/proc/$main_pid/cwd" 2>/dev/null || echo "UNREADABLE / PERMISSION DENIED")
             echo "/proc/$main_pid/exe -> $exe_target"
             echo "/proc/$main_pid/cwd -> $cwd_target"
+
+            # Check for material conflict with systemd ExecStart
+            if [ "$exec_path" != "UNRESOLVED" ] && [ -e "$exec_path" ]; then
+              expected_real_exec=$(readlink -f "$exec_path" 2>/dev/null || echo "$exec_path")
+              if [ "$exe_target" != "UNREADABLE / PERMISSION DENIED" ] && [ "$exe_target" != "$expected_real_exec" ]; then
+                echo "AUTHORITY CONFLICT: /proc/$main_pid/exe ($exe_target) does not match ExecStart realpath ($expected_real_exec)"
+                authority_conflict="true"
+              fi
+            fi
+
+            # Check WorkingDirectory conflict if configured
+            if [ -n "$svc_cwd" ] && [ "$svc_cwd" != "UNKNOWN" ] && [ -d "$svc_cwd" ]; then
+              expected_real_cwd=$(readlink -f "$svc_cwd" 2>/dev/null || echo "$svc_cwd")
+              if [ "$cwd_target" != "UNREADABLE / PERMISSION DENIED" ] && [ "$cwd_target" != "$expected_real_cwd" ]; then
+                echo "AUTHORITY CONFLICT: /proc/$main_pid/cwd ($cwd_target) does not match WorkingDirectory realpath ($expected_real_cwd)"
+                authority_conflict="true"
+              fi
+            fi
+          fi
+
+          echo "$authority_conflict" > .diag_meta/authority_conflict
+          if [ "$authority_conflict" = "true" ]; then
+            echo "Result: AUTHORITY CONFLICT DETECTED"
+          else
+            echo "Result: AUTHORITY VERIFIED (Process matches systemd service definition)"
           fi
 
       - name: "3. Candidate-File Identity & Comparison"
@@ -166,43 +221,138 @@ jobs:
             echo "Comparison: ONE OR BOTH CANDIDATES NOT FOUND"
           fi
 
-      - name: "4. Secret-Safe Environment-File Threshold Inspection"
+      - name: "4. Authoritative Program Linkage Inspection"
+        timeout-minutes: 2
+        run: |
+          set -euo pipefail
+          echo "=== AUTHORITATIVE PROGRAM CONFIGURATION LINKAGE INSPECTION ==="
+
+          exec_path=$(cat .diag_meta/exec_path 2>/dev/null || echo 'UNRESOLVED')
+          svc_cwd=$(cat .diag_meta/svc_cwd 2>/dev/null || echo '')
+
+          echo "Target Executable: $exec_path"
+          echo "Target WorkingDirectory: $svc_cwd"
+
+          program_linked_file=""
+          dotenv_detected="false"
+
+          if [ "$exec_path" = "UNRESOLVED" ] || [ ! -e "$exec_path" ]; then
+            echo "Executable status: UNRESOLVED OR NOT FOUND"
+          elif [ ! -r "$exec_path" ]; then
+            echo "Executable status: UNREADABLE / PERMISSION DENIED"
+          else
+            file_type=$(file -b "$exec_path" 2>/dev/null || echo "UNKNOWN")
+            echo "FileType: $file_type"
+
+            if echo "$file_type" | grep -qi "text"; then
+              echo "Inspecting text script metadata for configuration loading tokens:"
+              # Scan script metadata for allowlisted tokens without printing code lines
+              while IFS=: read -r lnum line; do
+                [ -n "$lnum" ] || continue
+                lower_line=$(echo "$line" | tr '[:upper:]' '[:lower:]')
+                matched_tokens=""
+                for tok in "load_dotenv" "dotenv" "environmentfile" "disk_threshold" "disk_critical" "threshold"; do
+                  if echo "$lower_line" | grep -qF "$tok"; then
+                    matched_tokens="${matched_tokens:+$matched_tokens,}$tok"
+                  fi
+                done
+                if [ -n "$matched_tokens" ]; then
+                  # Extract only referenced plain local file paths
+                  ref_path=$(echo "$line" | grep -oE '/[a-zA-Z0-9_./-]+\.(env|conf)' | head -1 || true)
+                  echo "  line=$lnum tokens=$matched_tokens ${ref_path:+config_path=$ref_path}"
+
+                  if echo "$matched_tokens" | grep -qE "dotenv|load_dotenv"; then
+                    dotenv_detected="true"
+                  fi
+                  if [ -n "$ref_path" ] && [ -z "$program_linked_file" ]; then
+                    program_linked_file="$ref_path"
+                  fi
+                fi
+              done < <(grep -nE -i 'dotenv|environmentfile|disk_threshold|disk_critical|threshold' "$exec_path" 2>/dev/null || true)
+
+              # If dotenv loading detected without explicit path, check WorkingDirectory/.env
+              if [ -z "$program_linked_file" ] && [ "$dotenv_detected" = "true" ] && [ -n "$svc_cwd" ] && [ -d "$svc_cwd" ]; then
+                if [ -e "$svc_cwd/.env" ]; then
+                  program_linked_file="$svc_cwd/.env"
+                  echo "Deterministic linkage: dotenv loader combined with WorkingDirectory resolves to $program_linked_file"
+                fi
+              fi
+            else
+              echo "Authoritative executable is binary; checking printable identifier presence:"
+              strings -n 4 "$exec_path" 2>/dev/null | grep -iE 'dotenv|environmentfile|disk_threshold|disk_critical' | head -5 | awk '{print "  binary_token=" $0}' || echo "  No linkage tokens found in binary"
+            fi
+          fi
+
+          echo "$program_linked_file" > .diag_meta/program_linked_file
+          echo "Program linked file result: ${program_linked_file:-NONE}"
+
+      - name: "5. Environment-File Authority Gating & Secret-Safe Threshold Inspection"
         timeout-minutes: 2
         env:
           SUDO_PASSWORD: ${{ secrets.SUDO_PASSWORD }}
         run: |
           set -euo pipefail
-          echo "=== ENVIRONMENT-FILE THRESHOLD INSPECTION (STRICT ALLOWLIST) ==="
+          echo "=== ENVIRONMENT-FILE AUTHORITY GATING & THRESHOLD INSPECTION ==="
 
+          # Safe non-interactive sudo helper
           _sudo() {
             if [ -n "${SUDO_PASSWORD:-}" ]; then
-              echo "$SUDO_PASSWORD" | sudo -S "$@" 2>/dev/null
+              printf '%s\n' "$SUDO_PASSWORD" | sudo -S -p '' -- "$@" 2>/dev/null
             else
-              sudo "$@"
+              sudo -n "$@" 2>/dev/null
             fi
           }
 
-          raw_env_files=$(systemctl show madeena-monitor.service -p EnvironmentFiles --value 2>/dev/null || true)
-          parsed_env_paths=""
-          if [ -n "$raw_env_files" ]; then
-            parsed_env_paths=$(echo "$raw_env_files" | grep -oE '/[^ ;\)#]+' | paste -sd' ' - || true)
-          fi
+          auth_conflict=$(cat .diag_meta/authority_conflict 2>/dev/null || echo 'false')
+          env_files_meta=$(cat .diag_meta/env_files 2>/dev/null || echo 'NONE')
+          program_linked_file=$(cat .diag_meta/program_linked_file 2>/dev/null || echo '')
 
-          target_env="/opt/madeena-monitor/.env"
-          echo "Systemd EnvironmentFiles: ${parsed_env_paths:-NONE}"
-          echo "Target env path to inspect: $target_env"
+          linkage_state="NOT_AUTHORITATIVELY_LINKED"
+          authoritative_env_target=""
 
-          if [ ! -e "$target_env" ]; then
-            echo "Env file status: NOT FOUND"
+          if [ "$auth_conflict" = "true" ]; then
+            echo "AUTHORITY CONFLICT: Process/service mismatch detected. Skipping environment file inspection."
+            echo "ENV SOURCE NOT AUTHORITATIVELY LINKED"
             exit 0
           fi
 
-          echo "Env file status: EXISTS"
-          echo "Env file permissions: $(stat -c '%a %U:%G' "$target_env" 2>/dev/null || echo 'UNKNOWN')"
+          # 1. Evaluate Path A: systemd linkage
+          if [ -n "$env_files_meta" ] && [ "$env_files_meta" != "NONE" ]; then
+            first_env=$(echo "$env_files_meta" | awk '{print $1}')
+            if [ -n "$first_env" ] && [ -e "$first_env" ]; then
+              linkage_state="SYSTEMD_LINKED"
+              authoritative_env_target="$first_env"
+              echo "Linkage evaluation: SYSTEMD_LINKED ($first_env referenced in service EnvironmentFiles)"
+            fi
+          fi
 
+          # 2. Evaluate Path B: program-level linkage if not systemd linked
+          if [ "$linkage_state" = "NOT_AUTHORITATIVELY_LINKED" ] && [ -n "$program_linked_file" ]; then
+            if [ -e "$program_linked_file" ]; then
+              linkage_state="PROGRAM_LINKED"
+              authoritative_env_target="$program_linked_file"
+              echo "Linkage evaluation: PROGRAM_LINKED ($program_linked_file verified from program metadata)"
+            fi
+          fi
+
+          echo "Final Linkage State: $linkage_state"
+          echo "$linkage_state" > .diag_meta/linkage_state
+          echo "$authoritative_env_target" > .diag_meta/authoritative_env_target
+
+          # Gating enforcement: NEVER sudo-read unless authoritatively linked
+          if [ "$linkage_state" != "SYSTEMD_LINKED" ] && [ "$linkage_state" != "PROGRAM_LINKED" ]; then
+            echo "ENV SOURCE NOT AUTHORITATIVELY LINKED"
+            echo "Skipping privileged inspection: no verified consumption link exists."
+            exit 0
+          fi
+
+          echo "Target Authoritative Config: $authoritative_env_target"
+          echo "File permissions: $(stat -c '%a %U:%G' "$authoritative_env_target" 2>/dev/null || echo 'UNKNOWN')"
+
+          # Secret-safe allowlist parser
           echo ""
           echo "--- Allowlisted Disk Threshold Variables ---"
-          _sudo cat "$target_env" 2>/dev/null | awk -F= '
+          if ! _sudo cat "$authoritative_env_target" 2>/dev/null | awk -F= '
             BEGIN { match_count = 0 }
             !/^[[:space:]]*(#|$)/ && NF >= 2 {
               k = $1; sub(/^[[:space:]]+/, "", k); sub(/[[:space:]]+$/, "", k);
@@ -223,15 +373,28 @@ jobs:
                 print "FOUND: 0 matching disk threshold variables in environment file";
               }
             }
-          ' || echo "INSPECTION FAILED: unable to read environment file via sudo"
+          '; then
+            echo "READ FAILED / PRIVILEGE INSUFFICIENT"
+          fi
 
-      - name: "5. Monitor Executable/Script Threshold Inspection"
+      - name: "6. Monitor Executable/Script Threshold Inspection"
         timeout-minutes: 2
         run: |
           set -euo pipefail
           echo "=== MONITOR EXECUTABLE/SCRIPT THRESHOLD INSPECTION ==="
 
-          cands=("/opt/madeena-monitor/monitor" "/var/www/madeena-server-monitor/monitor")
+          exec_path=$(cat .diag_meta/exec_path 2>/dev/null || echo 'UNRESOLVED')
+          cands=()
+          if [ "$exec_path" != "UNRESOLVED" ] && [ -e "$exec_path" ]; then
+            cands+=("$exec_path")
+          fi
+          # Also compare standard locations if different from authoritative ExecStart
+          for alt in "/opt/madeena-monitor/monitor" "/var/www/madeena-server-monitor/monitor"; do
+            if [ "$alt" != "$exec_path" ] && [ -e "$alt" ]; then
+              cands+=("$alt")
+            fi
+          done
+
           for f in "${cands[@]}"; do
             [ -e "$f" ] || continue
             echo "--- Inspecting: $f ---"
@@ -307,12 +470,41 @@ jobs:
             fi
           done
 
-      - name: "6. Summary & Source Classification Synthesis"
+      - name: "7. Threshold Source Classification Synthesis"
         timeout-minutes: 1
         run: |
           set -euo pipefail
-          echo "=== SECOND-STAGE DIAGNOSTIC COMPLETE ==="
-          echo "Timestamp UTC: $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
+          echo "=== THRESHOLD SOURCE CLASSIFICATION SYNTHESIS ==="
+
+          auth_conflict=$(cat .diag_meta/authority_conflict 2>/dev/null || echo 'false')
+          linkage_state=$(cat .diag_meta/linkage_state 2>/dev/null || echo 'NOT_AUTHORITATIVELY_LINKED')
+          env_target=$(cat .diag_meta/authoritative_env_target 2>/dev/null || echo '')
+          exec_path=$(cat .diag_meta/exec_path 2>/dev/null || echo 'UNRESOLVED')
+
+          echo "Authority Conflict: $auth_conflict"
+          echo "Linkage State: $linkage_state"
+          echo "Authoritative Environment File: ${env_target:-NONE}"
+          echo "Authoritative Executable: $exec_path"
+
+          echo ""
+          echo "Candidate Classification Result:"
+          if [ "$auth_conflict" = "true" ]; then
+            echo "CLASSIFICATION: E. AUTHORITY CONFLICT"
+            echo "Reason: Live running process PID/exe/cwd conflicts with systemd service definition."
+          elif [ "$linkage_state" = "SYSTEMD_LINKED" ]; then
+            echo "CLASSIFICATION: A. SYSTEMD ENVIRONMENT FILE"
+            echo "Evidence: Service EnvironmentFiles explicitly defines $env_target"
+          elif [ "$linkage_state" = "PROGRAM_LINKED" ]; then
+            echo "CLASSIFICATION: B. PROGRAM-LOADED ENVIRONMENT / CONFIG FILE"
+            echo "Evidence: Program metadata verified to load $env_target"
+          elif [ "$exec_path" != "UNRESOLVED" ]; then
+            echo "CLASSIFICATION: C. MONITOR SCRIPT / CONFIG VALUE or D. EMBEDDED / DEFAULT EXECUTABLE VALUE"
+            echo "Evidence: No external environment file is authoritatively linked; value originates in executable."
+          else
+            echo "CLASSIFICATION: F. UNRESOLVED"
+            echo "Evidence: Authority mapping incomplete."
+          fi
+          echo "Completed at: $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
   full-audit:
     name: "Full Server Audit"
     if: github.ref_name != 'task/server-disk-alert-threshold-80'

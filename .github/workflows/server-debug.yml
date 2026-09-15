@@ -39,8 +39,168 @@ env:
   MADEENA_CP_BACKUP_DIR: /media/nextcloud-data/data/${{ secrets.NEXTCLOUD_USERNAME }}/files/madeena_cp_backups
 
 jobs:
+  monitor-discovery:
+    name: "Production Monitor Discovery (Disk Alert 80% Task)"
+    if: github.ref_name == 'task/server-disk-alert-threshold-80'
+    runs-on: [self-hosted, linux, x64, production]
+    timeout-minutes: 10
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: "1. Runner Identity & Environment Verification"
+        timeout-minutes: 2
+        run: |
+          set -euo pipefail
+          echo "=== RUNNER IDENTITY & ENVIRONMENT ==="
+          echo "Hostname: $(hostname)"
+          echo "Runner Name: ${RUNNER_NAME:-unknown}"
+          echo "OS: $(uname -srm)"
+          echo "Current User: $(whoami) (id: $(id -u):$(id -g))"
+          echo "GitHub Ref: ${{ github.ref }}"
+          echo "GitHub Ref Name: ${{ github.ref_name }}"
+          echo "GitHub SHA: ${{ github.sha }}"
+          echo "GitHub Workflow: ${{ github.workflow }}"
+          echo "GitHub Run ID: ${{ github.run_id }}"
+          echo "GitHub Run Number: ${{ github.run_number }}"
+          echo "Date UTC: $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
+
+      - name: "2. Filesystem & Root Usage Inspection"
+        timeout-minutes: 2
+        run: |
+          set -euo pipefail
+          echo "=== ROOT FILESYSTEM USAGE ==="
+          df -h /
+          echo ""
+          echo "=== ALL FILESYSTEMS ==="
+          df -hT
+          echo ""
+          echo "=== ROOT USAGE PERCENTAGE ==="
+          df -P / | awk 'NR==2 {print "Root (/):", $5, "used of", $2, "(Available:", $4 ")"}'
+
+      - name: "3. Crontab Inspection (All Users & System Cron)"
+        timeout-minutes: 2
+        run: |
+          set -euo pipefail
+          echo "=== USER CRONTABS ==="
+          for user in root $(awk -F: '$3 >= 1000 && $3 < 65534 {print $1}' /etc/passwd 2>/dev/null || true); do
+            CRON_CONTENT=$(crontab -l -u "$user" 2>/dev/null | grep -v '^[[:space:]]*#' | grep -v '^[[:space:]]*$' || true)
+            if [ -n "$CRON_CONTENT" ]; then
+              echo "--- crontab for: $user ---"
+              echo "$CRON_CONTENT"
+            fi
+          done
+
+          echo ""
+          echo "=== SYSTEM CRON DIRECTORIES ==="
+          ls -la /etc/cron* 2>/dev/null || true
+
+          echo ""
+          echo "=== /etc/crontab ==="
+          if [ -f /etc/crontab ]; then
+            grep -v '^[[:space:]]*#' /etc/crontab | grep -v '^[[:space:]]*$' || true
+          fi
+
+          echo ""
+          echo "=== /etc/cron.d/ ENTRIES ==="
+          if [ -d /etc/cron.d ]; then
+            for f in /etc/cron.d/*; do
+              if [ -f "$f" ]; then
+                echo "--- File: $f ---"
+                grep -v '^[[:space:]]*#' "$f" 2>/dev/null | grep -v '^[[:space:]]*$' || true
+              fi
+            done
+          fi
+
+      - name: "4. Systemd Timers and Services Inspection"
+        timeout-minutes: 2
+        run: |
+          set -euo pipefail
+          echo "=== ALL ACTIVE & INACTIVE SYSTEMD TIMERS ==="
+          systemctl list-timers --all --no-pager 2>/dev/null || true
+
+          echo ""
+          echo "=== SYSTEMD SERVICES MATCHING MONITOR / DISK / ALERT / CHECK ==="
+          systemctl list-unit-files --type=service,timer --no-pager 2>/dev/null \
+            | grep -iE 'monitor|disk|alert|check|watch|notify|tele' || echo "No obvious unit-file name matches"
+
+          echo ""
+          echo "=== RUNNING SERVICES MATCHING MONITOR / DISK / ALERT / CHECK ==="
+          systemctl list-units --type=service --state=running --no-pager 2>/dev/null \
+            | grep -iE 'monitor|disk|alert|check|watch|notify|tele' || echo "No obvious running service matches"
+
+      - name: "5. Running Processes Inspection"
+        timeout-minutes: 2
+        run: |
+          set -euo pipefail
+          echo "=== RUNNING PROCESSES MATCHING MONITOR / DISK / ALERT / SCRIPT / PYTHON / BASH / SH / PHP ==="
+          ps aux | grep -iE 'monitor|disk|alert|df|check|notify|telegram|webhook' | grep -v 'grep' || echo "No matching processes found"
+
+      - name: "6. Docker Container & Compose Inspection"
+        timeout-minutes: 2
+        run: |
+          set -euo pipefail
+          echo "=== RUNNING DOCKER CONTAINERS ==="
+          docker ps --format "table {{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}" 2>/dev/null || echo "docker ps not available"
+
+          echo ""
+          echo "=== DOCKER CONTAINERS MATCHING MONITOR / ALERT / WATCH ==="
+          docker ps -a --format "table {{.Names}}\t{{.Image}}\t{{.Status}}" 2>/dev/null \
+            | grep -iE 'monitor|alert|watch|disk|agent' || echo "No container name matches"
+
+          echo ""
+          echo "=== DOCKER STACKS / SERVICES ==="
+          docker service ls 2>/dev/null || echo "Swarm not active or no services"
+
+      - name: "7. Targeted Filesystem Search for Monitor & Threshold 50%"
+        timeout-minutes: 3
+        run: |
+          set -euo pipefail
+          echo "=== TARGETED FILE SEARCH IN /etc, /usr/local/bin, /opt, /var/www, /home ==="
+
+          echo ""
+          echo "▶ Step 7a: Custom scripts in /usr/local/bin, /usr/local/sbin, /opt"
+          ls -la /usr/local/bin /usr/local/sbin /opt 2>/dev/null || true
+
+          echo ""
+          echo "▶ Step 7b: Files matching monitor / alert / disk in script directories"
+          find /usr/local/bin /usr/local/sbin /opt /etc/systemd/system -maxdepth 3 -type f \
+            \( -iname "*monitor*" -o -iname "*disk*" -o -iname "*alert*" -o -iname "*check*" \) 2>/dev/null || true
+
+          echo ""
+          echo "▶ Step 7c: Grep for alert keywords ('Madeena Server Monitor', 'Peringatan Kritis Server', '50.0%', 'threshold 50', 'Disk /=')"
+          # Search specific bounded configuration and script directories only. Redact sensitive values.
+          SEARCH_DIRS=""
+          for d in /etc/systemd/system /etc/cron* /usr/local/bin /usr/local/sbin /opt /var/www; do
+            [ -d "$d" ] && SEARCH_DIRS="$SEARCH_DIRS $d"
+          done
+
+          echo "Searching in: $SEARCH_DIRS"
+          grep -rniIE --exclude-dir=".git" --exclude-dir="node_modules" --exclude-dir="vendor" \
+            "Madeena Server Monitor|Peringatan Kritis Server|Peringatan Kritis|Disk /=" \
+            $SEARCH_DIRS 2>/dev/null \
+            | sed -E 's/(token|secret|password|key|auth)[=:][^ ]+/\1=***/I' | head -50 || echo "No matches for alert header keywords"
+
+          echo ""
+          echo "▶ Step 7d: Grep for threshold 50 / 50% in scripts"
+          grep -rniIE --exclude-dir=".git" --exclude-dir="node_modules" --exclude-dir="vendor" \
+            "threshold.*50|50%.*disk|disk.*50%|df.*50" \
+            $SEARCH_DIRS 2>/dev/null \
+            | sed -E 's/(token|secret|password|key|auth)[=:][^ ]+/\1=***/I' | head -50 || echo "No matches for threshold 50 keywords"
+
+      - name: "8. Summary Report"
+        timeout-minutes: 2
+        run: |
+          set -euo pipefail
+          echo "=== PRODUCTION MONITOR DISCOVERY COMPLETE ==="
+          echo "Completed at: $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
+
   full-audit:
     name: "Full Server Audit"
+    if: github.ref_name != 'task/server-disk-alert-threshold-80'
     runs-on: [self-hosted, linux, x64, production]
     permissions:
       contents: read

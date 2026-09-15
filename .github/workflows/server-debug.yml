@@ -39,11 +39,11 @@ env:
   MADEENA_CP_BACKUP_DIR: /media/nextcloud-data/data/${{ secrets.NEXTCLOUD_USERNAME }}/files/madeena_cp_backups
 
 jobs:
-  monitor-detail-discovery:
-    name: "Production Monitor Detail Discovery (Disk Alert 80% Task)"
+  monitor-threshold-change:
+    name: "Production Monitor Root Disk Alert Threshold Change (50% -> 80%)"
     if: github.ref_name == 'task/server-disk-alert-threshold-80'
     runs-on: [self-hosted, linux, x64, production]
-    timeout-minutes: 6
+    timeout-minutes: 10
     env:
       # Narrow job environment: neutralize inherited workflow-level storage/backup secrets
       NEXTCLOUD_USERNAME: ""
@@ -60,319 +60,315 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: "1. Service Authority & Configuration Mapping (madeena-monitor.service)"
+      - name: "1. Fail-Closed Preflight: Service Authority & Runtime Mapping Verification"
         timeout-minutes: 2
         run: |
           set -euo pipefail
-          echo "=== SYSTEMD SERVICE AUTHORITY & CONFIGURATION MAPPING ==="
+          echo "=== 1. PREFLIGHT: SERVICE AUTHORITY & RUNTIME MAPPING ==="
           if ! command -v systemctl >/dev/null 2>&1; then
-            echo "COMMAND UNAVAILABLE (systemctl not found)"
-            exit 0
+            echo "FATAL: systemctl command unavailable" >&2
+            exit 1
           fi
 
-          echo "Service: madeena-monitor.service"
+          mkdir -p .mutation_meta
+
+          # Check service existence and active state
           active_state=$(systemctl show madeena-monitor.service -p ActiveState --value 2>/dev/null || echo 'UNKNOWN')
-          unit_state=$(systemctl show madeena-monitor.service -p UnitFileState --value 2>/dev/null || echo 'UNKNOWN')
-          frag_path=$(systemctl show madeena-monitor.service -p FragmentPath --value 2>/dev/null || echo 'UNKNOWN')
-          svc_user=$(systemctl show madeena-monitor.service -p User --value 2>/dev/null || echo 'UNKNOWN')
-          svc_group=$(systemctl show madeena-monitor.service -p Group --value 2>/dev/null || echo 'UNKNOWN')
-          svc_cwd=$(systemctl show madeena-monitor.service -p WorkingDirectory --value 2>/dev/null || echo 'UNKNOWN')
-
           echo "ActiveState: $active_state"
-          echo "UnitFileState: $unit_state"
-          echo "FragmentPath: $frag_path"
-          echo "User: $svc_user"
-          echo "Group: $svc_group"
-          echo "WorkingDirectory: $svc_cwd"
-
-          mkdir -p .diag_meta
-
-          # EnvironmentFiles: output PATH(s) only (handle multiple paths cleanly)
-          raw_env_files=$(systemctl show madeena-monitor.service -p EnvironmentFiles --value 2>/dev/null || true)
-          parsed_env_paths=""
-          if [ -n "$raw_env_files" ]; then
-            parsed_env_paths=$(echo "$raw_env_files" | grep -oE '/[^ ;\)#]+' | paste -sd' ' - || echo "$raw_env_files")
-            echo "EnvironmentFiles: ${parsed_env_paths:-NONE}"
-          else
-            echo "EnvironmentFiles: NONE"
+          if [ "$active_state" != "active" ]; then
+            echo "FATAL: madeena-monitor.service is not active (state: $active_state)" >&2
+            exit 1
           fi
-          echo "${parsed_env_paths:-NONE}" > .diag_meta/env_files
 
-          # Direct Environment property: strictly parse allowlisted threshold keys only
+          frag_path=$(systemctl show madeena-monitor.service -p FragmentPath --value 2>/dev/null || echo 'UNKNOWN')
+          echo "FragmentPath: $frag_path"
+          if [ -z "$frag_path" ] || [ "$frag_path" = "UNKNOWN" ] || [ ! -f "$frag_path" ]; then
+            echo "FATAL: FragmentPath invalid or missing: $frag_path" >&2
+            exit 1
+          fi
+
+          # WorkingDirectory verification
+          svc_cwd=$(systemctl show madeena-monitor.service -p WorkingDirectory --value 2>/dev/null || echo 'UNKNOWN')
+          echo "WorkingDirectory: $svc_cwd"
+          expected_cwd="/var/www/madeena-server-monitor"
+          if [ "$svc_cwd" != "$expected_cwd" ]; then
+            echo "FATAL: WorkingDirectory mismatch: expected $expected_cwd, got $svc_cwd" >&2
+            exit 1
+          fi
+          real_cwd=$(readlink -f "$svc_cwd" 2>/dev/null || echo '')
+          if [ "$real_cwd" != "$expected_cwd" ]; then
+            echo "FATAL: WorkingDirectory realpath mismatch: expected $expected_cwd, got $real_cwd" >&2
+            exit 1
+          fi
+
+          # ExecStart verification
+          raw_exec_start=$(systemctl show madeena-monitor.service -p ExecStart --value 2>/dev/null || true)
+          exec_path=$(echo "$raw_exec_start" | grep -oE 'path=[^ ;]+' | cut -d= -f2 || echo "UNRESOLVED")
+          echo "ExecStart executable path: $exec_path"
+          expected_exec="/var/www/madeena-server-monitor/monitor"
+          if [ "$exec_path" != "$expected_exec" ]; then
+            echo "FATAL: ExecStart mismatch: expected $expected_exec, got $exec_path" >&2
+            exit 1
+          fi
+          real_exec=$(readlink -f "$exec_path" 2>/dev/null || echo '')
+          if [ "$real_exec" != "$expected_exec" ]; then
+            echo "FATAL: ExecStart realpath mismatch: expected $expected_exec, got $real_exec" >&2
+            exit 1
+          fi
+
+          # ExecStart CLI threshold argument check (Must NOT exist)
+          arg_matches=$(printf '%s\n' "$raw_exec_start" | awk '{
+            for (i = 1; i <= NF; i++) {
+              if ($i ~ /^--disk[-_]?(critical[-_]?)?threshold=[0-9]+([.][0-9]+)?%?$/) {
+                print $i;
+              } else if ($i ~ /^--disk[-_]?(critical[-_]?)?threshold$/ && (i+1) <= NF && $(i+1) ~ /^[0-9]+([.][0-9]+)?%?$/) {
+                print $i "=" $(i+1);
+              }
+            }
+          }' || true)
+          if [ -n "$arg_matches" ]; then
+            echo "FATAL: Disallowlisted CLI threshold override detected in ExecStart: $arg_matches" >&2
+            exit 1
+          fi
+
+          # Direct systemd Environment property check (Must NOT have threshold keys)
           raw_direct_env=$(systemctl show madeena-monitor.service -p Environment --value 2>/dev/null || true)
-          echo ""
-          echo "--- Direct systemd Environment Property Inspection ---"
-          direct_found="false"
-          direct_key="none"
-          direct_val="none"
-
           if [ -n "$raw_direct_env" ]; then
             direct_matches=$(printf '%s\n' "$raw_direct_env" | awk -v RS='[[:space:]]+' -F= '
               NF >= 2 {
-                k = $1; v = substr($0, index($0, "=") + 1);
-                gsub(/^["\x27]|["\x27]$/, "", v);
-                uk = toupper(k);
+                uk = toupper($1);
                 if (uk ~ /DISK/ && (uk ~ /THRESHOLD/ || uk ~ /CRITICAL/)) {
-                  if (v ~ /^[0-9]+([.][0-9]+)?%?$/) {
-                    print k "=" v;
-                  } else {
-                    print k "=<non-numeric-redacted>";
-                  }
+                  print $1;
                 }
               }
             ' || true)
-
             if [ -n "$direct_matches" ]; then
-              direct_found="true"
-              echo "$direct_matches" | while read -r line; do
-                echo "  direct_env_threshold: $line"
-              done
-              direct_key=$(echo "$direct_matches" | head -1 | cut -d= -f1)
-              direct_val=$(echo "$direct_matches" | head -1 | cut -d= -f2)
-            else
-              echo "  direct_env_threshold_found=false (No matching threshold variables in systemd Environment)"
+              echo "FATAL: Disallowlisted direct systemd Environment threshold override detected: $direct_matches" >&2
+              exit 1
             fi
-          else
-            echo "  direct_env_threshold_found=false (Environment property is empty)"
           fi
-          echo "$direct_found" > .diag_meta/direct_env_threshold_found
-          echo "$direct_key" > .diag_meta/direct_env_threshold_key
-          echo "$direct_val" > .diag_meta/direct_env_threshold_value
 
-          # MainPID
+          # EnvironmentFiles verification: exactly one file, matching expected path
+          raw_env_files=$(systemctl show madeena-monitor.service -p EnvironmentFiles --value 2>/dev/null || true)
+          parsed_env_paths=$(echo "$raw_env_files" | grep -oE '/[^ ;\)#]+' || true)
+          env_file_count=$(echo "$parsed_env_paths" | grep -c . || true)
+          echo "EnvironmentFiles count: $env_file_count"
+          expected_env="/var/www/madeena-server-monitor/.env"
+          if [ "$env_file_count" -ne 1 ]; then
+            echo "FATAL: Expected exactly 1 EnvironmentFile, found $env_file_count: $parsed_env_paths" >&2
+            exit 1
+          fi
+          if [ "$parsed_env_paths" != "$expected_env" ]; then
+            echo "FATAL: EnvironmentFiles mismatch: expected $expected_env, got $parsed_env_paths" >&2
+            exit 1
+          fi
+          real_env=$(readlink -f "$parsed_env_paths" 2>/dev/null || echo '')
+          if [ "$real_env" != "$expected_env" ]; then
+            echo "FATAL: EnvironmentFiles realpath mismatch: expected $expected_env, got $real_env" >&2
+            exit 1
+          fi
+
+          # Running process /proc verification
           main_pid=$(systemctl show madeena-monitor.service -p MainPID --value 2>/dev/null || echo '0')
           echo "MainPID: $main_pid"
-          echo "$main_pid" > .diag_meta/main_pid
+          if [ -z "$main_pid" ] || [ "$main_pid" = "0" ] || [ ! -d "/proc/$main_pid" ]; then
+            echo "FATAL: MainPID $main_pid not running or /proc entry missing" >&2
+            exit 1
+          fi
+          proc_exe=$(readlink -f "/proc/$main_pid/exe" 2>/dev/null || echo '')
+          proc_cwd=$(readlink -f "/proc/$main_pid/cwd" 2>/dev/null || echo '')
+          echo "/proc/$main_pid/exe: $proc_exe"
+          echo "/proc/$main_pid/cwd: $proc_cwd"
+          if [ "$proc_exe" != "$expected_exec" ]; then
+            echo "FATAL: /proc/$main_pid/exe ($proc_exe) mismatch with expected $expected_exec" >&2
+            exit 1
+          fi
+          if [ "$proc_cwd" != "$expected_cwd" ]; then
+            echo "FATAL: /proc/$main_pid/cwd ($proc_cwd) mismatch with expected $expected_cwd" >&2
+            exit 1
+          fi
 
-          # ExecStart: extract executable pathname only and parse allowlisted CLI threshold arguments safely
-          raw_exec_start=$(systemctl show madeena-monitor.service -p ExecStart --value 2>/dev/null || true)
-          exec_path="UNRESOLVED"
-          exec_arg_found="false"
-          exec_arg_name="none"
-          exec_arg_val="none"
+          echo "$main_pid" > .mutation_meta/initial_pid
+          echo "Preflight 1 (Service Authority & Runtime Mapping): PASSED"
 
-          if [ -n "$raw_exec_start" ]; then
-            exec_path=$(echo "$raw_exec_start" | grep -oE 'path=[^ ;]+' | cut -d= -f2 || echo "UNRESOLVED")
-            echo "ExecStart executable path: ${exec_path:-UNRESOLVED}"
+      - name: "2. Fail-Closed Preflight: Binary Provenance Gate"
+        timeout-minutes: 2
+        run: |
+          set -euo pipefail
+          echo "=== 2. PREFLIGHT: BINARY PROVENANCE GATE ==="
+          target_bin="/var/www/madeena-server-monitor/monitor"
+          if ! command -v go >/dev/null 2>&1; then
+            echo "FATAL: go command not found for buildinfo provenance inspection" >&2
+            exit 1
+          fi
 
-            # Safely parse allowlisted CLI arguments without echoing arbitrary argv
-            arg_matches=$(printf '%s\n' "$raw_exec_start" | awk '{
-              for (i = 1; i <= NF; i++) {
-                if ($i ~ /^--disk[-_]?(critical[-_]?)?threshold=[0-9]+([.][0-9]+)?%?$/) {
-                  split($i, kv, "=");
-                  print kv[1] "=" kv[2];
-                } else if ($i ~ /^--disk[-_]?(critical[-_]?)?threshold$/ && (i+1) <= NF && $(i+1) ~ /^[0-9]+([.][0-9]+)?%?$/) {
-                  print $i "=" $(i+1);
-                }
+          # Inspect Go build metadata
+          build_meta=$(go version -m "$target_bin" 2>/dev/null || true)
+          if [ -z "$build_meta" ]; then
+            echo "FATAL: Failed to read Go buildinfo from $target_bin" >&2
+            exit 1
+          fi
+
+          mod_path=$(echo "$build_meta" | awk '$1 == "mod" {print $2}' | head -1 || echo 'UNKNOWN')
+          vcs_rev=$(echo "$build_meta" | awk '$1 == "build" && $2 == "vcs.revision" {print $3}' | head -1 || echo 'UNKNOWN')
+          vcs_mod=$(echo "$build_meta" | awk '$1 == "build" && $2 == "vcs.modified" {print $3}' | head -1 || echo 'UNKNOWN')
+
+          echo "Binary module path: $mod_path"
+          echo "Binary vcs.revision: $vcs_rev"
+          echo "Binary vcs.modified: $vcs_mod"
+
+          expected_rev="a9be2681f07e9f5cea45de6b51f39b20f929dc1f"
+          if [ "$vcs_mod" = "true" ]; then
+            echo "FATAL: Binary was built from dirty working tree (vcs.modified=true)" >&2
+            exit 1
+          fi
+          if [ "$vcs_rev" != "$expected_rev" ]; then
+            echo "FATAL: Binary vcs.revision ($vcs_rev) does not match reviewed source revision ($expected_rev)" >&2
+            exit 1
+          fi
+
+          echo "$vcs_rev" > .mutation_meta/binary_vcs_rev
+          echo "Preflight 2 (Binary Provenance): PASSED"
+
+      - name: "3. Fail-Closed Preflight: Root-vs-Data Scope Gate (DATA_PARTITIONS)"
+        timeout-minutes: 2
+        run: |
+          set -euo pipefail
+          echo "=== 3. PREFLIGHT: ROOT-VS-DATA SCOPE GATE ==="
+          env_file="/var/www/madeena-server-monitor/.env"
+          if [ ! -r "$env_file" ]; then
+            echo "FATAL: Authoritative .env not readable: $env_file" >&2
+            exit 1
+          fi
+
+          # Allowlisted parse of DATA_PARTITIONS only (do NOT dump .env)
+          data_part_line=$(grep -E '^[[:space:]]*DATA_PARTITIONS=' "$env_file" || true)
+          if [ -n "$data_part_line" ]; then
+            echo "DATA_PARTITIONS key present: true"
+            raw_val=$(printf '%s\n' "$data_part_line" | head -1 | cut -d= -f2-)
+            # strip leading/trailing quotes and spaces
+            cleaned_val=$(printf '%s\n' "$raw_val" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e 's/^["']//' -e 's/["']$//')
+            if [ -n "$cleaned_val" ]; then
+              echo "FATAL: DATA_PARTITIONS is non-empty: '$cleaned_val'. Changing ROOT_DISK_THRESHOLD would affect data disks, which is out of scope." >&2
+              exit 1
+            else
+              echo "ACTIVE DATA_PARTITIONS: NONE (empty string)"
+            fi
+          else
+            echo "DATA_PARTITIONS key present: false"
+            echo "ACTIVE DATA_PARTITIONS: NONE"
+          fi
+
+          echo "Preflight 3 (Root-vs-Data Scope Gate): PASSED"
+
+      - name: "4. Fail-Closed Preflight: Threshold State & Single-Definition Gate"
+        timeout-minutes: 2
+        run: |
+          set -euo pipefail
+          echo "=== 4. PREFLIGHT: THRESHOLD STATE & SINGLE-DEFINITION GATE ==="
+          env_file="/var/www/madeena-server-monitor/.env"
+
+          # Parse strictly through allowlist without dumping .env
+          threshold_defs=$(awk -F= '
+            !/^[[:space:]]*(#|$)/ && NF >= 2 {
+              k = $1; sub(/^[[:space:]]+/, "", k); sub(/[[:space:]]+$/, "", k);
+              v = substr($0, index($0, "=") + 1); sub(/^[[:space:]]+/, "", v); sub(/[[:space:]]+$/, "", v);
+              gsub(/^["']|["']$/, "", v);
+              if (k == "ROOT_DISK_THRESHOLD") {
+                print k "=" v;
               }
-            }' || true)
+            }
+          ' "$env_file" || true)
 
-            if [ -n "$arg_matches" ]; then
-              exec_arg_found="true"
-              exec_arg_name=$(echo "$arg_matches" | head -1 | cut -d= -f1)
-              exec_arg_val=$(echo "$arg_matches" | head -1 | cut -d= -f2)
-              echo "ExecStart allowlisted threshold argument: $exec_arg_name=$exec_arg_val"
-            else
-              echo "ExecStart threshold argument: exec_arg_threshold_found=false"
-            fi
-          else
-            echo "ExecStart executable path: UNRESOLVED"
-            echo "ExecStart threshold argument: EXECSTART THRESHOLD ARGUMENT INSPECTION UNRESOLVED"
+          match_count=$(echo "$threshold_defs" | grep -c . || true)
+          echo "Found active ROOT_DISK_THRESHOLD definitions: $match_count"
+          if [ "$match_count" -ne 1 ]; then
+            echo "FATAL: Expected exactly 1 active ROOT_DISK_THRESHOLD definition, found $match_count: $threshold_defs" >&2
+            exit 1
           fi
 
-          echo "$exec_path" > .diag_meta/exec_path
-          echo "$svc_cwd" > .diag_meta/svc_cwd
-          echo "$exec_arg_found" > .diag_meta/exec_arg_threshold_found
-          echo "$exec_arg_name" > .diag_meta/exec_arg_name
-          echo "$exec_arg_val" > .diag_meta/exec_arg_val
-
-      - name: "2. Running-Process Identity Mapping & Authority Verification"
-        timeout-minutes: 1
-        run: |
-          set -euo pipefail
-          echo "=== RUNNING PROCESS IDENTITY MAPPING & AUTHORITY CHECK ==="
-
-          main_pid=$(cat .diag_meta/main_pid 2>/dev/null || echo '0')
-          exec_path=$(cat .diag_meta/exec_path 2>/dev/null || echo 'UNRESOLVED')
-          svc_cwd=$(cat .diag_meta/svc_cwd 2>/dev/null || echo '')
-
-          echo "Target MainPID: $main_pid"
-          echo "Systemd ExecStart: $exec_path"
-          echo "Systemd WorkingDirectory: $svc_cwd"
-
-          authority_conflict="false"
-
-          if [ -z "$main_pid" ] || [ "$main_pid" = "0" ]; then
-            echo "Process state: NOT RUNNING or PID 0"
-            authority_conflict="true"
-          elif [ ! -d "/proc/$main_pid" ]; then
-            echo "Process directory /proc/$main_pid: NOT FOUND"
-            authority_conflict="true"
-          else
-            exe_target=$(readlink -f "/proc/$main_pid/exe" 2>/dev/null || echo "UNREADABLE / PERMISSION DENIED")
-            cwd_target=$(readlink -f "/proc/$main_pid/cwd" 2>/dev/null || echo "UNREADABLE / PERMISSION DENIED")
-            echo "/proc/$main_pid/exe -> $exe_target"
-            echo "/proc/$main_pid/cwd -> $cwd_target"
-
-            # Check file type of ExecStart target to prevent false conflict for interpreted scripts
-            if [ "$exec_path" != "UNRESOLVED" ] && [ -e "$exec_path" ]; then
-              exec_file_type=$(file -b "$exec_path" 2>/dev/null || echo "UNKNOWN")
-              expected_real_exec=$(readlink -f "$exec_path" 2>/dev/null || echo "$exec_path")
-
-              if echo "$exec_file_type" | grep -qiE "text|script"; then
-                echo "ExecStart Type: interpreted script ($exec_file_type)"
-                echo "Process Executable: $exe_target"
-                echo "Direct executable identity comparison: NOT APPLICABLE (shebang/interpreter execution)"
-              else
-                echo "ExecStart Type: native executable/binary ($exec_file_type)"
-                if [ "$exe_target" != "UNREADABLE / PERMISSION DENIED" ] && [ "$exe_target" != "$expected_real_exec" ]; then
-                  echo "AUTHORITY CONFLICT: /proc/$main_pid/exe ($exe_target) does not match ExecStart realpath ($expected_real_exec)"
-                  authority_conflict="true"
-                fi
-              fi
-            fi
-
-            # Check WorkingDirectory conflict if configured
-            if [ -n "$svc_cwd" ] && [ "$svc_cwd" != "UNKNOWN" ] && [ -d "$svc_cwd" ]; then
-              expected_real_cwd=$(readlink -f "$svc_cwd" 2>/dev/null || echo "$svc_cwd")
-              if [ "$cwd_target" != "UNREADABLE / PERMISSION DENIED" ] && [ "$cwd_target" != "$expected_real_cwd" ]; then
-                echo "AUTHORITY CONFLICT: /proc/$main_pid/cwd ($cwd_target) does not match WorkingDirectory realpath ($expected_real_cwd)"
-                authority_conflict="true"
-              fi
-            fi
+          val=$(echo "$threshold_defs" | head -1 | cut -d= -f2)
+          echo "Current ROOT_DISK_THRESHOLD value: $val"
+          if [ "$val" != "50" ]; then
+            echo "FATAL: Current ROOT_DISK_THRESHOLD is '$val', expected exactly '50'" >&2
+            exit 1
           fi
 
-          echo "$authority_conflict" > .diag_meta/authority_conflict
-          if [ "$authority_conflict" = "true" ]; then
-            echo "Result: AUTHORITY CONFLICT DETECTED"
-          else
-            echo "Result: AUTHORITY VERIFIED (Process aligns with systemd service definition)"
+          # Verify no conflicting disallowlisted alternate disk threshold keys exist
+          conflicting_defs=$(awk -F= '
+            !/^[[:space:]]*(#|$)/ && NF >= 2 {
+              k = $1; sub(/^[[:space:]]+/, "", k); sub(/[[:space:]]+$/, "", k);
+              uk = toupper(k);
+              if (uk != "ROOT_DISK_THRESHOLD" && uk ~ /DISK/ && (uk ~ /THRESHOLD/ || uk ~ /CRITICAL/)) {
+                print k;
+              }
+            }
+          ' "$env_file" || true)
+          if [ -n "$conflicting_defs" ]; then
+            echo "FATAL: Conflicting alternate disk threshold definitions found: $conflicting_defs" >&2
+            exit 1
           fi
 
-      - name: "3. Candidate-File Identity & Comparison"
+          echo "Preflight 4 (Threshold State & Single-Definition): PASSED"
+
+      - name: "5. Fail-Closed Preflight: Root Usage Safety Gate"
         timeout-minutes: 2
         run: |
           set -euo pipefail
-          echo "=== CANDIDATE-FILE IDENTITY & COMPARISON ==="
+          echo "=== 5. PREFLIGHT: ROOT USAGE SAFETY GATE ==="
+          # Inspect root (/) filesystem usage safely
+          root_usage_line=$(df -P / | tail -1)
+          echo "df -P / output: $root_usage_line"
+          root_pct=$(echo "$root_usage_line" | awk '{print $(NF-1)}' | tr -d '%')
+          echo "Root filesystem usage: ${root_pct}%"
 
-          cands=("/opt/madeena-monitor/monitor" "/var/www/madeena-server-monitor/monitor")
-          for f in "${cands[@]}"; do
-            echo "--- Candidate: $f ---"
-            if [ ! -e "$f" ]; then
-              echo "  Status: NOT FOUND"
-              continue
-            fi
-            echo "  Status: EXISTS"
-            echo "  RealPath: $(readlink -f "$f" 2>/dev/null || echo 'UNKNOWN')"
-            echo "  FileType: $(file -b "$f" 2>/dev/null || echo 'UNKNOWN')"
-            echo "  Owner:Group: $(stat -c '%U:%G' "$f" 2>/dev/null || echo 'UNKNOWN')"
-            echo "  Mode: $(stat -c '%a' "$f" 2>/dev/null || echo 'UNKNOWN')"
-            echo "  Size: $(stat -c '%s' "$f" 2>/dev/null || echo 'UNKNOWN') bytes"
-            echo "  ModifyTime: $(stat -c '%y' "$f" 2>/dev/null || echo 'UNKNOWN')"
-            if [ -r "$f" ]; then
-              echo "  SHA256: $(sha256sum "$f" 2>/dev/null | awk '{print $1}')"
-            else
-              echo "  SHA256: UNREADABLE / PERMISSION DENIED"
-            fi
-          done
-
-          echo ""
-          echo "--- Cross-Candidate Comparison ---"
-          f1="/opt/madeena-monitor/monitor"
-          f2="/var/www/madeena-server-monitor/monitor"
-          if [ -e "$f1" ] && [ -e "$f2" ]; then
-            r1=$(readlink -f "$f1" 2>/dev/null || echo "1")
-            r2=$(readlink -f "$f2" 2>/dev/null || echo "2")
-            if [ "$r1" = "$r2" ]; then
-              echo "Comparison: SAME REALPATH ($r1)"
-            elif [ -r "$f1" ] && [ -r "$f2" ]; then
-              h1=$(sha256sum "$f1" 2>/dev/null | awk '{print $1}')
-              h2=$(sha256sum "$f2" 2>/dev/null | awk '{print $1}')
-              if [ "$h1" = "$h2" ]; then
-                echo "Comparison: IDENTICAL (hashes match: $h1)"
-              else
-                echo "Comparison: DIFFERENT (hash1: $h1 vs hash2: $h2)"
-              fi
-            else
-              echo "Comparison: UNABLE TO HASH (one or both candidates unreadable)"
-            fi
-          else
-            echo "Comparison: ONE OR BOTH CANDIDATES NOT FOUND"
+          # Require numeric integer/float comparison
+          if ! printf '%s\n' "$root_pct" | grep -qE '^[0-9]+([.][0-9]+)?$'; then
+            echo "FATAL: Could not parse numeric root disk usage percentage: $root_pct" >&2
+            exit 1
           fi
 
-      - name: "4. Authoritative Program Linkage Inspection"
+          # Fail-closed if usage >= 80%
+          is_ge_80=$(awk -v u="$root_pct" 'BEGIN { if (u >= 80.0) print "true"; else print "false"; }')
+          if [ "$is_ge_80" = "true" ]; then
+            echo "FATAL: Root disk usage is currently ${root_pct}% (>= 80%). Halting before mutation to prevent triggering critical alerts." >&2
+            exit 1
+          fi
+
+          echo "$root_pct" > .mutation_meta/initial_root_pct
+          echo "Preflight 5 (Root Usage Safety Gate): PASSED (${root_pct}% < 80%)"
+
+      - name: "6. Fail-Closed Preflight: Synthetic Comparator Verification"
         timeout-minutes: 2
         run: |
           set -euo pipefail
-          echo "=== AUTHORITATIVE PROGRAM CONFIGURATION LINKAGE INSPECTION ==="
+          echo "=== 6. PREFLIGHT: SYNTHETIC COMPARATOR VERIFICATION ==="
+          # Reviewed semantics from Madeena-software/madeena-server-monitor @ a9be2681f07e9f5cea45de6b51f39b20f929dc1f:
+          # RootDiskPercent >= RootDiskThreshold
+          echo "Testing comparator semantics: usage >= threshold with threshold=80"
 
-          exec_path=$(cat .diag_meta/exec_path 2>/dev/null || echo 'UNRESOLVED')
-          svc_cwd=$(cat .diag_meta/svc_cwd 2>/dev/null || echo '')
+          test_below=$(awk 'BEGIN { u=79.9; t=80.0; if (u >= t) print "CRITICAL"; else print "NORMAL"; }')
+          test_exact=$(awk 'BEGIN { u=80.0; t=80.0; if (u >= t) print "CRITICAL"; else print "NORMAL"; }')
+          test_above=$(awk 'BEGIN { u=80.1; t=80.0; if (u >= t) print "CRITICAL"; else print "NORMAL"; }')
 
-          echo "Target Executable: $exec_path"
-          echo "Target WorkingDirectory: $svc_cwd"
+          echo "Synthetic evaluation: 79.9% -> $test_below"
+          echo "Synthetic evaluation: 80.0% -> $test_exact"
+          echo "Synthetic evaluation: 80.1% -> $test_above"
 
-          program_linked_file=""
-
-          if [ "$exec_path" = "UNRESOLVED" ] || [ ! -e "$exec_path" ]; then
-            echo "Executable status: UNRESOLVED OR NOT FOUND"
-          elif [ ! -r "$exec_path" ]; then
-            echo "Executable status: UNREADABLE / PERMISSION DENIED"
-          else
-            file_type=$(file -b "$exec_path" 2>/dev/null || echo "UNKNOWN")
-            echo "FileType: $file_type"
-
-            if echo "$file_type" | grep -qi "text"; then
-              echo "Inspecting text script metadata for configuration loading tokens:"
-              while IFS=: read -r lnum line; do
-                [ -n "$lnum" ] || continue
-                lower_line=$(echo "$line" | tr '[:upper:]' '[:lower:]')
-                matched_tokens=""
-                for tok in "load_dotenv" "dotenv" "environmentfile" "disk_threshold" "disk_critical" "threshold"; do
-                  if echo "$lower_line" | grep -qF "$tok"; then
-                    matched_tokens="${matched_tokens:+$matched_tokens,}$tok"
-                  fi
-                done
-                if [ -n "$matched_tokens" ]; then
-                  # Extract only referenced plain local file paths
-                  ref_path=$(echo "$line" | grep -oE '/[a-zA-Z0-9_./-]+\.(env|conf)' | head -1 || true)
-                  echo "  line=$lnum tokens=$matched_tokens ${ref_path:+config_path=$ref_path}"
-
-                  # Require explicit path evidence associated with loader token to link
-                  if [ -n "$ref_path" ] && [ -z "$program_linked_file" ]; then
-                    if echo "$matched_tokens" | grep -qE "load_dotenv|dotenv|environmentfile"; then
-                      program_linked_file="$ref_path"
-                      echo "  Positive linkage: loader token associated with explicit config path: $program_linked_file"
-                    fi
-                  fi
-                fi
-              done < <(grep -nE -i 'dotenv|environmentfile|disk_threshold|disk_critical|threshold' "$exec_path" 2>/dev/null || true)
-
-              if [ -z "$program_linked_file" ]; then
-                echo "PROGRAM CONFIG LINKAGE UNRESOLVED (No explicit config path associated with loader in script metadata)"
-              fi
-            else
-              echo "Authoritative executable is binary; inspecting sanitized identifier counts only (NO raw strings):"
-              for tok in "dotenv" "environmentfile" "disk_threshold" "disk_critical"; do
-                cnt=$(strings -n 4 "$exec_path" 2>/dev/null | grep -ciF "$tok" || true)
-                if [ "$cnt" -gt 0 ]; then
-                  echo "  binary_identifier=$tok count=$cnt"
-                fi
-              done
-              echo "PROGRAM CONFIG LINKAGE UNRESOLVED (Binary executable cannot establish deterministic external config linkage safely)"
-            fi
+          if [ "$test_below" != "NORMAL" ] || [ "$test_exact" != "CRITICAL" ] || [ "$test_above" != "CRITICAL" ]; then
+            echo "FATAL: Synthetic comparator verification failed" >&2
+            exit 1
           fi
 
-          echo "$program_linked_file" > .diag_meta/program_linked_file
-          echo "Program linked file result: ${program_linked_file:-NONE}"
+          echo "Preflight 6 (Synthetic Comparator Verification): PASSED"
 
-      - name: "5. Environment-File Authority Gating & Secret-Safe Threshold Inspection"
+      - name: "7. Prepared Atomic Mutation with Rollback Protection"
         timeout-minutes: 2
         env:
           SUDO_PASSWORD: ${{ secrets.SUDO_PASSWORD }}
         run: |
           set -euo pipefail
-          echo "=== ENVIRONMENT-FILE AUTHORITY GATING & THRESHOLD INSPECTION ==="
+          echo "=== 7. ATOMIC MUTATION & ROLLBACK PREPARATION ==="
 
           _sudo() {
             if [ -n "${SUDO_PASSWORD:-}" ]; then
@@ -382,367 +378,249 @@ jobs:
             fi
           }
 
-          auth_conflict=$(cat .diag_meta/authority_conflict 2>/dev/null || echo 'false')
-          raw_env_files=$(cat .diag_meta/env_files 2>/dev/null || echo 'NONE')
-          program_linked_file=$(cat .diag_meta/program_linked_file 2>/dev/null || echo '')
+          env_file="/var/www/madeena-server-monitor/.env"
+          backup_dir="/var/www/madeena-server-monitor/.backup_mutation"
+          backup_file="$backup_dir/.env.bak.$(date +%s)"
 
-          # Discovered threshold state initialization
-          env_threshold_found="false"
-          env_threshold_source_path="none"
-          env_threshold_key="none"
-          env_threshold_numeric_value="none"
-          env_definitions_count=0
+          # 1. Capture exact file ownership and permissions
+          orig_stat=$(_sudo stat -c '%u:%g:%a' "$env_file")
+          orig_uid=$(echo "$orig_stat" | cut -d: -f1)
+          orig_gid=$(echo "$orig_stat" | cut -d: -f2)
+          orig_mode=$(echo "$orig_stat" | cut -d: -f3)
+          echo "Original .env ownership: $orig_uid:$orig_gid, mode: $orig_mode"
 
-          program_config_threshold_found="false"
-          program_config_path="none"
-          program_config_threshold_key="none"
-          program_config_threshold_value="none"
+          # 2. Create secure isolated backup
+          _sudo mkdir -p "$backup_dir"
+          _sudo chmod 700 "$backup_dir"
+          _sudo cp -a "$env_file" "$backup_file"
+          _sudo chmod 600 "$backup_file"
+          echo "$backup_file" > .mutation_meta/backup_file
 
-          if [ "$auth_conflict" = "true" ]; then
-            echo "AUTHORITY CONFLICT: Process/service mismatch detected. Skipping environment file inspection."
-            echo "ENV SOURCE NOT AUTHORITATIVELY LINKED"
-          else
-            # Part 1: Process ALL systemd EnvironmentFiles in order
-            if [ -n "$raw_env_files" ] && [ "$raw_env_files" != "NONE" ]; then
-              echo "--- Inspecting systemd EnvironmentFiles in discovered order ---"
-              for env_file in $raw_env_files; do
-                echo "Inspecting EnvironmentFile: $env_file"
-                echo "  linked=true"
-                if [ ! -e "$env_file" ]; then
-                  echo "  exists=false readable_directly=false threshold_key=none threshold_value=none"
-                  continue
-                fi
-                is_readable="false"
-                if [ -r "$env_file" ]; then is_readable="true"; fi
-                echo "  exists=true readable_directly=$is_readable"
+          # 3. Create mutated file in temporary path with identical ownership/mode
+          tmp_file="/var/www/madeena-server-monitor/.env.tmp.$$"
+          # Perform single-key targeted substitution using awk
+          _sudo awk '
+            BEGIN { replaced = 0 }
+            /^[[:space:]]*ROOT_DISK_THRESHOLD[[:space:]]*=/ {
+              sub(/ROOT_DISK_THRESHOLD[[:space:]]*=.*/, "ROOT_DISK_THRESHOLD=80")
+              replaced++
+            }
+            { print }
+            END {
+              if (replaced != 1) {
+                exit 42
+              }
+            }
+          ' "$env_file" | _sudo tee "$tmp_file" >/dev/null
 
-                # Parse strictly through allowlist using _sudo
-                parsed_thresholds=$(_sudo cat "$env_file" 2>/dev/null | awk -F= '
-                  !/^[[:space:]]*(#|$)/ && NF >= 2 {
-                    k = $1; sub(/^[[:space:]]+/, "", k); sub(/[[:space:]]+$/, "", k);
-                    v = substr($0, index($0, "=") + 1); sub(/^[[:space:]]+/, "", v); sub(/[[:space:]]+$/, "", v);
-                    gsub(/^["\x27]|["\x27]$/, "", v);
-                    uk = toupper(k);
-                    if (uk ~ /DISK/ && (uk ~ /THRESHOLD/ || uk ~ /CRITICAL/)) {
-                      if (v ~ /^[0-9]+([.][0-9]+)?%?$/) {
-                        print k "=" v;
-                      } else {
-                        print k "=<non-numeric-redacted>";
-                      }
-                    }
-                  }
-                ' || true)
+          _sudo chown "$orig_uid:$orig_gid" "$tmp_file"
+          _sudo chmod "$orig_mode" "$tmp_file"
 
-                if [ -n "$parsed_thresholds" ]; then
-                  while read -r match_line; do
-                    [ -n "$match_line" ] || continue
-                    env_definitions_count=$((env_definitions_count + 1))
-                    tk=$(echo "$match_line" | cut -d= -f1)
-                    tv=$(echo "$match_line" | cut -d= -f2)
-                    echo "  threshold_key=$tk threshold_value=$tv"
-                    if [ "$env_threshold_found" = "false" ]; then
-                      env_threshold_found="true"
-                      env_threshold_source_path="$env_file"
-                      env_threshold_key="$tk"
-                      env_threshold_numeric_value="$tv"
-                    fi
-                  done <<< "$parsed_thresholds"
-                else
-                  echo "  threshold_key=none threshold_value=none"
-                fi
-              done
-            fi
-
-            # Part 2: Process program-linked config file if positively linked
-            if [ -n "$program_linked_file" ] && [ -e "$program_linked_file" ]; then
-              echo ""
-              echo "--- Inspecting positively verified program-linked config: $program_linked_file ---"
-              program_config_path="$program_linked_file"
-              parsed_prog_thresholds=$(_sudo cat "$program_linked_file" 2>/dev/null | awk -F= '
-                !/^[[:space:]]*(#|$)/ && NF >= 2 {
-                  k = $1; sub(/^[[:space:]]+/, "", k); sub(/[[:space:]]+$/, "", k);
-                  v = substr($0, index($0, "=") + 1); sub(/^[[:space:]]+/, "", v); sub(/[[:space:]]+$/, "", v);
-                  gsub(/^["\x27]|["\x27]$/, "", v);
-                  uk = toupper(k);
-                  if (uk ~ /DISK/ && (uk ~ /THRESHOLD/ || uk ~ /CRITICAL/)) {
-                    if (v ~ /^[0-9]+([.][0-9]+)?%?$/) {
-                      print k "=" v;
-                    } else {
-                      print k "=<non-numeric-redacted>";
-                    }
-                  }
-                }
-              ' || true)
-
-              if [ -n "$parsed_prog_thresholds" ]; then
-                program_config_threshold_found="true"
-                program_config_threshold_key=$(echo "$parsed_prog_thresholds" | head -1 | cut -d= -f1)
-                program_config_threshold_value=$(echo "$parsed_prog_thresholds" | head -1 | cut -d= -f2)
-                echo "  program_config_threshold_found=true key=$program_config_threshold_key value=$program_config_threshold_value"
-              else
-                echo "  program_config_threshold_found=false (No threshold variables in program-linked config)"
-              fi
-            fi
-
-            if [ "$env_definitions_count" -gt 1 ]; then
-              echo "WARNING: MULTIPLE THRESHOLD DEFINITIONS — PRECEDENCE REVIEW REQUIRED (Found $env_definitions_count definitions across EnvironmentFiles)"
-            fi
+          # 4. Verify line-count parity between original and mutated temporary file
+          orig_lines=$(_sudo wc -l < "$env_file")
+          tmp_lines=$(_sudo wc -l < "$tmp_file")
+          if [ "$orig_lines" -ne "$tmp_lines" ]; then
+            echo "FATAL: Line count mismatch between original ($orig_lines) and modified ($tmp_lines)" >&2
+            _sudo rm -f "$tmp_file"
+            exit 1
           fi
 
-          # Persist discovered environment threshold metadata
-          echo "$env_threshold_found" > .diag_meta/env_threshold_found
-          echo "$env_threshold_source_path" > .diag_meta/env_threshold_source_path
-          echo "$env_threshold_key" > .diag_meta/env_threshold_key
-          echo "$env_threshold_numeric_value" > .diag_meta/env_threshold_numeric_value
-          echo "$env_definitions_count" > .diag_meta/env_definitions_count
+          # 5. Verify allowlisted difference: only ROOT_DISK_THRESHOLD may differ
+          diff_keys=$(_sudo diff -u "$env_file" "$tmp_file" | grep -E '^[+-][^+-]' || true)
+          echo "Mutated diff keys:"
+          printf '%s\n' "$diff_keys"
+          bad_keys=$(printf '%s\n' "$diff_keys" | grep -v 'ROOT_DISK_THRESHOLD' || true)
+          if [ -n "$bad_keys" ]; then
+            echo "FATAL: Unrelated keys modified in diff: $bad_keys" >&2
+            _sudo rm -f "$tmp_file"
+            exit 1
+          fi
 
-          echo "$program_config_threshold_found" > .diag_meta/program_config_threshold_found
-          echo "$program_config_path" > .diag_meta/program_config_path
-          echo "$program_config_threshold_key" > .diag_meta/program_config_threshold_key
-          echo "$program_config_threshold_value" > .diag_meta/program_config_threshold_value
+          # 6. Atomic replacement
+          _sudo mv "$tmp_file" "$env_file"
+          echo "Mutation: Atomic move into $env_file completed successfully"
 
-      - name: "6. Monitor Executable/Script Threshold Inspection"
+      - name: "8. Apply EnvironmentFile Change: Service Restart"
         timeout-minutes: 2
+        env:
+          SUDO_PASSWORD: ${{ secrets.SUDO_PASSWORD }}
         run: |
           set -euo pipefail
-          echo "=== MONITOR EXECUTABLE/SCRIPT THRESHOLD INSPECTION ==="
+          echo "=== 8. APPLY ENVIRONMENTFILE: SERVICE RESTART ==="
 
-          exec_path=$(cat .diag_meta/exec_path 2>/dev/null || echo 'UNRESOLVED')
-          authoritative_found="false"
-          auth_source_type="none"
-          auth_numeric=""
-          auth_ids=""
-
-          echo "Authoritative Executable Target: $exec_path"
-
-          # 1. Authoritative Executable Scan First
-          if [ "$exec_path" != "UNRESOLVED" ] && [ -e "$exec_path" ]; then
-            echo "--- Scanning Authoritative Target: $exec_path ---"
-            file_type=$(file -b "$exec_path" 2>/dev/null || echo "UNKNOWN")
-            echo "FileType: $file_type"
-
-            if [ ! -r "$exec_path" ]; then
-              echo "Status: UNREADABLE / PERMISSION DENIED"
-            elif echo "$file_type" | grep -qi "text"; then
-              auth_source_type="text"
-              echo "Script mode: TEXT SCAN (Authoritative Target — Allowlisted metadata only)"
-              res=$(awk '
-                BEGIN { match_count = 0 }
-                {
-                  line = $0;
-                  if (tolower(line) ~ /disk/ && tolower(line) ~ /(threshold|critical|50|80)/) {
-                    matched_ids = "";
-                    if (tolower(line) ~ /disk/) matched_ids = (matched_ids ? matched_ids "," : "") "disk";
-                    if (tolower(line) ~ /threshold/) matched_ids = (matched_ids ? matched_ids "," : "") "threshold";
-                    if (tolower(line) ~ /critical/) matched_ids = (matched_ids ? matched_ids "," : "") "critical";
-                    if (tolower(line) ~ /alert/) matched_ids = (matched_ids ? matched_ids "," : "") "alert";
-
-                    matched_nums = "";
-                    n = split(line, words, /[^0-9.%]+/);
-                    for (i = 1; i <= n; i++) {
-                      w = words[i];
-                      if (w ~ /^[0-9]+([.][0-9]+)?%?$/ && (w ~ /50/ || w ~ /80/ || (w+0 >= 1 && w+0 <= 100))) {
-                        matched_nums = (matched_nums ? matched_nums "," : "") w;
-                      }
-                    }
-                    if (matched_ids != "" && matched_nums != "") {
-                      match_count++;
-                      print "line=" NR " identifiers=" matched_ids " numeric_literals=" matched_nums;
-                    }
-                  }
-                }
-              ' "$exec_path" 2>/dev/null || true)
-
-              if [ -n "$res" ]; then
-                authoritative_found="true"
-                echo "$res"
-                auth_numeric=$(echo "$res" | grep -oE 'numeric_literals=[^ ]+' | head -1 | cut -d= -f2 || true)
-                auth_ids=$(echo "$res" | grep -oE 'identifiers=[^ ]+' | head -1 | cut -d= -f2 || true)
-              else
-                echo "No affirmative disk-threshold evidence found in authoritative script"
-              fi
+          _sudo() {
+            if [ -n "${SUDO_PASSWORD:-}" ]; then
+              printf '%s\n' "$SUDO_PASSWORD" | sudo -S -p '' -- "$@" 2>/dev/null
             else
-              auth_source_type="binary"
-              echo "Script mode: BINARY SCAN (Authoritative Target — Sanitized pattern counts & co-located literals)"
-              res=$(strings -n 4 "$exec_path" 2>/dev/null | awk '
-                BEGIN { match_count = 0 }
-                {
-                  line = $0;
-                  if (tolower(line) ~ /disk/ && tolower(line) ~ /(threshold|critical|50|80)/) {
-                    matched_ids = "";
-                    if (tolower(line) ~ /disk/) matched_ids = (matched_ids ? matched_ids "," : "") "disk";
-                    if (tolower(line) ~ /threshold/) matched_ids = (matched_ids ? matched_ids "," : "") "threshold";
-                    if (tolower(line) ~ /critical/) matched_ids = (matched_ids ? matched_ids "," : "") "critical";
-                    if (tolower(line) ~ /alert/) matched_ids = (matched_ids ? matched_ids "," : "") "alert";
-
-                    matched_nums = "";
-                    n = split(line, words, /[^0-9.%]+/);
-                    for (i = 1; i <= n; i++) {
-                      w = words[i];
-                      if (w ~ /^[0-9]+([.][0-9]+)?%?$/ && (w ~ /50/ || w ~ /80/ || (w+0 >= 1 && w+0 <= 100))) {
-                        matched_nums = (matched_nums ? matched_nums "," : "") w;
-                      }
-                    }
-                    if (matched_ids != "" && matched_nums != "") {
-                      match_count++;
-                      print "match=" match_count " identifiers=" matched_ids " numeric_literals=" matched_nums;
-                    }
-                  }
-                }
-                END {
-                  if (match_count == 0) {
-                    print "BINARY THRESHOLD SOURCE UNRESOLVED";
-                  }
-                }
-              ' || echo "BINARY THRESHOLD SOURCE UNRESOLVED")
-
-              if [ -n "$res" ] && [ "$res" != "BINARY THRESHOLD SOURCE UNRESOLVED" ]; then
-                authoritative_found="true"
-                echo "$res"
-                auth_numeric=$(echo "$res" | grep -oE 'numeric_literals=[^ ]+' | head -1 | cut -d= -f2 || true)
-                auth_ids=$(echo "$res" | grep -oE 'identifiers=[^ ]+' | head -1 | cut -d= -f2 || true)
-              else
-                echo "BINARY THRESHOLD SOURCE UNRESOLVED"
-              fi
+              sudo -n "$@" 2>/dev/null
             fi
-          else
-            echo "Authoritative ExecStart unresolved or file not found"
+          }
+
+          # Notice: NO systemctl daemon-reload (unit file is untouched)
+          echo "Restarting madeena-monitor.service..."
+          if ! _sudo systemctl restart madeena-monitor.service; then
+            echo "FATAL: systemctl restart madeena-monitor.service failed" >&2
+            echo "TRIGGER_ROLLBACK=true" > .mutation_meta/trigger_rollback
+            exit 1
           fi
 
-          # Persist authoritative threshold evidence
-          echo "$authoritative_found" > .diag_meta/threshold_evidence_found
-          echo "$auth_source_type" > .diag_meta/threshold_source_type
-          echo "${auth_numeric:-none}" > .diag_meta/threshold_numeric_evidence
-          echo "${auth_ids:-none}" > .diag_meta/threshold_identifier_evidence
+          sleep 3
+          active_state=$(systemctl show madeena-monitor.service -p ActiveState --value 2>/dev/null || echo 'UNKNOWN')
+          echo "Post-restart ActiveState: $active_state"
+          if [ "$active_state" != "active" ]; then
+            echo "FATAL: madeena-monitor.service is not active after restart (state: $active_state)" >&2
+            echo "TRIGGER_ROLLBACK=true" > .mutation_meta/trigger_rollback
+            exit 1
+          fi
 
-          # 2. Informational Alternate Candidate Scans (Do not drive authoritative classification unless identical/same realpath)
-          echo ""
-          echo "--- Informational Alternate Candidate Inspections ---"
-          for alt in "/opt/madeena-monitor/monitor" "/var/www/madeena-server-monitor/monitor"; do
-            if [ "$alt" != "$exec_path" ] && [ -e "$alt" ] && [ -r "$alt" ]; then
-              alt_ft=$(file -b "$alt" 2>/dev/null || echo "UNKNOWN")
-              echo "Alternate Candidate ($alt) [$alt_ft]:"
-              if echo "$alt_ft" | grep -qi "text"; then
-                awk '
-                  {
-                    line = $0;
-                    if (tolower(line) ~ /disk/ && tolower(line) ~ /(threshold|critical|50|80)/) {
-                      n = split(line, words, /[^0-9.%]+/);
-                      nums = "";
-                      for (i = 1; i <= n; i++) {
-                        w = words[i];
-                        if (w ~ /^[0-9]+([.][0-9]+)?%?$/ && (w ~ /50/ || w ~ /80/ || (w+0 >= 1 && w+0 <= 100))) {
-                          nums = (nums ? nums "," : "") w;
-                        }
-                      }
-                      if (nums != "") {
-                        print "  line=" NR " numeric_literals=" nums;
-                      }
-                    }
-                  }
-                ' "$alt" 2>/dev/null | head -5 || true
-              fi
-            fi
-          done
+          new_pid=$(systemctl show madeena-monitor.service -p MainPID --value 2>/dev/null || echo '0')
+          echo "New MainPID: $new_pid"
+          initial_pid=$(cat .mutation_meta/initial_pid 2>/dev/null || echo '0')
+          if [ -z "$new_pid" ] || [ "$new_pid" = "0" ] || [ "$new_pid" = "$initial_pid" ]; then
+            echo "FATAL: MainPID was not updated on restart (old: $initial_pid, new: $new_pid)" >&2
+            echo "TRIGGER_ROLLBACK=true" > .mutation_meta/trigger_rollback
+            exit 1
+          fi
 
-      - name: "7. Effective Threshold Source Synthesis"
-        timeout-minutes: 1
+          echo "$new_pid" > .mutation_meta/restarted_pid
+          echo "Service restart verified successfully."
+
+      - name: "9. Post-Change Verification"
+        timeout-minutes: 2
+        env:
+          SUDO_PASSWORD: ${{ secrets.SUDO_PASSWORD }}
         run: |
           set -euo pipefail
-          echo "=== EFFECTIVE THRESHOLD SOURCE SYNTHESIS ==="
+          echo "=== 9. POST-CHANGE VERIFICATION ==="
 
-          auth_conflict=$(cat .diag_meta/authority_conflict 2>/dev/null || echo 'false')
-          exec_path=$(cat .diag_meta/exec_path 2>/dev/null || echo 'UNRESOLVED')
-          exec_arg_found=$(cat .diag_meta/exec_arg_threshold_found 2>/dev/null || echo 'false')
-          exec_arg_name=$(cat .diag_meta/exec_arg_name 2>/dev/null || echo 'none')
-          exec_arg_val=$(cat .diag_meta/exec_arg_val 2>/dev/null || echo 'none')
+          _sudo() {
+            if [ -n "${SUDO_PASSWORD:-}" ]; then
+              printf '%s\n' "$SUDO_PASSWORD" | sudo -S -p '' -- "$@" 2>/dev/null
+            else
+              sudo -n "$@" 2>/dev/null
+            fi
+          }
 
-          direct_found=$(cat .diag_meta/direct_env_threshold_found 2>/dev/null || echo 'false')
-          direct_key=$(cat .diag_meta/direct_env_threshold_key 2>/dev/null || echo 'none')
-          direct_val=$(cat .diag_meta/direct_env_threshold_value 2>/dev/null || echo 'none')
+          env_file="/var/www/madeena-server-monitor/.env"
+          new_pid=$(cat .mutation_meta/restarted_pid 2>/dev/null || echo '0')
 
-          env_thresh_found=$(cat .diag_meta/env_threshold_found 2>/dev/null || echo 'false')
-          env_source_path=$(cat .diag_meta/env_threshold_source_path 2>/dev/null || echo 'none')
-          env_key=$(cat .diag_meta/env_threshold_key 2>/dev/null || echo 'none')
-          env_val=$(cat .diag_meta/env_threshold_numeric_value 2>/dev/null || echo 'none')
-          env_def_count=$(cat .diag_meta/env_definitions_count 2>/dev/null || echo '0')
-
-          prog_thresh_found=$(cat .diag_meta/program_config_threshold_found 2>/dev/null || echo 'false')
-          prog_path=$(cat .diag_meta/program_config_path 2>/dev/null || echo 'none')
-          prog_key=$(cat .diag_meta/program_config_threshold_key 2>/dev/null || echo 'none')
-          prog_val=$(cat .diag_meta/program_config_threshold_value 2>/dev/null || echo 'none')
-
-          thresh_found=$(cat .diag_meta/threshold_evidence_found 2>/dev/null || echo 'false')
-          thresh_type=$(cat .diag_meta/threshold_source_type 2>/dev/null || echo 'none')
-          thresh_num=$(cat .diag_meta/threshold_numeric_evidence 2>/dev/null || echo 'none')
-
-          echo "Discovered Evidence Summary:"
-          echo "  Authority Conflict: $auth_conflict"
-          echo "  ExecStart Argument Threshold Found: $exec_arg_found ($exec_arg_name=$exec_arg_val)"
-          echo "  Direct systemd Environment Threshold Found: $direct_found ($direct_key=$direct_val)"
-          echo "  systemd EnvironmentFiles Threshold Found: $env_thresh_found ($env_source_path: $env_key=$env_val, total_defs=$env_def_count)"
-          echo "  Program-Linked Config Threshold Found: $prog_thresh_found ($prog_path: $prog_key=$prog_val)"
-          echo "  Authoritative Target Threshold Evidence Found: $thresh_found (type=$thresh_type, value=$thresh_num)"
-
-          echo ""
-          echo "Effective Threshold Evaluation:"
-
-          if [ "$auth_conflict" = "true" ]; then
-            echo "Effective Threshold Source: AUTHORITY_CONFLICT"
-            echo "Effective Threshold Value: UNRESOLVED"
-            echo "Evidence Path: Runtime/configuration evidence materially contradicts the service authority chain."
-          elif [ "$env_def_count" -gt 1 ]; then
-            echo "Effective Threshold Source: UNRESOLVED"
-            echo "Effective Threshold Value: UNRESOLVED"
-            echo "Evidence Path: MULTIPLE THRESHOLD DEFINITIONS — PRECEDENCE REVIEW REQUIRED ($env_def_count definitions in EnvironmentFiles)"
-          elif [ "$exec_arg_found" = "true" ]; then
-            echo "Effective Threshold Source: SYSTEMD_EXECSTART_ARGUMENT"
-            echo "Effective Threshold Value: $exec_arg_val"
-            echo "Evidence Path:"
-            echo "madeena-monitor.service"
-            echo "  -> ExecStart=$exec_path"
-            echo "  -> $exec_arg_name=$exec_arg_val"
-          elif [ "$direct_found" = "true" ]; then
-            echo "Effective Threshold Source: SYSTEMD_DIRECT_ENVIRONMENT"
-            echo "Effective Threshold Value: $direct_val"
-            echo "Evidence Path:"
-            echo "madeena-monitor.service"
-            echo "  -> Environment: $direct_key=$direct_val"
-          elif [ "$env_thresh_found" = "true" ]; then
-            echo "Effective Threshold Source: SYSTEMD_ENVIRONMENT_FILE"
-            echo "Effective Threshold Value: $env_val"
-            echo "Evidence Path:"
-            echo "madeena-monitor.service"
-            echo "  -> EnvironmentFiles=$env_source_path"
-            echo "  -> $env_key=$env_val"
-          elif [ "$prog_thresh_found" = "true" ]; then
-            echo "Effective Threshold Source: PROGRAM_LINKED_CONFIG"
-            echo "Effective Threshold Value: $prog_val"
-            echo "Evidence Path:"
-            echo "madeena-monitor.service"
-            echo "  -> ExecStart=$exec_path"
-            echo "  -> Program-linked config=$prog_path"
-            echo "  -> $prog_key=$prog_val"
-          elif [ "$thresh_found" = "true" ] && [ "$thresh_type" = "text" ]; then
-            echo "Effective Threshold Source: MONITOR_SCRIPT_DEFAULT"
-            echo "Effective Threshold Value: $thresh_num"
-            echo "Evidence Path:"
-            echo "madeena-monitor.service"
-            echo "  -> ExecStart=$exec_path"
-            echo "  -> Authoritative text script affirmative threshold evidence=$thresh_num"
-          elif [ "$thresh_found" = "true" ] && [ "$thresh_type" = "binary" ]; then
-            echo "Effective Threshold Source: EMBEDDED_BINARY_DEFAULT"
-            echo "Effective Threshold Value: $thresh_num"
-            echo "Evidence Path:"
-            echo "madeena-monitor.service"
-            echo "  -> ExecStart=$exec_path"
-            echo "  -> Authoritative binary affirmative threshold evidence=$thresh_num"
-          else
-            echo "Effective Threshold Source: UNRESOLVED"
-            echo "Effective Threshold Value: UNRESOLVED"
-            echo "Evidence Path: No affirmative threshold evidence could be established from safe evidence."
+          # 1. Verify service ActiveState
+          active_state=$(systemctl show madeena-monitor.service -p ActiveState --value 2>/dev/null || echo 'UNKNOWN')
+          if [ "$active_state" != "active" ]; then
+            echo "FATAL: Verification failed: Service not active ($active_state)" >&2
+            echo "TRIGGER_ROLLBACK=true" > .mutation_meta/trigger_rollback
+            exit 1
           fi
-          echo "Completed at: $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
+
+          # 2. Verify /proc/<pid>/exe and cwd
+          proc_exe=$(readlink -f "/proc/$new_pid/exe" 2>/dev/null || echo '')
+          proc_cwd=$(readlink -f "/proc/$new_pid/cwd" 2>/dev/null || echo '')
+          expected_exec="/var/www/madeena-server-monitor/monitor"
+          expected_cwd="/var/www/madeena-server-monitor"
+
+          echo "Process /proc/$new_pid/exe: $proc_exe"
+          echo "Process /proc/$new_pid/cwd: $proc_cwd"
+          if [ "$proc_exe" != "$expected_exec" ] || [ "$proc_cwd" != "$expected_cwd" ]; then
+            echo "FATAL: Process mapping verification failed: exe=$proc_exe cwd=$proc_cwd" >&2
+            echo "TRIGGER_ROLLBACK=true" > .mutation_meta/trigger_rollback
+            exit 1
+          fi
+
+          # 3. Verify .env file allowlisted content: ROOT_DISK_THRESHOLD=80 exactly
+          env_val=$(awk -F= '
+            !/^[[:space:]]*(#|$)/ && NF >= 2 {
+              k = $1; sub(/^[[:space:]]+/, "", k); sub(/[[:space:]]+$/, "", k);
+              v = substr($0, index($0, "=") + 1); sub(/^[[:space:]]+/, "", v); sub(/[[:space:]]+$/, "", v);
+              gsub(/^["']|["']$/, "", v);
+              if (k == "ROOT_DISK_THRESHOLD") {
+                print v;
+              }
+            }
+          ' "$env_file" || true)
+
+          echo "Verified .env ROOT_DISK_THRESHOLD value: $env_val"
+          if [ "$env_val" != "80" ]; then
+            echo "FATAL: Verification failed: .env ROOT_DISK_THRESHOLD is '$env_val', expected '80'" >&2
+            echo "TRIGGER_ROLLBACK=true" > .mutation_meta/trigger_rollback
+            exit 1
+          fi
+
+          # 4. Process environment variable verification (allowlisted key only, NO dump)
+          proc_env_val=$(_sudo tr '\0' '\n' < "/proc/$new_pid/environ" 2>/dev/null | awk -F= '$1 == "ROOT_DISK_THRESHOLD" {print $2}' || true)
+          echo "Target process environment ROOT_DISK_THRESHOLD: ${proc_env_val:-NOT_IN_PROC_ENV}"
+          if [ -n "$proc_env_val" ] && [ "$proc_env_val" != "80" ]; then
+            echo "FATAL: Verification failed: Process environment ROOT_DISK_THRESHOLD is '$proc_env_val', expected '80'" >&2
+            echo "TRIGGER_ROLLBACK=true" > .mutation_meta/trigger_rollback
+            exit 1
+          fi
+
+          # 5. Root disk usage remains below 80%
+          root_pct=$(df -P / | tail -1 | awk '{print $(NF-1)}' | tr -d '%')
+          echo "Current root disk usage post-restart: ${root_pct}%"
+          is_ge_80=$(awk -v u="$root_pct" 'BEGIN { if (u >= 80.0) print "true"; else print "false"; }')
+          if [ "$is_ge_80" = "true" ]; then
+            echo "FATAL: Root disk usage reached ${root_pct}% (>= 80%)" >&2
+            echo "TRIGGER_ROLLBACK=true" > .mutation_meta/trigger_rollback
+            exit 1
+          fi
+
+          # 6. Clean up temporary backup after successful post-change verification
+          backup_file=$(cat .mutation_meta/backup_file 2>/dev/null || echo '')
+          if [ -n "$backup_file" ] && [ -f "$backup_file" ]; then
+            _sudo rm -f "$backup_file"
+            _sudo rmdir "/var/www/madeena-server-monitor/.backup_mutation" 2>/dev/null || true
+            echo "Backup file cleaned up successfully."
+          fi
+
+          echo "Post-Change Verification: ALL CHECKS PASSED (Threshold 80% active)"
+
+      - name: "10. Automatic Rollback Handler"
+        if: failure()
+        timeout-minutes: 2
+        env:
+          SUDO_PASSWORD: ${{ secrets.SUDO_PASSWORD }}
+        run: |
+          set -euo pipefail
+          echo "=== 10. AUTOMATIC ROLLBACK HANDLER TRIGGERED ==="
+
+          _sudo() {
+            if [ -n "${SUDO_PASSWORD:-}" ]; then
+              printf '%s\n' "$SUDO_PASSWORD" | sudo -S -p '' -- "$@" 2>/dev/null
+            else
+              sudo -n "$@" 2>/dev/null
+            fi
+          }
+
+          backup_file=$(cat .mutation_meta/backup_file 2>/dev/null || echo '')
+          env_file="/var/www/madeena-server-monitor/.env"
+
+          if [ -n "$backup_file" ] && [ -f "$backup_file" ]; then
+            echo "Restoring .env from backup file..."
+            _sudo cp -a "$backup_file" "$env_file"
+            _sudo rm -f "$backup_file"
+            _sudo rmdir "/var/www/madeena-server-monitor/.backup_mutation" 2>/dev/null || true
+
+            echo "Restoring madeena-monitor.service state..."
+            _sudo systemctl restart madeena-monitor.service || true
+            sleep 2
+            rb_state=$(systemctl show madeena-monitor.service -p ActiveState --value 2>/dev/null || echo 'UNKNOWN')
+            rb_val=$(awk -F= '
+              !/^[[:space:]]*(#|$)/ && NF >= 2 {
+                k = $1; sub(/^[[:space:]]+/, "", k); sub(/[[:space:]]+$/, "", k);
+                v = substr($0, index($0, "=") + 1); sub(/^[[:space:]]+/, "", v); sub(/[[:space:]]+$/, "", v);
+                gsub(/^["']|["']$/, "", v);
+                if (k == "ROOT_DISK_THRESHOLD") {
+                  print v;
+                }
+              }
+            ' "$env_file" || echo 'UNKNOWN')
+
+            echo "Rollback verification: ActiveState=$rb_state, ROOT_DISK_THRESHOLD=$rb_val"
+          else
+            echo "No backup file found to rollback."
+          fi
+
+          echo "Rollback completed. Returning failure to Planner/Reviewer."
   full-audit:
     name: "Full Server Audit"
     if: github.ref_name != 'task/server-disk-alert-threshold-80'

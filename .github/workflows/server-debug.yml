@@ -39,11 +39,11 @@ env:
   MADEENA_CP_BACKUP_DIR: /media/nextcloud-data/data/${{ secrets.NEXTCLOUD_USERNAME }}/files/madeena_cp_backups
 
 jobs:
-  monitor-discovery:
-    name: "Production Monitor Discovery (Disk Alert 80% Task)"
+  monitor-detail-discovery:
+    name: "Production Monitor Detail Discovery (Disk Alert 80% Task)"
     if: github.ref_name == 'task/server-disk-alert-threshold-80'
     runs-on: [self-hosted, linux, x64, production]
-    timeout-minutes: 10
+    timeout-minutes: 6
     permissions:
       contents: read
 
@@ -51,258 +51,268 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: "1. Runner Identity & Environment Verification"
+      - name: "1. Service Authority Mapping (madeena-monitor.service)"
         timeout-minutes: 2
         run: |
           set -euo pipefail
-          echo "=== RUNNER IDENTITY & ENVIRONMENT ==="
-          echo "Hostname: $(hostname)"
-          echo "Runner Name: ${RUNNER_NAME:-unknown}"
-          echo "OS: $(uname -srm)"
-          echo "Current User: $(whoami) (id: $(id -u):$(id -g))"
-          echo "GitHub Ref: ${{ github.ref }}"
-          echo "GitHub Ref Name: ${{ github.ref_name }}"
-          echo "GitHub SHA: ${{ github.sha }}"
-          echo "GitHub Workflow: ${{ github.workflow }}"
-          echo "GitHub Run ID: ${{ github.run_id }}"
-          echo "GitHub Run Number: ${{ github.run_number }}"
-          echo "Date UTC: $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
-
-      - name: "2. Filesystem & Root Usage Inspection"
-        timeout-minutes: 2
-        run: |
-          set -euo pipefail
-          echo "=== ROOT FILESYSTEM USAGE ==="
-          df -h /
-          echo ""
-          echo "=== ALL FILESYSTEMS ==="
-          df -hT
-          echo ""
-          echo "=== ROOT USAGE PERCENTAGE ==="
-          df -P / | awk 'NR==2 {print "Root (/):", $5, "used of", $2, "(Available:", $4 ")"}'
-
-      - name: "3. Crontab Metadata Inspection (Secret-Safe)"
-        timeout-minutes: 2
-        run: |
-          set -euo pipefail
-          echo "=== USER CRONTABS (METADATA ONLY — NO COMMAND BODIES) ==="
-          if [ ! -r /etc/passwd ]; then
-            echo "/etc/passwd: UNREADABLE / PERMISSION DENIED"
-          else
-            USERS=$(awk -F: '$3 == 0 || ($3 >= 1000 && $3 < 65534) {print $1}' /etc/passwd 2>/dev/null || echo "root")
-            for user in $USERS; do
-              if ! cron_out=$(crontab -l -u "$user" 2>&1); then
-                if echo "$cron_out" | grep -qi "no crontab"; then
-                  echo "User $user: crontab_present=false"
-                elif echo "$cron_out" | grep -qiE "permission|must be|not allowed"; then
-                  echo "User $user: crontab_present=unknown (UNREADABLE / PERMISSION DENIED)"
-                else
-                  echo "User $user: crontab_present=false"
-                fi
-              else
-                active_entries=$(echo "$cron_out" | grep -cvE '^\s*(#|$)' || true)
-                match_lines=$(echo "$cron_out" | grep -nE -i 'monitor|disk|alert|check|notify|server|madeena' | grep -vE '^\s*[0-9]+:\s*#' | cut -d: -f1 | paste -sd, - || true)
-                echo "User $user: crontab_present=true, active_entries=$active_entries, monitor_related_lines=${match_lines:-none}"
-              fi
-            done
-          fi
-
-          echo ""
-          echo "=== /etc/crontab (METADATA ONLY) ==="
-          if [ ! -e /etc/crontab ]; then
-            echo "/etc/crontab: NOT FOUND"
-          elif [ ! -r /etc/crontab ]; then
-            echo "/etc/crontab: UNREADABLE / PERMISSION DENIED"
-          else
-            active_entries=$(grep -cvE '^\s*(#|$)' /etc/crontab || true)
-            match_lines=$(grep -nE -i 'monitor|disk|alert|check|notify|server|madeena' /etc/crontab 2>/dev/null | grep -vE '^\s*[0-9]+:\s*#' | cut -d: -f1 | paste -sd, - || true)
-            echo "/etc/crontab: readable=true, active_entries=$active_entries, monitor_related_lines=${match_lines:-none}"
-          fi
-
-          echo ""
-          echo "=== /etc/cron.d/ ENTRIES (METADATA ONLY) ==="
-          if [ ! -e /etc/cron.d ]; then
-            echo "/etc/cron.d: NOT FOUND"
-          elif [ ! -r /etc/cron.d ] || [ ! -x /etc/cron.d ]; then
-            echo "/etc/cron.d: UNREADABLE / PERMISSION DENIED"
-          else
-            for f in /etc/cron.d/*; do
-              [ -e "$f" ] || continue
-              if [ ! -f "$f" ]; then
-                continue
-              elif [ ! -r "$f" ]; then
-                echo "$f: UNREADABLE / PERMISSION DENIED"
-              else
-                active_entries=$(grep -cvE '^\s*(#|$)' "$f" 2>/dev/null || true)
-                match_lines=$(grep -nE -i 'monitor|disk|alert|check|notify|server|madeena' "$f" 2>/dev/null | grep -vE '^\s*[0-9]+:\s*#' | cut -d: -f1 | paste -sd, - || true)
-                echo "$f: readable=true, active_entries=$active_entries, monitor_related_lines=${match_lines:-none}"
-              fi
-            done
-          fi
-
-          echo ""
-          echo "=== SYSTEM CRON DIRECTORIES STATUS ==="
-          for cron_dir in /etc/cron.hourly /etc/cron.daily /etc/cron.weekly /etc/cron.monthly; do
-            if [ ! -e "$cron_dir" ]; then
-              echo "$cron_dir: NOT FOUND"
-            elif [ ! -r "$cron_dir" ] || [ ! -x "$cron_dir" ]; then
-              echo "$cron_dir: UNREADABLE / PERMISSION DENIED"
-            else
-              file_list=$(ls -1 "$cron_dir" 2>/dev/null | paste -sd, - || true)
-              echo "$cron_dir: readable=true, files=${file_list:-none}"
-            fi
-          done
-
-      - name: "4. Systemd Timers and Services Inspection"
-        timeout-minutes: 2
-        run: |
-          set -euo pipefail
-          echo "=== ACTIVE & INACTIVE SYSTEMD TIMERS ==="
+          echo "=== SYSTEMD SERVICE AUTHORITY MAPPING ==="
           if ! command -v systemctl >/dev/null 2>&1; then
             echo "COMMAND UNAVAILABLE (systemctl not found)"
+            exit 0
+          fi
+
+          echo "Service: madeena-monitor.service"
+          echo "ActiveState: $(systemctl show madeena-monitor.service -p ActiveState --value 2>/dev/null || echo 'UNKNOWN')"
+          echo "UnitFileState: $(systemctl show madeena-monitor.service -p UnitFileState --value 2>/dev/null || echo 'UNKNOWN')"
+          echo "FragmentPath: $(systemctl show madeena-monitor.service -p FragmentPath --value 2>/dev/null || echo 'UNKNOWN')"
+          echo "User: $(systemctl show madeena-monitor.service -p User --value 2>/dev/null || echo 'UNKNOWN')"
+          echo "Group: $(systemctl show madeena-monitor.service -p Group --value 2>/dev/null || echo 'UNKNOWN')"
+          echo "WorkingDirectory: $(systemctl show madeena-monitor.service -p WorkingDirectory --value 2>/dev/null || echo 'UNKNOWN')"
+
+          # EnvironmentFiles: output PATH(s) only
+          raw_env_files=$(systemctl show madeena-monitor.service -p EnvironmentFiles --value 2>/dev/null || true)
+          if [ -n "$raw_env_files" ]; then
+            parsed_env_paths=$(echo "$raw_env_files" | grep -oE '/[^ ;\)#]+' | paste -sd' ' - || echo "$raw_env_files")
+            echo "EnvironmentFiles: ${parsed_env_paths:-NONE}"
           else
-            systemctl list-timers --all --no-pager 2>&1 || echo "SYSTEMCTL TIMERS: UNREADABLE / PERMISSION DENIED"
+            echo "EnvironmentFiles: NONE"
           fi
 
-          echo ""
-          echo "=== SYSTEMD SERVICES MATCHING MONITOR / DISK / ALERT / CHECK ==="
-          if command -v systemctl >/dev/null 2>&1; then
-            matching_units=$(systemctl list-unit-files --type=service,timer --no-pager 2>/dev/null \
-              | grep -iE 'monitor|disk|alert|check|watch|notify|tele' || true)
-            if [ -n "$matching_units" ]; then
-              echo "$matching_units"
-            else
-              echo "FOUND: 0 matching unit files"
-            fi
+          # MainPID
+          main_pid=$(systemctl show madeena-monitor.service -p MainPID --value 2>/dev/null || echo '0')
+          echo "MainPID: $main_pid"
 
-            echo ""
-            echo "=== RUNNING SERVICES MATCHING MONITOR / DISK / ALERT / CHECK ==="
-            running_matches=$(systemctl list-units --type=service --state=running --no-pager 2>/dev/null \
-              | grep -iE 'monitor|disk|alert|check|watch|notify|tele' || true)
-            if [ -n "$running_matches" ]; then
-              echo "$running_matches"
-            else
-              echo "FOUND: 0 running matching services"
-            fi
+          # ExecStart: extract executable pathname only, without argv
+          raw_exec_start=$(systemctl show madeena-monitor.service -p ExecStart --value 2>/dev/null || true)
+          if [ -n "$raw_exec_start" ]; then
+            parsed_exec=$(echo "$raw_exec_start" | grep -oE 'path=[^ ;]+' | cut -d= -f2 || echo "UNRESOLVED")
+            echo "ExecStart executable path: ${parsed_exec:-UNRESOLVED}"
+          else
+            echo "ExecStart executable path: UNRESOLVED"
           fi
 
-      - name: "5. Running Processes Inspection (Executable Names Only — No Argv)"
+      - name: "2. Running-Process Identity Mapping (/proc/<pid>)"
+        timeout-minutes: 1
+        run: |
+          set -euo pipefail
+          echo "=== RUNNING PROCESS IDENTITY MAPPING ==="
+          if ! command -v systemctl >/dev/null 2>&1; then
+            echo "COMMAND UNAVAILABLE (systemctl not found)"
+            exit 0
+          fi
+
+          main_pid=$(systemctl show madeena-monitor.service -p MainPID --value 2>/dev/null || echo '0')
+          echo "MainPID: $main_pid"
+
+          if [ -z "$main_pid" ] || [ "$main_pid" = "0" ]; then
+            echo "Process state: NOT RUNNING or PID 0"
+          elif [ ! -d "/proc/$main_pid" ]; then
+            echo "Process directory /proc/$main_pid: NOT FOUND"
+          else
+            exe_target=$(readlink -f "/proc/$main_pid/exe" 2>/dev/null || echo "UNREADABLE / PERMISSION DENIED")
+            cwd_target=$(readlink -f "/proc/$main_pid/cwd" 2>/dev/null || echo "UNREADABLE / PERMISSION DENIED")
+            echo "/proc/$main_pid/exe -> $exe_target"
+            echo "/proc/$main_pid/cwd -> $cwd_target"
+          fi
+
+      - name: "3. Candidate-File Identity & Comparison"
         timeout-minutes: 2
         run: |
           set -euo pipefail
-          echo "=== RUNNING PROCESSES (PID AND COMM ONLY — NO ARGV) ==="
-          if ! command -v ps >/dev/null 2>&1; then
-            echo "COMMAND UNAVAILABLE (ps not found)"
-          else
-            matched_procs=$(ps -eo pid=,comm= 2>/dev/null | grep -iE 'monitor|disk|alert|check|notify|tele|agent|watch' || true)
-            if [ -n "$matched_procs" ]; then
-              echo "$matched_procs" | awk '{printf "  PID=%-7s COMM=%s\n", $1, $2}'
-            else
-              echo "FOUND: 0 matching processes by comm name"
-            fi
-          fi
+          echo "=== CANDIDATE-FILE IDENTITY & COMPARISON ==="
 
-      - name: "6. Docker Container & Swarm Inspection"
-        timeout-minutes: 2
-        run: |
-          set -euo pipefail
-          echo "=== DOCKER CONTAINERS STATUS ==="
-          if ! command -v docker >/dev/null 2>&1; then
-            echo "COMMAND UNAVAILABLE (docker not found)"
-          elif ! docker ps >/dev/null 2>&1; then
-            echo "DOCKER STATUS: UNREADABLE / PERMISSION DENIED (runner user cannot query docker daemon)"
-          else
-            docker ps --format "table {{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}"
-            echo ""
-            echo "=== DOCKER CONTAINERS MATCHING MONITOR / ALERT / WATCH / DISK ==="
-            mon_containers=$(docker ps -a --format "table {{.Names}}\t{{.Image}}\t{{.Status}}" \
-              | grep -iE 'monitor|alert|watch|disk|agent' || true)
-            if [ -n "$mon_containers" ]; then
-              echo "$mon_containers"
-            else
-              echo "FOUND: 0 matching containers"
-            fi
-
-            echo ""
-            echo "=== DOCKER SWARM SERVICES ==="
-            docker service ls 2>&1 || echo "Swarm not active or query failed"
-          fi
-
-      - name: "7. Targeted Candidate File Search (Paths & Line Numbers Only — No Raw Lines)"
-        timeout-minutes: 3
-        run: |
-          set -euo pipefail
-          echo "=== TARGETED CANDIDATE FILE SEARCH (METADATA ONLY) ==="
-
-          CANDIDATE_DIRS="/usr/local/bin /usr/local/sbin /opt /etc/systemd/system /etc/cron.d"
-
-          for d in $CANDIDATE_DIRS; do
-            if [ ! -e "$d" ]; then
-              echo "Directory $d: NOT FOUND"
-              continue
-            elif [ ! -r "$d" ] || [ ! -x "$d" ]; then
-              echo "Directory $d: UNREADABLE / PERMISSION DENIED"
+          cands=("/opt/madeena-monitor/monitor" "/var/www/madeena-server-monitor/monitor")
+          for f in "${cands[@]}"; do
+            echo "--- Candidate: $f ---"
+            if [ ! -e "$f" ]; then
+              echo "  Status: NOT FOUND"
               continue
             fi
-
-            echo "Scanning directory: $d"
-            while IFS= read -r f; do
-              [ -f "$f" ] || continue
-              if [ ! -r "$f" ]; then
-                echo "  File $f: UNREADABLE / PERMISSION DENIED"
-                continue
-              fi
-
-              header_count=$(grep -ciE "Madeena Server Monitor|Peringatan Kritis Server|Peringatan Kritis|Disk /=" "$f" 2>/dev/null || true)
-              thresh_count=$(grep -ciE "threshold.*50|50%.*disk|disk.*50%|df.*50" "$f" 2>/dev/null || true)
-
-              if [ "$header_count" -gt 0 ] || [ "$thresh_count" -gt 0 ]; then
-                echo "  CANDIDATE FOUND: $f"
-                if [ "$header_count" -gt 0 ]; then
-                  h_lines=$(grep -niE "Madeena Server Monitor|Peringatan Kritis Server|Peringatan Kritis|Disk /=" "$f" 2>/dev/null | cut -d: -f1 | paste -sd, - || true)
-                  echo "    alert-header matches ($header_count): lines $h_lines"
-                fi
-                if [ "$thresh_count" -gt 0 ]; then
-                  t_lines=$(grep -niE "threshold.*50|50%.*disk|disk.*50%|df.*50" "$f" 2>/dev/null | cut -d: -f1 | paste -sd, - || true)
-                  echo "    threshold-pattern matches ($thresh_count): lines $t_lines"
-                fi
-              fi
-            done < <(find "$d" -maxdepth 3 -type f 2>/dev/null || true)
+            echo "  Status: EXISTS"
+            echo "  RealPath: $(readlink -f "$f" 2>/dev/null || echo 'UNKNOWN')"
+            echo "  FileType: $(file -b "$f" 2>/dev/null || echo 'UNKNOWN')"
+            echo "  Owner:Group: $(stat -c '%U:%G' "$f" 2>/dev/null || echo 'UNKNOWN')"
+            echo "  Mode: $(stat -c '%a' "$f" 2>/dev/null || echo 'UNKNOWN')"
+            echo "  Size: $(stat -c '%s' "$f" 2>/dev/null || echo 'UNKNOWN') bytes"
+            echo "  ModifyTime: $(stat -c '%y' "$f" 2>/dev/null || echo 'UNKNOWN')"
+            if [ -r "$f" ]; then
+              echo "  SHA256: $(sha256sum "$f" 2>/dev/null | awk '{print $1}')"
+            else
+              echo "  SHA256: UNREADABLE / PERMISSION DENIED"
+            fi
           done
 
           echo ""
-          echo "=== CHECKING /var/www CANDIDATE SCRIPT NAMES (DEPTH 2) ==="
-          if [ ! -e /var/www ]; then
-            echo "/var/www: NOT FOUND"
-          elif [ ! -r /var/www ] || [ ! -x /var/www ]; then
-            echo "/var/www: UNREADABLE / PERMISSION DENIED"
-          else
-            found_scripts=$(find /var/www -maxdepth 2 -type f \( -iname "*monitor*" -o -iname "*disk*" -o -iname "*alert*" \) 2>/dev/null || true)
-            if [ -n "$found_scripts" ]; then
-              for sf in $found_scripts; do
-                echo "  Candidate script name: $sf"
-                if [ -r "$sf" ]; then
-                  h_cnt=$(grep -ciE "Madeena Server Monitor|Peringatan Kritis Server|Peringatan Kritis|Disk /=" "$sf" 2>/dev/null || true)
-                  t_cnt=$(grep -ciE "threshold.*50|50%.*disk|disk.*50%|df.*50" "$sf" 2>/dev/null || true)
-                  if [ "$h_cnt" -gt 0 ] || [ "$t_cnt" -gt 0 ]; then
-                    echo "    alert-header matches: $h_cnt | threshold-pattern matches: $t_cnt"
-                  fi
-                else
-                  echo "    UNREADABLE / PERMISSION DENIED"
-                fi
-              done
+          echo "--- Cross-Candidate Comparison ---"
+          f1="/opt/madeena-monitor/monitor"
+          f2="/var/www/madeena-server-monitor/monitor"
+          if [ -e "$f1" ] && [ -e "$f2" ]; then
+            r1=$(readlink -f "$f1" 2>/dev/null || echo "1")
+            r2=$(readlink -f "$f2" 2>/dev/null || echo "2")
+            if [ "$r1" = "$r2" ]; then
+              echo "Comparison: SAME REALPATH ($r1)"
+            elif [ -r "$f1" ] && [ -r "$f2" ]; then
+              h1=$(sha256sum "$f1" 2>/dev/null | awk '{print $1}')
+              h2=$(sha256sum "$f2" 2>/dev/null | awk '{print $1}')
+              if [ "$h1" = "$h2" ]; then
+                echo "Comparison: IDENTICAL (hashes match: $h1)"
+              else
+                echo "Comparison: DIFFERENT (hash1: $h1 vs hash2: $h2)"
+              fi
             else
-              echo "FOUND: 0 matching monitor/disk/alert script names in /var/www (depth 2)"
+              echo "Comparison: UNABLE TO HASH (one or both candidates unreadable)"
             fi
+          else
+            echo "Comparison: ONE OR BOTH CANDIDATES NOT FOUND"
           fi
 
-      - name: "8. Summary Report"
+      - name: "4. Secret-Safe Environment-File Threshold Inspection"
+        timeout-minutes: 2
+        env:
+          SUDO_PASSWORD: ${{ secrets.SUDO_PASSWORD }}
+        run: |
+          set -euo pipefail
+          echo "=== ENVIRONMENT-FILE THRESHOLD INSPECTION (STRICT ALLOWLIST) ==="
+
+          _sudo() {
+            if [ -n "${SUDO_PASSWORD:-}" ]; then
+              echo "$SUDO_PASSWORD" | sudo -S "$@" 2>/dev/null
+            else
+              sudo "$@"
+            fi
+          }
+
+          raw_env_files=$(systemctl show madeena-monitor.service -p EnvironmentFiles --value 2>/dev/null || true)
+          parsed_env_paths=""
+          if [ -n "$raw_env_files" ]; then
+            parsed_env_paths=$(echo "$raw_env_files" | grep -oE '/[^ ;\)#]+' | paste -sd' ' - || true)
+          fi
+
+          target_env="/opt/madeena-monitor/.env"
+          echo "Systemd EnvironmentFiles: ${parsed_env_paths:-NONE}"
+          echo "Target env path to inspect: $target_env"
+
+          if [ ! -e "$target_env" ]; then
+            echo "Env file status: NOT FOUND"
+            exit 0
+          fi
+
+          echo "Env file status: EXISTS"
+          echo "Env file permissions: $(stat -c '%a %U:%G' "$target_env" 2>/dev/null || echo 'UNKNOWN')"
+
+          echo ""
+          echo "--- Allowlisted Disk Threshold Variables ---"
+          _sudo cat "$target_env" 2>/dev/null | awk -F= '
+            BEGIN { match_count = 0 }
+            !/^[[:space:]]*(#|$)/ && NF >= 2 {
+              k = $1; sub(/^[[:space:]]+/, "", k); sub(/[[:space:]]+$/, "", k);
+              v = substr($0, index($0, "=") + 1); sub(/^[[:space:]]+/, "", v); sub(/[[:space:]]+$/, "", v);
+              gsub(/^["\x27]|["\x27]$/, "", v);
+              uk = toupper(k);
+              if (uk ~ /DISK/ && (uk ~ /THRESHOLD/ || uk ~ /CRITICAL/)) {
+                match_count++;
+                if (v ~ /^[0-9]+([.][0-9]+)?%?$/) {
+                  print k "=" v;
+                } else {
+                  print k "=<non-numeric-redacted>";
+                }
+              }
+            }
+            END {
+              if (match_count == 0) {
+                print "FOUND: 0 matching disk threshold variables in environment file";
+              }
+            }
+          ' || echo "INSPECTION FAILED: unable to read environment file via sudo"
+
+      - name: "5. Monitor Executable/Script Threshold Inspection"
         timeout-minutes: 2
         run: |
           set -euo pipefail
-          echo "=== PRODUCTION MONITOR DISCOVERY COMPLETE ==="
-          echo "Completed at: $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
+          echo "=== MONITOR EXECUTABLE/SCRIPT THRESHOLD INSPECTION ==="
 
+          cands=("/opt/madeena-monitor/monitor" "/var/www/madeena-server-monitor/monitor")
+          for f in "${cands[@]}"; do
+            [ -e "$f" ] || continue
+            echo "--- Inspecting: $f ---"
+            file_type=$(file -b "$f" 2>/dev/null || echo "UNKNOWN")
+            echo "FileType: $file_type"
+
+            if [ ! -r "$f" ]; then
+              echo "Status: UNREADABLE / PERMISSION DENIED"
+              continue
+            fi
+
+            if echo "$file_type" | grep -qi "text"; then
+              echo "Script mode: TEXT SCAN (Allowlisted metadata only)"
+              awk '
+                BEGIN { match_count = 0 }
+                {
+                  line = $0;
+                  if (tolower(line) ~ /disk/ && tolower(line) ~ /(threshold|critical|50|80)/) {
+                    match_count++;
+                    matched_ids = "";
+                    if (tolower(line) ~ /disk/) matched_ids = (matched_ids ? matched_ids "," : "") "disk";
+                    if (tolower(line) ~ /threshold/) matched_ids = (matched_ids ? matched_ids "," : "") "threshold";
+                    if (tolower(line) ~ /critical/) matched_ids = (matched_ids ? matched_ids "," : "") "critical";
+                    if (tolower(line) ~ /alert/) matched_ids = (matched_ids ? matched_ids "," : "") "alert";
+
+                    matched_nums = "";
+                    n = split(line, words, /[^0-9.%]+/);
+                    for (i = 1; i <= n; i++) {
+                      w = words[i];
+                      if (w ~ /^[0-9]+([.][0-9]+)?%?$/ && (w ~ /50/ || w ~ /80/ || (w+0 >= 1 && w+0 <= 100))) {
+                        matched_nums = (matched_nums ? matched_nums "," : "") w;
+                      }
+                    }
+                    if (matched_ids != "" && matched_nums != "") {
+                      print "line=" NR " identifiers=" matched_ids " numeric_literals=" matched_nums;
+                    }
+                  }
+                }
+              ' "$f" 2>/dev/null || echo "TEXT SCAN FAILED"
+            else
+              echo "Script mode: BINARY SCAN (Sanitized pattern counts & plain co-located literals)"
+              strings -n 4 "$f" 2>/dev/null | awk '
+                BEGIN { match_count = 0 }
+                {
+                  line = $0;
+                  if (tolower(line) ~ /disk/ && tolower(line) ~ /(threshold|critical|50|80)/) {
+                    match_count++;
+                    matched_ids = "";
+                    if (tolower(line) ~ /disk/) matched_ids = (matched_ids ? matched_ids "," : "") "disk";
+                    if (tolower(line) ~ /threshold/) matched_ids = (matched_ids ? matched_ids "," : "") "threshold";
+                    if (tolower(line) ~ /critical/) matched_ids = (matched_ids ? matched_ids "," : "") "critical";
+                    if (tolower(line) ~ /alert/) matched_ids = (matched_ids ? matched_ids "," : "") "alert";
+
+                    matched_nums = "";
+                    n = split(line, words, /[^0-9.%]+/);
+                    for (i = 1; i <= n; i++) {
+                      w = words[i];
+                      if (w ~ /^[0-9]+([.][0-9]+)?%?$/ && (w ~ /50/ || w ~ /80/ || (w+0 >= 1 && w+0 <= 100))) {
+                        matched_nums = (matched_nums ? matched_nums "," : "") w;
+                      }
+                    }
+                    if (matched_ids != "" && matched_nums != "") {
+                      print "match=" match_count " identifiers=" matched_ids " numeric_literals=" matched_nums;
+                    }
+                  }
+                }
+                END {
+                  if (match_count == 0) {
+                    print "BINARY THRESHOLD SOURCE UNRESOLVED";
+                  }
+                }
+              ' || echo "BINARY THRESHOLD SOURCE UNRESOLVED"
+            fi
+          done
+
+      - name: "6. Summary & Source Classification Synthesis"
+        timeout-minutes: 1
+        run: |
+          set -euo pipefail
+          echo "=== SECOND-STAGE DIAGNOSTIC COMPLETE ==="
+          echo "Timestamp UTC: $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
   full-audit:
     name: "Full Server Audit"
     if: github.ref_name != 'task/server-disk-alert-threshold-80'

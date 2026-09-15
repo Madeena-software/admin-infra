@@ -144,12 +144,21 @@ jobs:
             echo "/proc/$main_pid/exe -> $exe_target"
             echo "/proc/$main_pid/cwd -> $cwd_target"
 
-            # Check for material conflict with systemd ExecStart
+            # Check file type of ExecStart target to prevent false conflict for interpreted scripts
             if [ "$exec_path" != "UNRESOLVED" ] && [ -e "$exec_path" ]; then
+              exec_file_type=$(file -b "$exec_path" 2>/dev/null || echo "UNKNOWN")
               expected_real_exec=$(readlink -f "$exec_path" 2>/dev/null || echo "$exec_path")
-              if [ "$exe_target" != "UNREADABLE / PERMISSION DENIED" ] && [ "$exe_target" != "$expected_real_exec" ]; then
-                echo "AUTHORITY CONFLICT: /proc/$main_pid/exe ($exe_target) does not match ExecStart realpath ($expected_real_exec)"
-                authority_conflict="true"
+
+              if echo "$exec_file_type" | grep -qiE "text|script"; then
+                echo "ExecStart Type: interpreted script ($exec_file_type)"
+                echo "Process Executable: $exe_target"
+                echo "Direct executable identity comparison: NOT APPLICABLE (shebang/interpreter execution)"
+              else
+                echo "ExecStart Type: native executable/binary ($exec_file_type)"
+                if [ "$exe_target" != "UNREADABLE / PERMISSION DENIED" ] && [ "$exe_target" != "$expected_real_exec" ]; then
+                  echo "AUTHORITY CONFLICT: /proc/$main_pid/exe ($exe_target) does not match ExecStart realpath ($expected_real_exec)"
+                  authority_conflict="true"
+                fi
               fi
             fi
 
@@ -167,7 +176,7 @@ jobs:
           if [ "$authority_conflict" = "true" ]; then
             echo "Result: AUTHORITY CONFLICT DETECTED"
           else
-            echo "Result: AUTHORITY VERIFIED (Process matches systemd service definition)"
+            echo "Result: AUTHORITY VERIFIED (Process aligns with systemd service definition)"
           fi
 
       - name: "3. Candidate-File Identity & Comparison"
@@ -234,7 +243,6 @@ jobs:
           echo "Target WorkingDirectory: $svc_cwd"
 
           program_linked_file=""
-          dotenv_detected="false"
 
           if [ "$exec_path" = "UNRESOLVED" ] || [ ! -e "$exec_path" ]; then
             echo "Executable status: UNRESOLVED OR NOT FOUND"
@@ -246,7 +254,6 @@ jobs:
 
             if echo "$file_type" | grep -qi "text"; then
               echo "Inspecting text script metadata for configuration loading tokens:"
-              # Scan script metadata for allowlisted tokens without printing code lines
               while IFS=: read -r lnum line; do
                 [ -n "$lnum" ] || continue
                 lower_line=$(echo "$line" | tr '[:upper:]' '[:lower:]')
@@ -261,25 +268,29 @@ jobs:
                   ref_path=$(echo "$line" | grep -oE '/[a-zA-Z0-9_./-]+\.(env|conf)' | head -1 || true)
                   echo "  line=$lnum tokens=$matched_tokens ${ref_path:+config_path=$ref_path}"
 
-                  if echo "$matched_tokens" | grep -qE "dotenv|load_dotenv"; then
-                    dotenv_detected="true"
-                  fi
+                  # Require explicit path evidence associated with loader token to link
                   if [ -n "$ref_path" ] && [ -z "$program_linked_file" ]; then
-                    program_linked_file="$ref_path"
+                    if echo "$matched_tokens" | grep -qE "load_dotenv|dotenv|environmentfile"; then
+                      program_linked_file="$ref_path"
+                      echo "  Positive linkage: loader token associated with explicit config path: $program_linked_file"
+                    fi
                   fi
                 fi
               done < <(grep -nE -i 'dotenv|environmentfile|disk_threshold|disk_critical|threshold' "$exec_path" 2>/dev/null || true)
 
-              # If dotenv loading detected without explicit path, check WorkingDirectory/.env
-              if [ -z "$program_linked_file" ] && [ "$dotenv_detected" = "true" ] && [ -n "$svc_cwd" ] && [ -d "$svc_cwd" ]; then
-                if [ -e "$svc_cwd/.env" ]; then
-                  program_linked_file="$svc_cwd/.env"
-                  echo "Deterministic linkage: dotenv loader combined with WorkingDirectory resolves to $program_linked_file"
-                fi
+              if [ -z "$program_linked_file" ]; then
+                echo "PROGRAM CONFIG LINKAGE UNRESOLVED (No explicit config path associated with loader in script metadata)"
               fi
             else
-              echo "Authoritative executable is binary; checking printable identifier presence:"
-              strings -n 4 "$exec_path" 2>/dev/null | grep -iE 'dotenv|environmentfile|disk_threshold|disk_critical' | head -5 | awk '{print "  binary_token=" $0}' || echo "  No linkage tokens found in binary"
+              echo "Authoritative executable is binary; inspecting sanitized identifier counts only (NO raw strings):"
+              # Count allowlisted identifier occurrences without echoing raw strings
+              for tok in "dotenv" "environmentfile" "disk_threshold" "disk_critical"; do
+                cnt=$(strings -n 4 "$exec_path" 2>/dev/null | grep -ciF "$tok" || true)
+                if [ "$cnt" -gt 0 ]; then
+                  echo "  binary_identifier=$tok count=$cnt"
+                fi
+              done
+              echo "PROGRAM CONFIG LINKAGE UNRESOLVED (Binary executable cannot establish deterministic external config linkage safely)"
             fi
           fi
 
@@ -331,7 +342,7 @@ jobs:
             if [ -e "$program_linked_file" ]; then
               linkage_state="PROGRAM_LINKED"
               authoritative_env_target="$program_linked_file"
-              echo "Linkage evaluation: PROGRAM_LINKED ($program_linked_file verified from program metadata)"
+              echo "Linkage evaluation: PROGRAM_LINKED ($program_linked_file positively verified from program metadata)"
             fi
           fi
 
@@ -384,36 +395,29 @@ jobs:
           echo "=== MONITOR EXECUTABLE/SCRIPT THRESHOLD INSPECTION ==="
 
           exec_path=$(cat .diag_meta/exec_path 2>/dev/null || echo 'UNRESOLVED')
-          cands=()
-          if [ "$exec_path" != "UNRESOLVED" ] && [ -e "$exec_path" ]; then
-            cands+=("$exec_path")
-          fi
-          # Also compare standard locations if different from authoritative ExecStart
-          for alt in "/opt/madeena-monitor/monitor" "/var/www/madeena-server-monitor/monitor"; do
-            if [ "$alt" != "$exec_path" ] && [ -e "$alt" ]; then
-              cands+=("$alt")
-            fi
-          done
+          authoritative_found="false"
+          auth_source_type="none"
+          auth_numeric=""
+          auth_ids=""
 
-          for f in "${cands[@]}"; do
-            [ -e "$f" ] || continue
-            echo "--- Inspecting: $f ---"
-            file_type=$(file -b "$f" 2>/dev/null || echo "UNKNOWN")
+          echo "Authoritative Executable Target: $exec_path"
+
+          # 1. Authoritative Executable Scan First
+          if [ "$exec_path" != "UNRESOLVED" ] && [ -e "$exec_path" ]; then
+            echo "--- Scanning Authoritative Target: $exec_path ---"
+            file_type=$(file -b "$exec_path" 2>/dev/null || echo "UNKNOWN")
             echo "FileType: $file_type"
 
-            if [ ! -r "$f" ]; then
+            if [ ! -r "$exec_path" ]; then
               echo "Status: UNREADABLE / PERMISSION DENIED"
-              continue
-            fi
-
-            if echo "$file_type" | grep -qi "text"; then
-              echo "Script mode: TEXT SCAN (Allowlisted metadata only)"
-              awk '
+            elif echo "$file_type" | grep -qi "text"; then
+              auth_source_type="text"
+              echo "Script mode: TEXT SCAN (Authoritative Target — Allowlisted metadata only)"
+              res=$(awk '
                 BEGIN { match_count = 0 }
                 {
                   line = $0;
                   if (tolower(line) ~ /disk/ && tolower(line) ~ /(threshold|critical|50|80)/) {
-                    match_count++;
                     matched_ids = "";
                     if (tolower(line) ~ /disk/) matched_ids = (matched_ids ? matched_ids "," : "") "disk";
                     if (tolower(line) ~ /threshold/) matched_ids = (matched_ids ? matched_ids "," : "") "threshold";
@@ -429,19 +433,29 @@ jobs:
                       }
                     }
                     if (matched_ids != "" && matched_nums != "") {
+                      match_count++;
                       print "line=" NR " identifiers=" matched_ids " numeric_literals=" matched_nums;
                     }
                   }
                 }
-              ' "$f" 2>/dev/null || echo "TEXT SCAN FAILED"
+              ' "$exec_path" 2>/dev/null || true)
+
+              if [ -n "$res" ]; then
+                authoritative_found="true"
+                echo "$res"
+                auth_numeric=$(echo "$res" | grep -oE 'numeric_literals=[^ ]+' | head -1 | cut -d= -f2 || true)
+                auth_ids=$(echo "$res" | grep -oE 'identifiers=[^ ]+' | head -1 | cut -d= -f2 || true)
+              else
+                echo "No affirmative disk-threshold evidence found in authoritative script"
+              fi
             else
-              echo "Script mode: BINARY SCAN (Sanitized pattern counts & plain co-located literals)"
-              strings -n 4 "$f" 2>/dev/null | awk '
+              auth_source_type="binary"
+              echo "Script mode: BINARY SCAN (Authoritative Target — Sanitized pattern counts & co-located literals)"
+              res=$(strings -n 4 "$exec_path" 2>/dev/null | awk '
                 BEGIN { match_count = 0 }
                 {
                   line = $0;
                   if (tolower(line) ~ /disk/ && tolower(line) ~ /(threshold|critical|50|80)/) {
-                    match_count++;
                     matched_ids = "";
                     if (tolower(line) ~ /disk/) matched_ids = (matched_ids ? matched_ids "," : "") "disk";
                     if (tolower(line) ~ /threshold/) matched_ids = (matched_ids ? matched_ids "," : "") "threshold";
@@ -457,6 +471,7 @@ jobs:
                       }
                     }
                     if (matched_ids != "" && matched_nums != "") {
+                      match_count++;
                       print "match=" match_count " identifiers=" matched_ids " numeric_literals=" matched_nums;
                     }
                   }
@@ -466,7 +481,54 @@ jobs:
                     print "BINARY THRESHOLD SOURCE UNRESOLVED";
                   }
                 }
-              ' || echo "BINARY THRESHOLD SOURCE UNRESOLVED"
+              ' || echo "BINARY THRESHOLD SOURCE UNRESOLVED")
+
+              if [ -n "$res" ] && [ "$res" != "BINARY THRESHOLD SOURCE UNRESOLVED" ]; then
+                authoritative_found="true"
+                echo "$res"
+                auth_numeric=$(echo "$res" | grep -oE 'numeric_literals=[^ ]+' | head -1 | cut -d= -f2 || true)
+                auth_ids=$(echo "$res" | grep -oE 'identifiers=[^ ]+' | head -1 | cut -d= -f2 || true)
+              else
+                echo "BINARY THRESHOLD SOURCE UNRESOLVED"
+              fi
+            fi
+          else
+            echo "Authoritative ExecStart unresolved or file not found"
+          fi
+
+          # Persist authoritative threshold evidence
+          echo "$authoritative_found" > .diag_meta/threshold_evidence_found
+          echo "$auth_source_type" > .diag_meta/threshold_source_type
+          echo "${auth_numeric:-none}" > .diag_meta/threshold_numeric_evidence
+          echo "${auth_ids:-none}" > .diag_meta/threshold_identifier_evidence
+
+          # 2. Informational Alternate Candidate Scans (Do not drive authoritative classification unless identical/same realpath)
+          echo ""
+          echo "--- Informational Alternate Candidate Inspections ---"
+          for alt in "/opt/madeena-monitor/monitor" "/var/www/madeena-server-monitor/monitor"; do
+            if [ "$alt" != "$exec_path" ] && [ -e "$alt" ] && [ -r "$alt" ]; then
+              alt_ft=$(file -b "$alt" 2>/dev/null || echo "UNKNOWN")
+              echo "Alternate Candidate ($alt) [$alt_ft]:"
+              if echo "$alt_ft" | grep -qi "text"; then
+                awk '
+                  {
+                    line = $0;
+                    if (tolower(line) ~ /disk/ && tolower(line) ~ /(threshold|critical|50|80)/) {
+                      n = split(line, words, /[^0-9.%]+/);
+                      nums = "";
+                      for (i = 1; i <= n; i++) {
+                        w = words[i];
+                        if (w ~ /^[0-9]+([.][0-9]+)?%?$/ && (w ~ /50/ || w ~ /80/ || (w+0 >= 1 && w+0 <= 100))) {
+                          nums = (nums ? nums "," : "") w;
+                        }
+                      }
+                      if (nums != "") {
+                        print "  line=" NR " numeric_literals=" nums;
+                      }
+                    }
+                  }
+                ' "$alt" 2>/dev/null | head -5 || true
+              fi
             fi
           done
 
@@ -480,29 +542,38 @@ jobs:
           linkage_state=$(cat .diag_meta/linkage_state 2>/dev/null || echo 'NOT_AUTHORITATIVELY_LINKED')
           env_target=$(cat .diag_meta/authoritative_env_target 2>/dev/null || echo '')
           exec_path=$(cat .diag_meta/exec_path 2>/dev/null || echo 'UNRESOLVED')
+          thresh_found=$(cat .diag_meta/threshold_evidence_found 2>/dev/null || echo 'false')
+          thresh_type=$(cat .diag_meta/threshold_source_type 2>/dev/null || echo 'none')
+          thresh_num=$(cat .diag_meta/threshold_numeric_evidence 2>/dev/null || echo 'none')
 
           echo "Authority Conflict: $auth_conflict"
           echo "Linkage State: $linkage_state"
           echo "Authoritative Environment File: ${env_target:-NONE}"
           echo "Authoritative Executable: $exec_path"
+          echo "Authoritative Target Threshold Evidence Found: $thresh_found"
+          echo "Authoritative Threshold Source Type: $thresh_type"
+          echo "Authoritative Numeric Evidence: $thresh_num"
 
           echo ""
-          echo "Candidate Classification Result:"
+          echo "Classification Result:"
           if [ "$auth_conflict" = "true" ]; then
             echo "CLASSIFICATION: E. AUTHORITY CONFLICT"
-            echo "Reason: Live running process PID/exe/cwd conflicts with systemd service definition."
+            echo "Reason: Runtime/configuration evidence materially contradicts the service authority chain."
           elif [ "$linkage_state" = "SYSTEMD_LINKED" ]; then
             echo "CLASSIFICATION: A. SYSTEMD ENVIRONMENT FILE"
             echo "Evidence: Service EnvironmentFiles explicitly defines $env_target"
           elif [ "$linkage_state" = "PROGRAM_LINKED" ]; then
             echo "CLASSIFICATION: B. PROGRAM-LOADED ENVIRONMENT / CONFIG FILE"
-            echo "Evidence: Program metadata verified to load $env_target"
-          elif [ "$exec_path" != "UNRESOLVED" ]; then
-            echo "CLASSIFICATION: C. MONITOR SCRIPT / CONFIG VALUE or D. EMBEDDED / DEFAULT EXECUTABLE VALUE"
-            echo "Evidence: No external environment file is authoritatively linked; value originates in executable."
+            echo "Evidence: Program metadata positively verified to load $env_target"
+          elif [ "$thresh_found" = "true" ] && [ "$thresh_type" = "text" ]; then
+            echo "CLASSIFICATION: C. MONITOR SCRIPT / CONFIG VALUE"
+            echo "Evidence: Authoritative ExecStart is text/script and safe scan yielded affirmative disk-threshold evidence (numeric: $thresh_num)."
+          elif [ "$thresh_found" = "true" ] && [ "$thresh_type" = "binary" ]; then
+            echo "CLASSIFICATION: D. EMBEDDED / DEFAULT EXECUTABLE VALUE"
+            echo "Evidence: Authoritative ExecStart is binary and yielded affirmative co-located threshold evidence (numeric: $thresh_num)."
           else
             echo "CLASSIFICATION: F. UNRESOLVED"
-            echo "Evidence: Authority mapping incomplete."
+            echo "Evidence: Threshold source cannot be deterministically established from verified evidence."
           fi
           echo "Completed at: $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
   full-audit:

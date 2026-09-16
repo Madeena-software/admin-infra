@@ -244,6 +244,7 @@ jobs:
           set -euo pipefail
           echo "=== 3. PREFLIGHT: ROOT-VS-DATA SCOPE GATE ==="
           env_file="/var/www/madeena-server-monitor/.env"
+          initial_pid=$(cat .mutation_meta/initial_pid 2>/dev/null || echo '0')
 
           _sudo() {
             if [ -n "${SUDO_PASSWORD:-}" ]; then
@@ -255,6 +256,10 @@ jobs:
 
           if ! _sudo test -f "$env_file"; then
             echo "FATAL: Authoritative .env does not exist: $env_file" >&2
+            exit 1
+          fi
+          if [ -z "$initial_pid" ] || [ "$initial_pid" = "0" ] || [ ! -d "/proc/$initial_pid" ]; then
+            echo "FATAL: Initial MainPID not found or process directory missing: $initial_pid" >&2
             exit 1
           fi
 
@@ -317,32 +322,90 @@ jobs:
             dir_count=$(printf '%s\n' "$direct_dp_audit" | awk -F= '$1=="count"{print $2}')
             dir_empty_count=$(printf '%s\n' "$direct_dp_audit" | awk -F= '$1=="empty_count"{print $2}')
 
-            if [ "${dir_count:-0}" -gt 0 ]; then
+            if [ "${dir_count:-0}" -eq 0 ]; then
+              direct_dp_present="false"
+              direct_dp_empty="true"
+            elif [ "${dir_count:-0}" -eq 1 ]; then
               direct_dp_present="true"
-              if [ "${dir_empty_count:-0}" -eq "${dir_count:-0}" ]; then
+              if [ "${dir_empty_count:-0}" -eq 1 ]; then
                 direct_dp_empty="true"
               else
                 direct_dp_empty="false"
               fi
+            else
+              echo "FATAL: Ambiguous configuration: multiple ($dir_count) active DATA_PARTITIONS definitions in direct systemd Environment" >&2
+              exit 1
             fi
+          fi
+
+          # 3. Allowlisted parse of DATA_PARTITIONS from effective running process environment (/proc/<pid>/environ)
+          proc_dp_audit=$(_sudo sh -c '
+            pid="$1"
+            tr "\0" "\n" < "/proc/$pid/environ" 2>/dev/null | awk -F= "
+              !/^[[:space:]]*(#|$)/ && NF >= 2 {
+                k = \$1; sub(/^[[:space:]]+/, \"\", k); sub(/[[:space:]]+$/, \"\", k);
+                v = substr(\$0, index(\$0, \"=\") + 1); sub(/^[[:space:]]+/, \"\", v); sub(/[[:space:]]+$/, \"\", v);
+                gsub(/^[\"'"'"']|[\"'"'"']$/, \"\", v);
+                if (k == \"DATA_PARTITIONS\") {
+                  count++
+                  if (v == \"\") empty_count++
+                }
+              }
+              END {
+                printf \"count=%d\nempty_count=%d\n\", count, empty_count
+              }
+            "
+          ' -- "$initial_pid")
+
+          proc_dp_count=$(printf '%s\n' "$proc_dp_audit" | awk -F= '$1=="count"{print $2}')
+          proc_dp_empty_count=$(printf '%s\n' "$proc_dp_audit" | awk -F= '$1=="empty_count"{print $2}')
+
+          if [ "${proc_dp_count:-0}" -eq 0 ]; then
+            proc_dp_present="false"
+            proc_dp_empty="true"
+          elif [ "${proc_dp_count:-0}" -eq 1 ]; then
+            proc_dp_present="true"
+            if [ "${proc_dp_empty_count:-0}" -eq 1 ]; then
+              proc_dp_empty="true"
+            else
+              proc_dp_empty="false"
+            fi
+          else
+            echo "FATAL: Ambiguous configuration: multiple ($proc_dp_count) active DATA_PARTITIONS definitions in process environment" >&2
+            exit 1
           fi
 
           echo "EnvironmentFile DATA_PARTITIONS present=$env_dp_present empty=$env_dp_empty"
           echo "Direct Environment DATA_PARTITIONS present=$direct_dp_present empty=$direct_dp_empty"
+          echo "Process DATA_PARTITIONS present=$proc_dp_present empty=$proc_dp_empty"
 
-          # 3. Check for ambiguity / dual definition (even if both are empty)
+          # 4. Check for ambiguity / dual definition between config sources (even if both are empty)
           if [ "$env_dp_present" = "true" ] && [ "$direct_dp_present" = "true" ]; then
             echo "FATAL: Ambiguous DATA_PARTITIONS configuration: defined in both .env and direct systemd Environment. Halting before mutation." >&2
             exit 1
           fi
 
-          # 4. Fail-closed if either source defines a non-empty value
+          # 5. Check if effective process state contradicts config authority
+          if [ "$env_dp_present" = "true" ] && [ "$proc_dp_present" != "true" ]; then
+            echo "FATAL: Authority ambiguity: DATA_PARTITIONS defined in .env but absent in active process environment" >&2
+            exit 1
+          fi
+          if [ "$env_dp_empty" != "$proc_dp_empty" ]; then
+            echo "FATAL: Authority ambiguity: DATA_PARTITIONS emptiness mismatch between .env ($env_dp_empty) and process environment ($proc_dp_empty)" >&2
+            exit 1
+          fi
+
+          # 6. Fail-closed if any source defines a non-empty value
           if [ "$env_dp_present" = "true" ] && [ "$env_dp_empty" = "false" ]; then
-            echo "FATAL: DATA_PARTITIONS is non-empty; root-only threshold mutation is out of scope" >&2
+            echo "FATAL: Effective process DATA_PARTITIONS is non-empty; root-only threshold mutation is out of scope" >&2
             exit 1
           fi
           if [ "$direct_dp_present" = "true" ] && [ "$direct_dp_empty" = "false" ]; then
-            echo "FATAL: DATA_PARTITIONS is non-empty; root-only threshold mutation is out of scope" >&2
+            echo "FATAL: Effective process DATA_PARTITIONS is non-empty; root-only threshold mutation is out of scope" >&2
+            exit 1
+          fi
+          if [ "$proc_dp_present" = "true" ] && [ "$proc_dp_empty" = "false" ]; then
+            echo "FATAL: Effective process DATA_PARTITIONS is non-empty; root-only threshold mutation is out of scope" >&2
             exit 1
           fi
 
@@ -357,6 +420,7 @@ jobs:
           set -euo pipefail
           echo "=== 4. PREFLIGHT: THRESHOLD STATE & SINGLE-DEFINITION GATE ==="
           env_file="/var/www/madeena-server-monitor/.env"
+          initial_pid=$(cat .mutation_meta/initial_pid 2>/dev/null || echo '0')
 
           _sudo() {
             if [ -n "${SUDO_PASSWORD:-}" ]; then
@@ -365,6 +429,11 @@ jobs:
               sudo -n "$@" 2>/dev/null
             fi
           }
+
+          if [ -z "$initial_pid" ] || [ "$initial_pid" = "0" ] || [ ! -d "/proc/$initial_pid" ]; then
+            echo "FATAL: Initial MainPID not found or process directory missing: $initial_pid" >&2
+            exit 1
+          fi
 
           # Privileged parse strictly through allowlist without dumping .env
           threshold_defs=$(_sudo sh -c '
@@ -382,16 +451,45 @@ jobs:
           ' -- "$env_file" || true)
 
           match_count=$(echo "$threshold_defs" | grep -c . || true)
-          echo "Found active ROOT_DISK_THRESHOLD definitions: $match_count"
+          echo "Found active ROOT_DISK_THRESHOLD definitions in .env: $match_count"
           if [ "$match_count" -ne 1 ]; then
-            echo "FATAL: Expected exactly 1 active ROOT_DISK_THRESHOLD definition, found $match_count: $threshold_defs" >&2
+            echo "FATAL: Expected exactly 1 active ROOT_DISK_THRESHOLD definition in .env, found $match_count: $threshold_defs" >&2
             exit 1
           fi
 
           val=$(echo "$threshold_defs" | head -1 | cut -d= -f2)
-          echo "Current ROOT_DISK_THRESHOLD value: $val"
+          echo "Current .env ROOT_DISK_THRESHOLD value: $val"
           if [ "$val" != "50" ]; then
-            echo "FATAL: Current ROOT_DISK_THRESHOLD is '$val', expected exactly '50'" >&2
+            echo "FATAL: Current .env ROOT_DISK_THRESHOLD is '$val', expected exactly '50'" >&2
+            exit 1
+          fi
+
+          # Inspect effective ROOT_DISK_THRESHOLD from current active process environment (/proc/<pid>/environ)
+          proc_thresh_defs=$(_sudo sh -c '
+            pid="$1"
+            tr "\0" "\n" < "/proc/$pid/environ" 2>/dev/null | awk -F= "
+              !/^[[:space:]]*(#|$)/ && NF >= 2 {
+                k = \$1; sub(/^[[:space:]]+/, \"\", k); sub(/[[:space:]]+$/, \"\", k);
+                v = substr(\$0, index(\$0, \"=\") + 1); sub(/^[[:space:]]+/, \"\", v); sub(/[[:space:]]+$/, \"\", v);
+                gsub(/^[\"'"'"']|[\"'"'"']$/, \"\", v);
+                if (k == \"ROOT_DISK_THRESHOLD\") {
+                  print v;
+                }
+              }
+            "
+          ' -- "$initial_pid" || true)
+
+          proc_thresh_count=$(echo "$proc_thresh_defs" | grep -c . || true)
+          echo "Found active ROOT_DISK_THRESHOLD definitions in process environment: $proc_thresh_count"
+          if [ "$proc_thresh_count" -ne 1 ]; then
+            echo "FATAL: Expected exactly 1 active ROOT_DISK_THRESHOLD definition in process environment, found $proc_thresh_count" >&2
+            exit 1
+          fi
+
+          proc_thresh_val=$(echo "$proc_thresh_defs" | head -1)
+          echo "Effective current process ROOT_DISK_THRESHOLD: $proc_thresh_val"
+          if [ "$proc_thresh_val" != "50" ]; then
+            echo "FATAL: Effective current process ROOT_DISK_THRESHOLD is '$proc_thresh_val', expected exactly '50'" >&2
             exit 1
           fi
 
@@ -564,7 +662,7 @@ jobs:
               # Allowlisted extraction of ROOT_DISK_THRESHOLD from /proc/<pid>/environ without dumping environment
               rb_proc_val=$(_sudo sh -c '
                 pid="$1"
-                tr "\0" "\n" < "/proc/$pid/environ" 2>/dev/null | awk -F= "$1 == \"ROOT_DISK_THRESHOLD\" { print \$2; exit }"
+                tr "\0" "\n" < "/proc/$pid/environ" 2>/dev/null | awk -F= "\$1 == \"ROOT_DISK_THRESHOLD\" { print \$2; exit }"
               ' -- "$rb_pid" 2>/dev/null || echo 'UNKNOWN')
 
               echo "Rollback Verification:"
@@ -730,7 +828,7 @@ jobs:
           # c. Mandatory process environment verification from /proc/<pid>/environ (allowlisted extraction only)
           proc_env_val=$(_sudo sh -c '
             pid="$1"
-            tr "\0" "\n" < "/proc/$pid/environ" | awk -F= "$1 == \"ROOT_DISK_THRESHOLD\" { print \$2; exit }"
+            tr "\0" "\n" < "/proc/$pid/environ" | awk -F= "\$1 == \"ROOT_DISK_THRESHOLD\" { print \$2; exit }"
           ' -- "$new_pid")
           echo "Target process environment ROOT_DISK_THRESHOLD: ${proc_env_val:-MISSING}"
           if [ -z "$proc_env_val" ] || [ "$proc_env_val" != "80" ]; then

@@ -238,60 +238,111 @@ jobs:
 
       - name: "3. Fail-Closed Preflight: Root-vs-Data Scope Gate (DATA_PARTITIONS)"
         timeout-minutes: 2
+        env:
+          SUDO_PASSWORD: ${{ secrets.SUDO_PASSWORD }}
         run: |
           set -euo pipefail
           echo "=== 3. PREFLIGHT: ROOT-VS-DATA SCOPE GATE ==="
           env_file="/var/www/madeena-server-monitor/.env"
-          if [ ! -r "$env_file" ]; then
-            echo "FATAL: Authoritative .env not readable: $env_file" >&2
+
+          _sudo() {
+            if [ -n "${SUDO_PASSWORD:-}" ]; then
+              printf '%s\n' "$SUDO_PASSWORD" | sudo -S -p '' -- "$@" 2>/dev/null
+            else
+              sudo -n "$@" 2>/dev/null
+            fi
+          }
+
+          if ! _sudo test -f "$env_file"; then
+            echo "FATAL: Authoritative .env does not exist: $env_file" >&2
             exit 1
           fi
 
-          # 1. Allowlisted parse of DATA_PARTITIONS in .env without dumping file
-          data_part_env_line=$(grep -E '^[[:space:]]*DATA_PARTITIONS=' "$env_file" || true)
-          env_dp_present="false"
-          env_dp_val=""
-          if [ -n "$data_part_env_line" ]; then
+          # 1. Privileged allowlisted parse of DATA_PARTITIONS in .env without dumping file
+          # Count active definitions and check emptiness without exposing actual partition values
+          env_dp_audit=$(_sudo sh -c '
+            f="$1"
+            awk -F= "
+              !/^[[:space:]]*(#|$)/ && NF >= 2 {
+                k = \$1; sub(/^[[:space:]]+/, \"\", k); sub(/[[:space:]]+$/, \"\", k);
+                v = substr(\$0, index(\$0, \"=\") + 1); sub(/^[[:space:]]+/, \"\", v); sub(/[[:space:]]+$/, \"\", v);
+                gsub(/^[\"'"'"']|[\"'"'"']$/, \"\", v);
+                if (k == \"DATA_PARTITIONS\") {
+                  count++
+                  if (v == \"\") empty_count++
+                }
+              }
+              END {
+                printf \"count=%d\nempty_count=%d\n\", count, empty_count
+              }
+            " "$f"
+          ' -- "$env_file")
+
+          env_dp_count=$(printf '%s\n' "$env_dp_audit" | awk -F= '$1=="count"{print $2}')
+          env_dp_empty_count=$(printf '%s\n' "$env_dp_audit" | awk -F= '$1=="empty_count"{print $2}')
+
+          if [ "$env_dp_count" -eq 0 ]; then
+            env_dp_present="false"
+            env_dp_empty="true"
+          elif [ "$env_dp_count" -eq 1 ]; then
             env_dp_present="true"
-            raw_val=$(printf '%s\n' "$data_part_env_line" | head -1 | cut -d= -f2-)
-            env_dp_val=$(printf '%s\n' "$raw_val" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e 's/^["']//' -e 's/["']$//')
+            if [ "$env_dp_empty_count" -eq 1 ]; then
+              env_dp_empty="true"
+            else
+              env_dp_empty="false"
+            fi
+          else
+            echo "FATAL: Ambiguous configuration: multiple ($env_dp_count) active DATA_PARTITIONS definitions in .env" >&2
+            exit 1
           fi
 
           # 2. Allowlisted parse of DATA_PARTITIONS in direct systemd Environment
           raw_direct_env=$(systemctl show madeena-monitor.service -p Environment --value 2>/dev/null || true)
           direct_dp_present="false"
-          direct_dp_val=""
+          direct_dp_empty="true"
           if [ -n "$raw_direct_env" ]; then
-            direct_dp_match=$(printf '%s\n' "$raw_direct_env" | awk -v RS='[[:space:]]+' -F= '
+            direct_dp_audit=$(printf '%s\n' "$raw_direct_env" | awk -v RS='[[:space:]]+' -F= '
               $1 == "DATA_PARTITIONS" {
-                v = substr($0, index($0, "=") + 1);
-                gsub(/^["']|["']$/, "", v);
-                print v;
-                exit;
+                count++
+                v = substr($0, index($0, "=") + 1)
+                gsub(/^["'\''"]|["'\''"]$/, "", v)
+                sub(/^[[:space:]]+/, "", v); sub(/[[:space:]]+$/, "", v)
+                if (v == "") empty_count++
+              }
+              END {
+                printf "count=%d\nempty_count=%d\n", count, empty_count
               }
             ' || true)
-            if [ -n "$direct_dp_match" ]; then
+
+            dir_count=$(printf '%s\n' "$direct_dp_audit" | awk -F= '$1=="count"{print $2}')
+            dir_empty_count=$(printf '%s\n' "$direct_dp_audit" | awk -F= '$1=="empty_count"{print $2}')
+
+            if [ "${dir_count:-0}" -gt 0 ]; then
               direct_dp_present="true"
-              direct_dp_val=$(printf '%s\n' "$direct_dp_match" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+              if [ "${dir_empty_count:-0}" -eq "${dir_count:-0}" ]; then
+                direct_dp_empty="true"
+              else
+                direct_dp_empty="false"
+              fi
             fi
           fi
 
-          echo "EnvironmentFile DATA_PARTITIONS present: $env_dp_present"
-          echo "Direct systemd Environment DATA_PARTITIONS present: $direct_dp_present"
+          echo "EnvironmentFile DATA_PARTITIONS present=$env_dp_present empty=$env_dp_empty"
+          echo "Direct Environment DATA_PARTITIONS present=$direct_dp_present empty=$direct_dp_empty"
 
-          # 3. Check for ambiguity / dual definition
+          # 3. Check for ambiguity / dual definition (even if both are empty)
           if [ "$env_dp_present" = "true" ] && [ "$direct_dp_present" = "true" ]; then
-            echo "FATAL: Ambiguous DATA_PARTITIONS configuration: defined in both .env and direct systemd Environment" >&2
+            echo "FATAL: Ambiguous DATA_PARTITIONS configuration: defined in both .env and direct systemd Environment. Halting before mutation." >&2
             exit 1
           fi
 
           # 4. Fail-closed if either source defines a non-empty value
-          if [ "$env_dp_present" = "true" ] && [ -n "$env_dp_val" ]; then
-            echo "FATAL: DATA_PARTITIONS is configured in .env with non-empty value: '$env_dp_val'. Halting before mutation to prevent affecting data partitions." >&2
+          if [ "$env_dp_present" = "true" ] && [ "$env_dp_empty" = "false" ]; then
+            echo "FATAL: DATA_PARTITIONS is non-empty; root-only threshold mutation is out of scope" >&2
             exit 1
           fi
-          if [ "$direct_dp_present" = "true" ] && [ -n "$direct_dp_val" ]; then
-            echo "FATAL: DATA_PARTITIONS is configured in direct systemd Environment with non-empty value: '$direct_dp_val'. Halting before mutation to prevent affecting data partitions." >&2
+          if [ "$direct_dp_present" = "true" ] && [ "$direct_dp_empty" = "false" ]; then
+            echo "FATAL: DATA_PARTITIONS is non-empty; root-only threshold mutation is out of scope" >&2
             exit 1
           fi
 
@@ -300,22 +351,35 @@ jobs:
 
       - name: "4. Fail-Closed Preflight: Threshold State & Single-Definition Gate"
         timeout-minutes: 2
+        env:
+          SUDO_PASSWORD: ${{ secrets.SUDO_PASSWORD }}
         run: |
           set -euo pipefail
           echo "=== 4. PREFLIGHT: THRESHOLD STATE & SINGLE-DEFINITION GATE ==="
           env_file="/var/www/madeena-server-monitor/.env"
 
-          # Parse strictly through allowlist without dumping .env
-          threshold_defs=$(awk -F= '
-            !/^[[:space:]]*(#|$)/ && NF >= 2 {
-              k = $1; sub(/^[[:space:]]+/, "", k); sub(/[[:space:]]+$/, "", k);
-              v = substr($0, index($0, "=") + 1); sub(/^[[:space:]]+/, "", v); sub(/[[:space:]]+$/, "", v);
-              gsub(/^["']|["']$/, "", v);
-              if (k == "ROOT_DISK_THRESHOLD") {
-                print k "=" v;
+          _sudo() {
+            if [ -n "${SUDO_PASSWORD:-}" ]; then
+              printf '%s\n' "$SUDO_PASSWORD" | sudo -S -p '' -- "$@" 2>/dev/null
+            else
+              sudo -n "$@" 2>/dev/null
+            fi
+          }
+
+          # Privileged parse strictly through allowlist without dumping .env
+          threshold_defs=$(_sudo sh -c '
+            f="$1"
+            awk -F= "
+              !/^[[:space:]]*(#|$)/ && NF >= 2 {
+                k = \$1; sub(/^[[:space:]]+/, \"\", k); sub(/[[:space:]]+$/, \"\", k);
+                v = substr(\$0, index(\$0, \"=\") + 1); sub(/^[[:space:]]+/, \"\", v); sub(/[[:space:]]+$/, \"\", v);
+                gsub(/^[\"'"'"']|[\"'"'"']$/, \"\", v);
+                if (k == \"ROOT_DISK_THRESHOLD\") {
+                  print k \"=\" v;
+                }
               }
-            }
-          ' "$env_file" || true)
+            " "$f"
+          ' -- "$env_file" || true)
 
           match_count=$(echo "$threshold_defs" | grep -c . || true)
           echo "Found active ROOT_DISK_THRESHOLD definitions: $match_count"
@@ -332,15 +396,18 @@ jobs:
           fi
 
           # Verify no conflicting disallowlisted alternate disk threshold keys exist
-          conflicting_defs=$(awk -F= '
-            !/^[[:space:]]*(#|$)/ && NF >= 2 {
-              k = $1; sub(/^[[:space:]]+/, "", k); sub(/[[:space:]]+$/, "", k);
-              uk = toupper(k);
-              if (uk != "ROOT_DISK_THRESHOLD" && uk ~ /DISK/ && (uk ~ /THRESHOLD/ || uk ~ /CRITICAL/)) {
-                print k;
+          conflicting_defs=$(_sudo sh -c '
+            f="$1"
+            awk -F= "
+              !/^[[:space:]]*(#|$)/ && NF >= 2 {
+                k = \$1; sub(/^[[:space:]]+/, \"\", k); sub(/[[:space:]]+$/, \"\", k);
+                uk = toupper(k);
+                if (uk != \"ROOT_DISK_THRESHOLD\" && uk ~ /DISK/ && (uk ~ /THRESHOLD/ || uk ~ /CRITICAL/)) {
+                  print k;
+                }
               }
-            }
-          ' "$env_file" || true)
+            " "$f"
+          ' -- "$env_file" || true)
           if [ -n "$conflicting_defs" ]; then
             echo "FATAL: Conflicting alternate disk threshold definitions found: $conflicting_defs" >&2
             exit 1
@@ -440,7 +507,26 @@ jobs:
             local exit_code=$?
             trap - EXIT ERR INT TERM
 
-            if [ "$mutation_applied" = "true" ]; then
+            # Determine whether mutation occurred using both flag and safe inspect of current .env
+            local current_val
+            current_val=$(_sudo sh -c '
+              f="$1"
+              awk -F= "
+                !/^[[:space:]]*(#|$)/ && NF >= 2 {
+                  k = \$1; sub(/^[[:space:]]+/, \"\", k); sub(/[[:space:]]+$/, \"\", k);
+                  v = substr(\$0, index(\$0, \"=\") + 1); sub(/^[[:space:]]+/, \"\", v); sub(/[[:space:]]+$/, \"\", v);
+                  gsub(/^[\"'"'"']|[\"'"'"']$/, \"\", v);
+                  if (k == \"ROOT_DISK_THRESHOLD\") print v;
+                }
+              " "$f"
+            ' -- "$env_file" 2>/dev/null || echo 'UNKNOWN')
+
+            local needs_rollback="false"
+            if [ "$mutation_applied" = "true" ] || [ "$current_val" = "80" ]; then
+              needs_rollback="true"
+            fi
+
+            if [ "$needs_rollback" = "true" ]; then
               echo "=== IN-PROCESS ROLLBACK TRIGGERED (Exit code: $exit_code) ==="
               local rollback_ok="true"
 
@@ -463,38 +549,62 @@ jobs:
               rb_pid=$(systemctl show madeena-monitor.service -p MainPID --value 2>/dev/null || echo '0')
               rb_exe=$(readlink -f "/proc/$rb_pid/exe" 2>/dev/null || echo '')
               rb_cwd=$(readlink -f "/proc/$rb_pid/cwd" 2>/dev/null || echo '')
-              rb_val=$(_sudo awk -F= '
-                !/^[[:space:]]*(#|$)/ && NF >= 2 {
-                  k = $1; sub(/^[[:space:]]+/, "", k); sub(/[[:space:]]+$/, "", k);
-                  v = substr($0, index($0, "=") + 1); sub(/^[[:space:]]+/, "", v); sub(/[[:space:]]+$/, "", v);
-                  gsub(/^["']|["']$/, "", v);
-                  if (k == "ROOT_DISK_THRESHOLD") print v;
-                }
-              ' "$env_file" || echo 'UNKNOWN')
+              rb_val=$(_sudo sh -c '
+                f="$1"
+                awk -F= "
+                  !/^[[:space:]]*(#|$)/ && NF >= 2 {
+                    k = \$1; sub(/^[[:space:]]+/, \"\", k); sub(/[[:space:]]+$/, \"\", k);
+                    v = substr(\$0, index(\$0, \"=\") + 1); sub(/^[[:space:]]+/, \"\", v); sub(/[[:space:]]+$/, \"\", v);
+                    gsub(/^[\"'"'"']|[\"'"'"']$/, \"\", v);
+                    if (k == \"ROOT_DISK_THRESHOLD\") print v;
+                  }
+                " "$f"
+              ' -- "$env_file" 2>/dev/null || echo 'UNKNOWN')
+
+              # Allowlisted extraction of ROOT_DISK_THRESHOLD from /proc/<pid>/environ without dumping environment
+              rb_proc_val=$(_sudo sh -c '
+                pid="$1"
+                tr "\0" "\n" < "/proc/$pid/environ" 2>/dev/null | awk -F= "$1 == \"ROOT_DISK_THRESHOLD\" { print \$2; exit }"
+              ' -- "$rb_pid" 2>/dev/null || echo 'UNKNOWN')
 
               echo "Rollback Verification:"
               echo "  ActiveState: $rb_state"
               echo "  MainPID: $rb_pid"
               echo "  /proc/<pid>/exe: $rb_exe"
               echo "  /proc/<pid>/cwd: $rb_cwd"
-              echo "  ROOT_DISK_THRESHOLD: $rb_val"
+              echo "  .env ROOT_DISK_THRESHOLD: $rb_val"
+              echo "  /proc/<pid>/environ ROOT_DISK_THRESHOLD: $rb_proc_val"
 
-              if [ "$rb_state" != "active" ] || [ "$rb_pid" = "0" ] || [ "$rb_exe" != "/var/www/madeena-server-monitor/monitor" ] || [ "$rb_cwd" != "/var/www/madeena-server-monitor" ] || [ "$rb_val" != "50" ]; then
+              if [ "$rb_state" != "active" ] || [ "$rb_pid" = "0" ] || [ "$rb_exe" != "/var/www/madeena-server-monitor/monitor" ] || [ "$rb_cwd" != "/var/www/madeena-server-monitor" ] || [ "$rb_val" != "50" ] || [ "$rb_proc_val" != "50" ]; then
                 rollback_ok="false"
               fi
 
               if [ "$rollback_ok" = "true" ]; then
                 echo "Rollback state verified: Original configuration and service restored."
+                if [ -n "${backup_dir:-}" ] && _sudo test -d "$backup_dir"; then
+                  _sudo rm -rf "$backup_dir" || true
+                fi
               else
-                echo "FATAL: ROLLBACK FAILED! Manual operational intervention required." >&2
+                echo "ROLLBACK FAILED — SECURE RECOVERY BACKUP PRESERVED" >&2
+                echo "Recovery backup location: $backup_file" >&2
+                if [ -n "${backup_dir:-}" ] && _sudo test -d "$backup_dir"; then
+                  _sudo chmod 700 "$backup_dir" || true
+                fi
+                if [ -n "${backup_file:-}" ] && _sudo test -f "$backup_file"; then
+                  _sudo chmod 600 "$backup_file" || true
+                fi
               fi
             else
-              echo "Transaction ended before mutation: No service restart or file restoration required."
-            fi
-
-            # Clean up backup directory if it exists
-            if [ -n "${backup_dir:-}" ] && _sudo test -d "$backup_dir"; then
-              _sudo rm -rf "$backup_dir" || true
+              if [ "$current_val" = "50" ]; then
+                echo "Transaction ended before mutation: No service restart or file restoration required."
+                if [ -n "${backup_dir:-}" ] && _sudo test -d "$backup_dir"; then
+                  _sudo rm -rf "$backup_dir" || true
+                fi
+              else
+                echo "FATAL: Ambiguous pre-mutation state (current_val=$current_val); preserving backup directory." >&2
+                echo "ROLLBACK FAILED — SECURE RECOVERY BACKUP PRESERVED" >&2
+                echo "Recovery backup location: $backup_file" >&2
+              fi
             fi
 
             exit "$exit_code"
@@ -526,9 +636,9 @@ jobs:
           _sudo chown "$orig_uid:$orig_gid" "$tmp_file"
           _sudo chmod "$orig_mode" "$tmp_file"
 
-          # 4. Line count parity check
-          orig_lines=$(_sudo wc -l < "$env_file")
-          tmp_lines=$(_sudo wc -l < "$tmp_file")
+          # 4. Line count parity check (inside privileged process)
+          orig_lines=$(_sudo sh -c 'wc -l < "$1"' -- "$env_file")
+          tmp_lines=$(_sudo sh -c 'wc -l < "$1"' -- "$tmp_file")
           if [ "$orig_lines" -ne "$tmp_lines" ]; then
             echo "FATAL: Line count mismatch between original ($orig_lines) and transformed ($tmp_lines)" >&2
             exit 1
@@ -599,15 +709,18 @@ jobs:
             exit 1
           fi
 
-          # b. Verify .env file content: ROOT_DISK_THRESHOLD=80 exactly
-          env_val=$(_sudo awk -F= '
-            !/^[[:space:]]*(#|$)/ && NF >= 2 {
-              k = $1; sub(/^[[:space:]]+/, "", k); sub(/[[:space:]]+$/, "", k);
-              v = substr($0, index($0, "=") + 1); sub(/^[[:space:]]+/, "", v); sub(/[[:space:]]+$/, "", v);
-              gsub(/^["']|["']$/, "", v);
-              if (k == "ROOT_DISK_THRESHOLD") print v;
-            }
-          ' "$env_file" || echo 'UNKNOWN')
+          # b. Verify .env file content: ROOT_DISK_THRESHOLD=80 exactly (inside privileged process)
+          env_val=$(_sudo sh -c '
+            f="$1"
+            awk -F= "
+              !/^[[:space:]]*(#|$)/ && NF >= 2 {
+                k = \$1; sub(/^[[:space:]]+/, \"\", k); sub(/[[:space:]]+$/, \"\", k);
+                v = substr(\$0, index(\$0, \"=\") + 1); sub(/^[[:space:]]+/, \"\", v); sub(/[[:space:]]+$/, \"\", v);
+                gsub(/^[\"'"'"']|[\"'"'"']$/, \"\", v);
+                if (k == \"ROOT_DISK_THRESHOLD\") print v;
+              }
+            " "$f"
+          ' -- "$env_file" || echo 'UNKNOWN')
           echo "Verified .env ROOT_DISK_THRESHOLD: $env_val"
           if [ "$env_val" != "80" ]; then
             echo "FATAL: .env ROOT_DISK_THRESHOLD is '$env_val', expected '80'" >&2

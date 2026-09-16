@@ -1,14 +1,14 @@
 ---
-title: Update Madeena Server Root-Filesystem Disk-Alert Threshold to 80%
+title: Update Madeena Server Disk-Alert Threshold to 80% (Unified Root and Data Partitions)
 document_id: AGENT-TASK-ADMIN-INFRA-003
-version: 1.1
+version: 2.0
 status: Validated/Published
 language: en-US
-last_updated: 2026-09-15
+last_updated: 2026-09-16
 scope:
-  - root filesystem disk-usage critical alert threshold configuration
-  - identification and update of alert threshold from 50% to 80%
-  - verification via authorized GitHub Actions diagnostic workflow
+  - disk-usage critical alert threshold configuration update from 50% to 80%
+  - unified threshold applicable to root filesystem (/) and configured DATA_PARTITIONS via shared ROOT_DISK_THRESHOLD
+  - verification via authorized GitHub Actions diagnostic/mutation workflow
   - boundary classification between local execution environment and Madeena production host
 authority_note: A published validated task authorizes only the bounded implementation scope explicitly defined by the task and applicable approved repository authority. Observed repository evidence governs claims about current implementation reality but does not silently redefine the task or its intended authority.
 ---
@@ -24,7 +24,7 @@ A task is not a generic coding recipe. Implementation technique remains the Exec
 ## Task identity
 
 **Task title:**  
-Update Madeena Server Root-Filesystem Disk-Alert Threshold to 80%
+Update Madeena Server Disk-Alert Threshold to 80% (Unified Root and Data Partitions)
 
 **Task path:**  
 `.agents/tasks/update-server-disk-alert-threshold.md`
@@ -41,28 +41,43 @@ A lifecycle-status update MUST NOT silently replace the immutable task revision 
 When remediation materially changes this executable contract, edit the same stable task path, return it to Draft as needed, and republish it as a new immutable governing task revision before renewed execution.
 
 **Delivery objective / Work Package / MVP:**  
-Work Package 03 — Server Monitoring & Root-Filesystem Disk Alert Threshold Adjustment (50% -> 80%)
+Work Package 03 — Server Monitoring & Unified Disk Alert Threshold Adjustment (50% -> 80%)
 
 **Owner / designated planning authority:**  
 Designated Human Authority / Repository Planner
 
 ## Delivery context
 
-Operational monitoring on the Madeena server currently triggers critical alerts when the root filesystem (`/`) disk usage reaches 50%.
+Operational monitoring on the Madeena server currently triggers critical alerts when disk usage reaches 50%.
 
-The designated operational authority has requested raising this critical-alert threshold from the observed 50% to 80% to avoid premature and noisy alerts, while maintaining appropriate warning headroom for server operations.
+The designated human authority has clarified and approved that the existing shared Madeena disk-alert threshold shall become 80% for BOTH:
+1. the root filesystem (`/`); and
+2. all configured `DATA_PARTITIONS` monitored by `madeena-monitor.service`.
 
-Repository inspection across the `admin-infra` Git repository (`305f223281040f3c3dbec3833b596314d2dd0d99`) confirms that no disk monitoring alert scripts, cron jobs, or threshold definitions are tracked in this Git repository. Workflows in `.github/workflows/` (such as `server-debug.yml`) inspect disk usage and check for an 80% threshold for audit reports, but do not emit recurring push/webhook alerts.
+This supersedes the earlier requirement that non-root filesystem thresholds must remain unchanged. No separate `DATA_DISK_THRESHOLD` is required. The active monitor binary (`Madeena-software/madeena-server-monitor`) uses `RootDiskThreshold` for both root `/` and configured `DATA_PARTITIONS`, evaluating critical alerts with `>=`. Thus, updating `ROOT_DISK_THRESHOLD=50` to `ROOT_DISK_THRESHOLD=80` in the authoritative environment file achieves the desired unified behavior without modifying or recompiling the monitor binary.
+
+### Established Production Facts (Discovered & Verified)
+- **Active Monitor Service:** `madeena-monitor.service`
+- **Executable:** `/var/www/madeena-server-monitor/monitor`
+- **Working Directory:** `/var/www/madeena-server-monitor`
+- **EnvironmentFile Authority:** `/var/www/madeena-server-monitor/.env`
+- **Current Effective Disk Threshold:** `ROOT_DISK_THRESHOLD=50`
+- **Configured Partitions:** Production has non-empty `DATA_PARTITIONS` both in `.env` and in the active process environment (`/proc/<pid>/environ`).
+- **Binary Provenance:** Go build metadata verifies module `github.com/Madeena-software/madeena-server-monitor` at commit `a9be2681f07e9f5cea45de6b51f39b20f929dc1f` with `vcs.modified=false`.
+- **Comparator Semantics:** Active monitor evaluates critical condition as `usage >= threshold`.
+
+### Recorded Production Run 35046824964
+Production run `35046824964` was an authorized production workflow dispatch on revision `dcbd564f3c3659412673f280ff9a51edf7cb9598`. It executed exactly once, verified service authority, confirmed binary provenance, detected effective non-empty `DATA_PARTITIONS`, and intentionally failed closed in Preflight 3 according to the earlier root-only contract. It performed zero configuration mutations, zero service restarts, and required no rollback because no transaction began. Run `35046824964` MUST NOT be retried; any subsequent production workflow dispatch requires new explicit human approval.
 
 ### Execution & Environment Boundary Clarification
-- **Antigravity Local Shell ≠ Madeena Production Server:** The Madeena production server is not directly accessible through the local Antigravity execution shell. The shell environment is local execution-environment evidence only. The absence of cron jobs or monitoring scripts in the local shell does not imply absence on the production server. Do not use ordinary local-shell `df`, `systemctl`, `crontab`, `ps`, or `find` results as production evidence.
-- **Production Access Control Plane:** Production access is mediated strictly through repository-authorized GitHub Actions workflows running on `[self-hosted, linux, x64, production]`. A workflow job running on `[self-hosted, linux, x64, production]` provides truthful production evidence only when the actual dispatched job is verified to execute on the intended production runner.
-- **Diagnostic Discovery Requirement:** Determining the exact production monitoring implementation requires running an authorized non-destructive diagnostic workflow via GitHub Actions.
+- **Antigravity Local Shell ≠ Madeena Production Server:** The Madeena production server is not directly accessible through the local Antigravity execution shell. The shell environment provides local execution-environment evidence only.
+- **Production Access Control Plane:** Production access is mediated strictly through repository-authorized GitHub Actions workflows running on `[self-hosted, linux, x64, production]`.
+- **Diagnostic & Mutation Gating:** Workflow dispatch and production mutation require explicit designated human authorization.
 
 ## Baseline and task revision
 
 **Implementation baseline:**  
-`305f223281040f3c3dbec3833b596314d2dd0d99`
+`dcbd564f3c3659412673f280ff9a51edf7cb9598`
 
 **Task revision:**  
 `established upon commit and reported externally`
@@ -79,131 +94,153 @@ The immutable revision is supplied externally by version-control history and rep
 
 ## Objective
 
-Change the Madeena production root-filesystem (`/`) critical disk-alert threshold from the currently observed 50% to 80% (locating the source configuration/script via authorized non-destructive GitHub Actions diagnostic execution on the production runner, updating the threshold value from 50% to 80%, and verifying that the 80% threshold is active without disrupting existing server workloads).
+Change the critical disk-usage alert threshold from 50% to 80% for every filesystem currently monitored through the shared `ROOT_DISK_THRESHOLD` mechanism of `madeena-monitor.service`, including the root filesystem (`/`) and configured `DATA_PARTITIONS`, while preserving all unrelated monitoring and server behavior.
 
 ## Authoritative inputs
 
 ### Governing authority
 
-- User Operational Request / Instruction: "Change the Madeena server root-filesystem disk-usage critical-alert threshold from the currently observed 50% to 80%."
-- Execution Clarification: Production access boundary, diagnostic workflow gating, production mutation gating, and background task timeout policy.
+- User Operational Directive & Requirement Clarification: "It is acceptable and intended for the existing shared Madeena disk-alert threshold to become 80% for BOTH root filesystem / and all configured DATA_PARTITIONS monitored by madeena-monitor.service."
+- Verified Production Run Evidence: Run `35046824964` establishing active service, executable, EnvironmentFile, binary provenance (`a9be2681f07e9f5cea45de6b51f39b20f929dc1f`), and non-empty `DATA_PARTITIONS`.
+- Monitor Source Architecture: `Madeena-software/madeena-server-monitor` uses `RootDiskThreshold` for both root and data partition evaluations.
 - Repository AI Delivery Contract: `.agents/AGENTS.md`
 - Normative Software Delivery Protocol: `.agents/software-workflow.md`
 - Repository Orientation Map: `.agents/context/project.md`
 
 ### Requirement traceability
 
-- `REQ-INFRA-ALERT-001` (Threshold update 50% -> 80%) → Human Operational Directive
-- `REQ-INFRA-RUNNER-BOUNDARY` (Production mediation via GitHub Actions) → Execution Clarification
+- `REQ-INFRA-ALERT-001` (Unified threshold update 50% -> 80% for root and data partitions) → Human Operational Directive
+- `REQ-INFRA-RUNNER-BOUNDARY` (Production mediation strictly via GitHub Actions) → Execution Clarification
 - `REQ-INFRA-EXEC-TIMEOUT` (Background task timeout policy: 5 min diagnostic / 15 min build) → Execution Clarification
+- `REQ-INFRA-NO-SOURCE-CHANGE` (Preserve monitor binary and source without new abstractions) → Human Clarification & Architecture Authority
 
 ## Scope
 
 ### In scope
 
-- Identification of the active disk-usage alert mechanism on the Madeena production host using authorized non-destructive GitHub Actions workflow execution on `[self-hosted, linux, x64, production]`.
-- Updating the critical alert threshold configuration or script from 50% to 80% for the root filesystem (`/`) following explicit production-action authorization.
-- Automated non-destructive verification that the threshold is configured to 80% and that alert evaluation logic behaves as expected.
-- Documenting the exact monitoring mechanism, file path, and operational configuration discovered.
+- Updating the critical alert threshold configuration `ROOT_DISK_THRESHOLD=50` to `ROOT_DISK_THRESHOLD=80` in the authoritative production EnvironmentFile (`/var/www/madeena-server-monitor/.env`) via authorized transactional workflow execution.
+- Raising the effective alert threshold from 50% to 80% for the root filesystem (`/`).
+- Raising the effective alert threshold from 50% to 80% for all configured `DATA_PARTITIONS` through the existing shared threshold mechanism.
+- Updating workflow preflight and verification logic in `server-debug.yml` to permit non-empty `DATA_PARTITIONS`, verifying its configuration consistency and immutability via a safe non-secret digest/count fingerprint.
+- Restart of only `madeena-monitor.service`.
+- Verification that the restarted process uses `ROOT_DISK_THRESHOLD=80`, retains the exact pre-change `DATA_PARTITIONS` fingerprint, and that the service remains active.
+- Deterministic synthetic comparator verification (`79.9 < 80` not critical, `80.0 >= 80` critical, `80.1 >= 80` critical).
 
 ### Out of scope
 
-- Direct production shell access from the local environment bypassing GitHub Actions.
-- Inbound SSH access or alternative backdoor access to the production host.
-- Altering thresholds for other filesystems or mounts (e.g., `/media/nextcloud-data` HDD mount).
-- Modifying runner pool configurations, application containers, or unrelated workflows.
-- Workflow dispatch without explicit human authorization.
-- Production modification without explicit review and approval following discovery.
+- Modifying `Madeena-software/madeena-server-monitor` source code.
+- Introducing a separate `DATA_DISK_THRESHOLD` variable.
+- Rebuilding or deploying a new monitor binary.
+- Changing which `DATA_PARTITIONS` are configured or altering mount paths.
+- Changing CPU, RAM, or temperature thresholds.
+- Changing alert intervals, cooldown periods, alert recipients, or SMTP configuration.
+- Changing alert message semantics or formatting.
+- Modifying systemd service unit definitions (`madeena-monitor.service`).
+- Docker Swarm workload modifications (`simama`, `madeena_cp`).
+- GitHub Actions runner service pool modifications (`actions-runner-madeena-devops*`).
+- SSD or HDD storage cleanup, file deletion, log rotation, cache pruning, or disk migration.
+- Direct production SSH access or alternative bypasses from the local environment.
 
 ### Preserved behavior
 
-- Inbound SSH remains disabled / prohibited as a control mechanism.
-- Docker Swarm stacks (`simama`, `madeena_cp`) and runner services (`actions-runner-madeena-devops*`) must not be disrupted.
-- Preserve the existing production alert delivery channel(s), recipients, message semantics, and scheduling behavior actually discovered during production inspection, unless a directly necessary change is explicitly authorized by the governing task.
+- Exact `DATA_PARTITIONS` configuration and content.
+- Monitor executable (`/var/www/madeena-server-monitor/monitor`).
+- Service WorkingDirectory (`/var/www/madeena-server-monitor`).
+- Service EnvironmentFile authority (`/var/www/madeena-server-monitor/.env`).
+- Inbound SSH remains disabled as a control mechanism.
+- Alert recipients and SMTP configuration.
+- CPU, RAM, and temperature alert thresholds.
+- Alert evaluation intervals and cooldown behavior.
+- Comparator semantics (`usage >= threshold`).
+- Docker Swarm workloads and production runner services.
+- All unrelated `.env` values.
 
 ## Dependencies and assumptions
 
 ### Dependencies
 
-- Execution of diagnostic and modification steps requires workflow execution on self-hosted runners labelled `[self-hosted, linux, x64, production]`.
-- GitHub Actions workflow dispatch authorization from the repository owner / human authority.
+- Workflow execution on self-hosted runner labeled `[self-hosted, linux, x64, production]`.
+- Explicit human approval required before any GitHub Actions workflow dispatch.
 
 ### Approved assumptions
 
-- The active monitoring implementation has not yet been identified. Possible implementation mechanisms (cron job, systemd timer/service, containerized monitor, external webhook, etc.) may be investigated, but none is authoritative until verified through production-runner evidence.
-- The intended critical alert threshold for the root filesystem is 80% as authorized by human directive. Whether the discovered implementation can safely realize that value must be verified during execution.
-- Workflows verified to execute on `runs-on: [self-hosted, linux, x64, production]` provide truthful production-server evidence.
+- The active monitor binary (`a9be2681f07e9f5cea45de6b51f39b20f929dc1f`) applies `RootDiskThreshold` to all configured filesystems; changing `ROOT_DISK_THRESHOLD` in `.env` to 80 uniformly adjusts critical evaluation for root `/` and all configured `DATA_PARTITIONS`.
+- Non-empty `DATA_PARTITIONS` in production is expected and intended to evaluate against 80%.
+- Workflows running on `[self-hosted, linux, x64, production]` provide truthful production-server evidence.
 
 ### Remaining approval requirements
 
-- **Designated Human Approval required before diagnostic workflow dispatch:** Production diagnostic execution is required, but workflow dispatch is NOT authorized by default. Before any dispatch:
-  1. Identify the exact workflow file.
-  2. Identify the exact job and steps intended to execute.
-  3. Demonstrate that the steps are strictly non-destructive.
-  4. Identify any secrets/permissions used (without exposing secret values).
-  5. Specify the exact production evidence to be collected.
-  6. Obtain explicit human approval before triggering dispatch.
-- **Designated Human Approval required before production modification:** Discovery of the monitor does not authorize changing it. After discovery, return:
-  1. Actual monitoring mechanism.
-  2. Exact production file, configuration, or service involved.
-  3. Current threshold representation.
-  4. Proposed smallest change to 80%.
-  5. Verification approach.
-  6. Operational risk.
-  7. Rollback/recovery method.
-  Planner/Reviewer will determine whether the task authorizes the change or whether explicit production-action authorization is required before applying the mutation.
+- **Designated Human Approval required before production workflow dispatch:** Every production workflow dispatch requires prior explicit human authorization.
+- **Production root usage gate:** If current root filesystem usage is already `>= 80%`, the workflow must abort before mutation to prevent activating a critical alert condition during configuration change.
 
 ## Required capabilities
 
-- Repository read and write (for tracking task and workflow files).
-- Local git inspection and shell execution within bounded timeouts.
+- Repository read and write (for workflow and task definitions).
+- Local Git inspection and shell execution within bounded timeouts.
 - GitHub Actions workflow inspection and dispatch (strictly subject to human approval).
 
 ## Execution constraints
 
 ### Constraints
 
-- Strict separation of environments: Local Antigravity shell outputs are local-environment evidence, not production evidence.
-- No direct external network mutation or SSH access from local shell.
-- Background process timeout policy:
-  - Exploration / diagnostic: default maximum 5 minutes.
-  - Tests / builds / validation: default maximum 15 minutes.
-  - A longer timeout must be technically justified and explicitly recorded.
-  - Track task/process ID, purpose, start time, timeout deadline, and terminal result.
-  - On timeout, terminate/cancel only Executor-owned processes safely, preserve partial evidence, report the timeout truthfully, and leave no orphaned processes.
-- Reuse existing diagnostic mechanisms (such as non-destructive audit jobs in `server-debug.yml` or safe workflow steps) rather than inventing unmanaged tools.
+- Separation of environments: Local Antigravity shell outputs are local evidence, not production evidence.
+- No direct network mutation or SSH access to production from the local shell.
+- Production workflow timeout policy: default maximum 10 minutes.
+- Transactional mutation with fail-closed rollback: any failure during preflight, mutation, restart, or verification must abort or revert `.env` to `ROOT_DISK_THRESHOLD=50` and ensure `madeena-monitor.service` is active.
+- Confidentiality: Do not log or expose raw partition paths, passwords, or secret values. Fingerprint `DATA_PARTITIONS` using safe metadata/hash/count.
+- Storage separation: SSD/HDD cleanup is a separate operational matter; this task authorizes zero file pruning or storage deletion.
 
 ## Acceptance criteria
 
-- [ ] The exact production mechanism emitting the 50% disk alert is identified and verified via production runner evidence.
-- [ ] The root-filesystem disk-usage critical alert threshold is updated from 50% to 80% following required approvals.
-- [ ] Non-destructive verification confirms that the alert script or service reads 80% as the critical threshold.
-- [ ] A representative/synthetic disk-usage value below 80% does not satisfy the disk critical condition, and a representative value meeting the configured critical boundary does satisfy it, according to the monitor's existing comparison semantics (evaluated safely via deterministic dry-run/unit test without manipulating production disk space or triggering alert storms).
-- [ ] Server services, Docker Swarm workloads, and runner pool remain undisturbed.
+- [ ] Exact production monitor authority remains verified (`madeena-monitor.service`, cwd `/var/www/madeena-server-monitor`, exec `/var/www/madeena-server-monitor/monitor`, EnvironmentFile `/var/www/madeena-server-monitor/.env`).
+- [ ] Binary provenance remains verified: module `github.com/Madeena-software/madeena-server-monitor`, revision `a9be2681f07e9f5cea45de6b51f39b20f929dc1f`, `vcs.modified=false`.
+- [ ] Before mutation, authoritative EnvironmentFile and active process environment both have `ROOT_DISK_THRESHOLD=50`.
+- [ ] Existing `DATA_PARTITIONS` configuration is detected and recorded via safe fingerprint (digest/count) without exposing raw values.
+- [ ] Production change modifies strictly `ROOT_DISK_THRESHOLD=50 -> 80` in `/var/www/madeena-server-monitor/.env`.
+- [ ] `DATA_PARTITIONS` content is unchanged across the transaction (post-change fingerprint equals pre-change fingerprint).
+- [ ] `madeena-monitor.service` restarts cleanly and is in `active` state.
+- [ ] New process environment reflects `ROOT_DISK_THRESHOLD=80`.
+- [ ] Root `/` evaluates against 80%.
+- [ ] Configured `DATA_PARTITIONS` evaluate against the shared 80% threshold.
+- [ ] Synthetic comparator verification proves:
+  - `79.9 < 80` -> not critical
+  - `80.0 >= 80` -> critical
+  - `80.1 >= 80` -> critical
+- [ ] No real disk filling or test-alert storm is performed.
+- [ ] No unrelated production configuration or service is modified.
+- [ ] If post-change verification fails, transactional rollback restores `ROOT_DISK_THRESHOLD=50` and restarts `madeena-monitor.service`.
 
 ## Verification requirements
 
 ### Required checks
 
-- Non-destructive diagnostic check on production runner to inspect crontabs, systemd units, container definitions, and custom monitoring scripts.
-- Post-change inspection of the identified file/configuration to confirm the 80% threshold string/logic.
-- Safe deterministic evaluation (dry-run or synthetic parameter test) of the alert logic verifying boundary behavior without triggering real alerts.
+- Preflight verification of service authority, binary provenance, and baseline threshold (`50`).
+- Safe fingerprint recording of `DATA_PARTITIONS` before mutation.
+- Current root filesystem disk usage check (`< 80%`).
+- Post-restart inspection of `.env` and `/proc/<new_pid>/environ` confirming `ROOT_DISK_THRESHOLD=80`.
+- Post-restart fingerprint verification confirming `DATA_PARTITIONS` identity.
+- Synthetic dry-run test of comparator semantics (`79.9`, `80.0`, `80.1`).
+- Verification that `madeena-monitor.service` is active and healthy.
 
 ### Required evidence
 
 The Executor MUST report:
-- Specific GitHub Actions workflow run ID, URL, and job output establishing production state.
-- Exact file path and line content of the threshold definition.
-- Diff or content change demonstrating the update to 80%.
-- Bounded execution log showing timeouts respected and no orphaned processes.
+- Specific GitHub Actions workflow run ID, URL, and execution log establishing production state.
+- Pre-mutation baseline values (`ROOT_DISK_THRESHOLD=50`, `DATA_PARTITIONS` presence and fingerprint).
+- Atomic diff showing only `ROOT_DISK_THRESHOLD` updated to `80`.
+- Post-mutation process inspection showing PID change, active state, and effective `ROOT_DISK_THRESHOLD=80`.
+- Unchanged `DATA_PARTITIONS` fingerprint confirmation.
+- Synthetic comparator evaluation output.
 
 ## Stop conditions
 
 The Executor MUST stop implementation and return the issue to planning when:
-- Workflow dispatch cannot be authorized by human authority.
-- The threshold is managed by a third-party managed service outside host control requiring external console authority.
-- Production host runner is offline or unreachable.
-- Production diagnostic steps yield ambiguous or contradictory findings.
+- Workflow dispatch is not authorized by human authority.
+- Production host runner is offline, unreachable, or job is routed to an unexpected runner.
+- Active monitor binary provenance does not match `a9be2681f07e9f5cea45de6b51f39b20f929dc1f` (`vcs.modified=false`).
+- Initial root filesystem usage is already `>= 80%`.
+- EnvironmentFile or active process environment has multiple ambiguous threshold or partition definitions.
+- Post-restart verification fails and rollback is executed.
 - Any unexpected production error or service failure occurs.
 
 ## Side-effect authorization
@@ -211,16 +248,16 @@ The Executor MUST stop implementation and return the issue to planning when:
 ### Explicitly authorized side effects
 
 - Authoring, committing, and pushing this validated task document to the isolated branch `task/server-disk-alert-threshold-80`.
-- Local git status, diff, and branch inspections.
-- No direct commit to `main`, no PR creation, no production workflow dispatch, and no production modification is authorized by this task publication.
+- Local Git status, diff, and branch inspections.
+- No direct commit to `main`, no workflow dispatch, and no production modification is authorized by this task publication alone.
 
 ## Expected terminal outcome
 
 ### Review Required
 
-- When production diagnostic findings and proposed change are returned for review before modification.
-- When implementation and non-destructive verification are completed with full evidence.
+- When the updated task document is validated, published, committed, and pushed to the isolated branch `task/server-disk-alert-threshold-80`.
+- Following subsequent authorized execution, when production verification evidence is collected and ready for Reviewer evaluation.
 
 ### Planning Required
 
-- If workflow dispatch is denied, production runner is unreachable, or monitor is externally managed.
+- If workflow dispatch is denied, production preflight fails unexpectedly, or rollback occurs.

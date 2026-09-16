@@ -40,7 +40,7 @@ env:
 
 jobs:
   monitor-threshold-change:
-    name: "Production Monitor Root Disk Alert Threshold Change (50% -> 80%)"
+    name: "Production Monitor Unified Disk Alert Threshold Change (50% -> 80%)"
     if: github.ref_name == 'task/server-disk-alert-threshold-80'
     runs-on: [self-hosted, linux, x64, production]
     timeout-minutes: 10
@@ -236,13 +236,13 @@ jobs:
           echo "$vcs_rev" > .mutation_meta/binary_vcs_rev
           echo "Preflight 2 (Binary Provenance): PASSED"
 
-      - name: "3. Fail-Closed Preflight: Root-vs-Data Scope Gate (DATA_PARTITIONS)"
+      - name: "3. Fail-Closed Preflight: DATA_PARTITIONS Authority & Preservation Gate"
         timeout-minutes: 2
         env:
           SUDO_PASSWORD: ${{ secrets.SUDO_PASSWORD }}
         run: |
           set -euo pipefail
-          echo "=== 3. PREFLIGHT: ROOT-VS-DATA SCOPE GATE ==="
+          echo "=== 3. PREFLIGHT: DATA_PARTITIONS AUTHORITY & PRESERVATION GATE ==="
           env_file="/var/www/madeena-server-monitor/.env"
           initial_pid=$(cat .mutation_meta/initial_pid 2>/dev/null || echo '0')
 
@@ -264,7 +264,7 @@ jobs:
           fi
 
           # 1. Privileged allowlisted parse of DATA_PARTITIONS in .env without dumping file
-          # Count active definitions and check emptiness without exposing actual partition values
+          # Count active definitions, check non-emptiness, and compute safe SHA-256 fingerprint
           env_dp_audit=$(_sudo sh -c '
             f="$1"
             awk -F= "
@@ -286,54 +286,43 @@ jobs:
           env_dp_count=$(printf '%s\n' "$env_dp_audit" | awk -F= '$1=="count"{print $2}')
           env_dp_empty_count=$(printf '%s\n' "$env_dp_audit" | awk -F= '$1=="empty_count"{print $2}')
 
-          if [ "$env_dp_count" -eq 0 ]; then
-            env_dp_present="false"
-            env_dp_empty="true"
-          elif [ "$env_dp_count" -eq 1 ]; then
-            env_dp_present="true"
-            if [ "$env_dp_empty_count" -eq 1 ]; then
-              env_dp_empty="true"
-            else
-              env_dp_empty="false"
-            fi
-          else
-            echo "FATAL: Ambiguous configuration: multiple ($env_dp_count) active DATA_PARTITIONS definitions in .env" >&2
+          echo "EnvironmentFile DATA_PARTITIONS definitions: $env_dp_count"
+          if [ "$env_dp_count" -ne 1 ]; then
+            echo "FATAL: Expected exactly 1 active DATA_PARTITIONS definition in .env, found $env_dp_count" >&2
+            exit 1
+          fi
+          if [ "$env_dp_empty_count" -ne 0 ]; then
+            echo "FATAL: Configured DATA_PARTITIONS in .env is unexpectedly empty" >&2
             exit 1
           fi
 
-          # 2. Allowlisted parse of DATA_PARTITIONS in direct systemd Environment
+          # Extract SHA-256 fingerprint of allowlisted DATA_PARTITIONS value in .env
+          pre_env_dp_hash=$(_sudo sh -c '
+            f="$1"
+            val=$(awk -F= "
+              !/^[[:space:]]*(#|$)/ && NF >= 2 {
+                k = \$1; sub(/^[[:space:]]+/, \"\", k); sub(/[[:space:]]+$/, \"\", k);
+                v = substr(\$0, index(\$0, \"=\") + 1); sub(/^[[:space:]]+/, \"\", v); sub(/[[:space:]]+$/, \"\", v);
+                gsub(/^[\"'"'"']|[\"'"'"']$/, \"\", v);
+                if (k == \"DATA_PARTITIONS\") {
+                  print v;
+                  exit;
+                }
+              }
+            " "$f")
+            printf "%s" "$val" | sha256sum | awk "{print \$1}"
+          ' -- "$env_file")
+
+          # 2. Check direct systemd Environment property (must NOT define DATA_PARTITIONS)
           raw_direct_env=$(systemctl show madeena-monitor.service -p Environment --value 2>/dev/null || true)
-          direct_dp_present="false"
-          direct_dp_empty="true"
           if [ -n "$raw_direct_env" ]; then
-            direct_dp_audit=$(printf '%s\n' "$raw_direct_env" | awk -v RS='[[:space:]]+' -F= '
-              $1 == "DATA_PARTITIONS" {
-                count++
-                v = substr($0, index($0, "=") + 1)
-                gsub(/^["'\''"]|["'\''"]$/, "", v)
-                sub(/^[[:space:]]+/, "", v); sub(/[[:space:]]+$/, "", v)
-                if (v == "") empty_count++
-              }
-              END {
-                printf "count=%d\nempty_count=%d\n", count, empty_count
-              }
-            ' || true)
+            direct_dp_count=$(printf '%s\n' "$raw_direct_env" | awk -v RS='[[:space:]]+' -F= '
+              $1 == "DATA_PARTITIONS" { count++ }
+              END { print count + 0 }
+            ' || echo '0')
 
-            dir_count=$(printf '%s\n' "$direct_dp_audit" | awk -F= '$1=="count"{print $2}')
-            dir_empty_count=$(printf '%s\n' "$direct_dp_audit" | awk -F= '$1=="empty_count"{print $2}')
-
-            if [ "${dir_count:-0}" -eq 0 ]; then
-              direct_dp_present="false"
-              direct_dp_empty="true"
-            elif [ "${dir_count:-0}" -eq 1 ]; then
-              direct_dp_present="true"
-              if [ "${dir_empty_count:-0}" -eq 1 ]; then
-                direct_dp_empty="true"
-              else
-                direct_dp_empty="false"
-              fi
-            else
-              echo "FATAL: Ambiguous configuration: multiple ($dir_count) active DATA_PARTITIONS definitions in direct systemd Environment" >&2
+            if [ "$direct_dp_count" -ne 0 ]; then
+              echo "FATAL: Competing DATA_PARTITIONS definition detected in direct systemd Environment ($direct_dp_count)" >&2
               exit 1
             fi
           fi
@@ -360,57 +349,47 @@ jobs:
           proc_dp_count=$(printf '%s\n' "$proc_dp_audit" | awk -F= '$1=="count"{print $2}')
           proc_dp_empty_count=$(printf '%s\n' "$proc_dp_audit" | awk -F= '$1=="empty_count"{print $2}')
 
-          if [ "${proc_dp_count:-0}" -eq 0 ]; then
-            proc_dp_present="false"
-            proc_dp_empty="true"
-          elif [ "${proc_dp_count:-0}" -eq 1 ]; then
-            proc_dp_present="true"
-            if [ "${proc_dp_empty_count:-0}" -eq 1 ]; then
-              proc_dp_empty="true"
-            else
-              proc_dp_empty="false"
-            fi
-          else
-            echo "FATAL: Ambiguous configuration: multiple ($proc_dp_count) active DATA_PARTITIONS definitions in process environment" >&2
+          echo "Process DATA_PARTITIONS definitions: $proc_dp_count"
+          if [ "$proc_dp_count" -ne 1 ]; then
+            echo "FATAL: Expected exactly 1 active DATA_PARTITIONS definition in process environment, found $proc_dp_count" >&2
+            exit 1
+          fi
+          if [ "$proc_dp_empty_count" -ne 0 ]; then
+            echo "FATAL: Process DATA_PARTITIONS is unexpectedly empty" >&2
             exit 1
           fi
 
-          echo "EnvironmentFile DATA_PARTITIONS present=$env_dp_present empty=$env_dp_empty"
-          echo "Direct Environment DATA_PARTITIONS present=$direct_dp_present empty=$direct_dp_empty"
-          echo "Process DATA_PARTITIONS present=$proc_dp_present empty=$proc_dp_empty"
+          # Extract SHA-256 fingerprint of allowlisted DATA_PARTITIONS in process environment
+          pre_process_dp_hash=$(_sudo sh -c '
+            pid="$1"
+            val=$(tr "\0" "\n" < "/proc/$pid/environ" 2>/dev/null | awk -F= "
+              !/^[[:space:]]*(#|$)/ && NF >= 2 {
+                k = \$1; sub(/^[[:space:]]+/, \"\", k); sub(/[[:space:]]+$/, \"\", k);
+                v = substr(\$0, index(\$0, \"=\") + 1); sub(/^[[:space:]]+/, \"\", v); sub(/[[:space:]]+$/, \"\", v);
+                gsub(/^[\"'"'"']|[\"'"'"']$/, \"\", v);
+                if (k == \"DATA_PARTITIONS\") {
+                  print v;
+                  exit;
+                }
+              }
+            ")
+            printf "%s" "$val" | sha256sum | awk "{print \$1}"
+          ' -- "$initial_pid")
 
-          # 4. Check for ambiguity / dual definition between config sources (even if both are empty)
-          if [ "$env_dp_present" = "true" ] && [ "$direct_dp_present" = "true" ]; then
-            echo "FATAL: Ambiguous DATA_PARTITIONS configuration: defined in both .env and direct systemd Environment. Halting before mutation." >&2
-            exit 1
-          fi
-
-          # 5. Check if effective process state contradicts config authority
-          if [ "$env_dp_present" = "true" ] && [ "$proc_dp_present" != "true" ]; then
-            echo "FATAL: Authority ambiguity: DATA_PARTITIONS defined in .env but absent in active process environment" >&2
-            exit 1
-          fi
-          if [ "$env_dp_empty" != "$proc_dp_empty" ]; then
-            echo "FATAL: Authority ambiguity: DATA_PARTITIONS emptiness mismatch between .env ($env_dp_empty) and process environment ($proc_dp_empty)" >&2
-            exit 1
-          fi
-
-          # 6. Fail-closed if any source defines a non-empty value
-          if [ "$env_dp_present" = "true" ] && [ "$env_dp_empty" = "false" ]; then
-            echo "FATAL: Effective process DATA_PARTITIONS is non-empty; root-only threshold mutation is out of scope" >&2
-            exit 1
-          fi
-          if [ "$direct_dp_present" = "true" ] && [ "$direct_dp_empty" = "false" ]; then
-            echo "FATAL: Effective process DATA_PARTITIONS is non-empty; root-only threshold mutation is out of scope" >&2
-            exit 1
-          fi
-          if [ "$proc_dp_present" = "true" ] && [ "$proc_dp_empty" = "false" ]; then
-            echo "FATAL: Effective process DATA_PARTITIONS is non-empty; root-only threshold mutation is out of scope" >&2
+          # 4. Authority consistency check between .env and process environment
+          if [ "$pre_env_dp_hash" != "$pre_process_dp_hash" ]; then
+            echo "FATAL: Authority discrepancy: .env DATA_PARTITIONS fingerprint does not match running process environment fingerprint" >&2
             exit 1
           fi
 
-          echo "ACTIVE DATA_PARTITIONS: NONE"
-          echo "Preflight 3 (Root-vs-Data Scope Gate): PASSED"
+          echo "DATA_PARTITIONS authority consistency: VERIFIED"
+          echo "DATA_PARTITIONS fingerprint captured"
+
+          # Store fingerprints safely in isolated meta directory
+          echo "$pre_env_dp_hash" > .mutation_meta/pre_env_dp_hash
+          echo "$pre_process_dp_hash" > .mutation_meta/pre_process_dp_hash
+
+          echo "Preflight 3 (DATA_PARTITIONS Authority & Preservation Gate): PASSED"
 
       - name: "4. Fail-Closed Preflight: Threshold State & Single-Definition Gate"
         timeout-minutes: 2
@@ -665,6 +644,42 @@ jobs:
                 tr "\0" "\n" < "/proc/$pid/environ" 2>/dev/null | awk -F= "\$1 == \"ROOT_DISK_THRESHOLD\" { print \$2; exit }"
               ' -- "$rb_pid" 2>/dev/null || echo 'UNKNOWN')
 
+              # Allowlisted fingerprint verification of restored .env and process DATA_PARTITIONS
+              orig_env_hash=$(cat .mutation_meta/pre_env_dp_hash 2>/dev/null || echo '')
+              orig_proc_hash=$(cat .mutation_meta/pre_process_dp_hash 2>/dev/null || echo '')
+
+              rb_env_dp_hash=$(_sudo sh -c '
+                f="$1"
+                val=$(awk -F= "
+                  !/^[[:space:]]*(#|$)/ && NF >= 2 {
+                    k = \$1; sub(/^[[:space:]]+/, \"\", k); sub(/[[:space:]]+$/, \"\", k);
+                    v = substr(\$0, index(\$0, \"=\") + 1); sub(/^[[:space:]]+/, \"\", v); sub(/[[:space:]]+$/, \"\", v);
+                    gsub(/^[\"'"'"']|[\"'"'"']$/, \"\", v);
+                    if (k == \"DATA_PARTITIONS\") {
+                      print v;
+                      exit;
+                    }
+                  }
+                " "$f")
+                printf "%s" "$val" | sha256sum | awk "{print \$1}"
+              ' -- "$env_file" 2>/dev/null || echo 'UNKNOWN')
+
+              rb_proc_dp_hash=$(_sudo sh -c '
+                pid="$1"
+                val=$(tr "\0" "\n" < "/proc/$pid/environ" 2>/dev/null | awk -F= "
+                  !/^[[:space:]]*(#|$)/ && NF >= 2 {
+                    k = \$1; sub(/^[[:space:]]+/, \"\", k); sub(/[[:space:]]+$/, \"\", k);
+                    v = substr(\$0, index(\$0, \"=\") + 1); sub(/^[[:space:]]+/, \"\", v); sub(/[[:space:]]+$/, \"\", v);
+                    gsub(/^[\"'"'"']|[\"'"'"']$/, \"\", v);
+                    if (k == \"DATA_PARTITIONS\") {
+                      print v;
+                      exit;
+                    }
+                  }
+                ")
+                printf "%s" "$val" | sha256sum | awk "{print \$1}"
+              ' -- "$rb_pid" 2>/dev/null || echo 'UNKNOWN')
+
               echo "Rollback Verification:"
               echo "  ActiveState: $rb_state"
               echo "  MainPID: $rb_pid"
@@ -672,8 +687,10 @@ jobs:
               echo "  /proc/<pid>/cwd: $rb_cwd"
               echo "  .env ROOT_DISK_THRESHOLD: $rb_val"
               echo "  /proc/<pid>/environ ROOT_DISK_THRESHOLD: $rb_proc_val"
+              echo "  .env DATA_PARTITIONS restored fingerprint match: $( [ "$rb_env_dp_hash" = "$orig_env_hash" ] && echo "YES" || echo "NO" )"
+              echo "  /proc/<pid>/environ DATA_PARTITIONS restored fingerprint match: $( [ "$rb_proc_dp_hash" = "$orig_proc_hash" ] && echo "YES" || echo "NO" )"
 
-              if [ "$rb_state" != "active" ] || [ "$rb_pid" = "0" ] || [ "$rb_exe" != "/var/www/madeena-server-monitor/monitor" ] || [ "$rb_cwd" != "/var/www/madeena-server-monitor" ] || [ "$rb_val" != "50" ] || [ "$rb_proc_val" != "50" ]; then
+              if [ "$rb_state" != "active" ] || [ "$rb_pid" = "0" ] || [ "$rb_exe" != "/var/www/madeena-server-monitor/monitor" ] || [ "$rb_cwd" != "/var/www/madeena-server-monitor" ] || [ "$rb_val" != "50" ] || [ "$rb_proc_val" != "50" ] || [ "$rb_env_dp_hash" != "$orig_env_hash" ] || [ "$rb_proc_dp_hash" != "$orig_proc_hash" ]; then
                 rollback_ok="false"
               fi
 
@@ -836,7 +853,127 @@ jobs:
             exit 1
           fi
 
-          # d. Verify root usage remains below 80%
+          # d. Verify DATA_PARTITIONS preservation post-restart
+          orig_env_hash=$(cat .mutation_meta/pre_env_dp_hash 2>/dev/null || echo '')
+          orig_proc_hash=$(cat .mutation_meta/pre_process_dp_hash 2>/dev/null || echo '')
+
+          # Verify .env DATA_PARTITIONS: exactly 1 definition, non-empty, and exact fingerprint match
+          post_env_dp_audit=$(_sudo sh -c '
+            f="$1"
+            awk -F= "
+              !/^[[:space:]]*(#|$)/ && NF >= 2 {
+                k = \$1; sub(/^[[:space:]]+/, \"\", k); sub(/[[:space:]]+$/, \"\", k);
+                v = substr(\$0, index(\$0, \"=\") + 1); sub(/^[[:space:]]+/, \"\", v); sub(/[[:space:]]+$/, \"\", v);
+                gsub(/^[\"'"'"']|[\"'"'"']$/, \"\", v);
+                if (k == \"DATA_PARTITIONS\") {
+                  count++
+                  if (v == \"\") empty_count++
+                }
+              }
+              END {
+                printf \"count=%d\nempty_count=%d\n\", count, empty_count
+              }
+            " "$f"
+          ' -- "$env_file")
+
+          post_env_dp_count=$(printf '%s\n' "$post_env_dp_audit" | awk -F= '$1=="count"{print $2}')
+          post_env_dp_empty_count=$(printf '%s\n' "$post_env_dp_audit" | awk -F= '$1=="empty_count"{print $2}')
+
+          echo "Post-restart EnvironmentFile DATA_PARTITIONS definitions: $post_env_dp_count"
+          if [ "$post_env_dp_count" -ne 1 ]; then
+            echo "FATAL: Expected exactly 1 active DATA_PARTITIONS definition in .env post-restart, found $post_env_dp_count" >&2
+            exit 1
+          fi
+          if [ "$post_env_dp_empty_count" -ne 0 ]; then
+            echo "FATAL: Configured DATA_PARTITIONS in .env is unexpectedly empty post-restart" >&2
+            exit 1
+          fi
+
+          post_env_dp_hash=$(_sudo sh -c '
+            f="$1"
+            val=$(awk -F= "
+              !/^[[:space:]]*(#|$)/ && NF >= 2 {
+                k = \$1; sub(/^[[:space:]]+/, \"\", k); sub(/[[:space:]]+$/, \"\", k);
+                v = substr(\$0, index(\$0, \"=\") + 1); sub(/^[[:space:]]+/, \"\", v); sub(/[[:space:]]+$/, \"\", v);
+                gsub(/^[\"'"'"']|[\"'"'"']$/, \"\", v);
+                if (k == \"DATA_PARTITIONS\") {
+                  print v;
+                  exit;
+                }
+              }
+            " "$f")
+            printf "%s" "$val" | sha256sum | awk "{print \$1}"
+          ' -- "$env_file")
+
+          echo "Post-restart .env DATA_PARTITIONS fingerprint match: $( [ "$post_env_dp_hash" = "$orig_env_hash" ] && echo "YES" || echo "NO" )"
+          if [ "$post_env_dp_hash" != "$orig_env_hash" ]; then
+            echo "FATAL: Post-restart .env DATA_PARTITIONS fingerprint mismatch with pre-change fingerprint" >&2
+            exit 1
+          fi
+
+          # Verify process DATA_PARTITIONS: exactly 1 definition, non-empty, and exact fingerprint match
+          post_proc_dp_audit=$(_sudo sh -c '
+            pid="$1"
+            tr "\0" "\n" < "/proc/$pid/environ" 2>/dev/null | awk -F= "
+              !/^[[:space:]]*(#|$)/ && NF >= 2 {
+                k = \$1; sub(/^[[:space:]]+/, \"\", k); sub(/[[:space:]]+$/, \"\", k);
+                v = substr(\$0, index(\$0, \"=\") + 1); sub(/^[[:space:]]+/, \"\", v); sub(/[[:space:]]+$/, \"\", v);
+                gsub(/^[\"'"'"']|[\"'"'"']$/, \"\", v);
+                if (k == \"DATA_PARTITIONS\") {
+                  count++
+                  if (v == \"\") empty_count++
+                }
+              }
+              END {
+                printf \"count=%d\nempty_count=%d\n\", count, empty_count
+              }
+            "
+          ' -- "$new_pid")
+
+          post_proc_dp_count=$(printf '%s\n' "$post_proc_dp_audit" | awk -F= '$1=="count"{print $2}')
+          post_proc_dp_empty_count=$(printf '%s\n' "$post_proc_dp_audit" | awk -F= '$1=="empty_count"{print $2}')
+
+          echo "Post-restart Process DATA_PARTITIONS definitions: $post_proc_dp_count"
+          if [ "$post_proc_dp_count" -ne 1 ]; then
+            echo "FATAL: Expected exactly 1 active DATA_PARTITIONS definition in process environment post-restart, found $post_proc_dp_count" >&2
+            exit 1
+          fi
+          if [ "$post_proc_dp_empty_count" -ne 0 ]; then
+            echo "FATAL: Process DATA_PARTITIONS is unexpectedly empty post-restart" >&2
+            exit 1
+          fi
+
+          post_proc_dp_hash=$(_sudo sh -c '
+            pid="$1"
+            val=$(tr "\0" "\n" < "/proc/$pid/environ" 2>/dev/null | awk -F= "
+              !/^[[:space:]]*(#|$)/ && NF >= 2 {
+                k = \$1; sub(/^[[:space:]]+/, \"\", k); sub(/[[:space:]]+$/, \"\", k);
+                v = substr(\$0, index(\$0, \"=\") + 1); sub(/^[[:space:]]+/, \"\", v); sub(/[[:space:]]+$/, \"\", v);
+                gsub(/^[\"'"'"']|[\"'"'"']$/, \"\", v);
+                if (k == \"DATA_PARTITIONS\") {
+                  print v;
+                  exit;
+                }
+              }
+            ")
+            printf "%s" "$val" | sha256sum | awk "{print \$1}"
+          ' -- "$new_pid")
+
+          echo "Post-restart Process DATA_PARTITIONS fingerprint match: $( [ "$post_proc_dp_hash" = "$orig_proc_hash" ] && echo "YES" || echo "NO" )"
+          if [ "$post_proc_dp_hash" != "$orig_proc_hash" ]; then
+            echo "FATAL: Post-restart Process DATA_PARTITIONS fingerprint mismatch with pre-change process fingerprint" >&2
+            exit 1
+          fi
+
+          # Semantic consistency between post-restart .env and process environment
+          if [ "$post_env_dp_hash" != "$post_proc_dp_hash" ]; then
+            echo "FATAL: Post-restart discrepancy between .env and process DATA_PARTITIONS fingerprints" >&2
+            exit 1
+          fi
+
+          echo "DATA_PARTITIONS post-restart preservation: VERIFIED"
+
+          # e. Verify root usage remains below 80%
           root_pct=$(df -P / | tail -1 | awk '{print $(NF-1)}' | tr -d '%')
           echo "Current root disk usage post-restart: ${root_pct}%"
           is_ge_80=$(awk -v u="$root_pct" 'BEGIN { if (u >= 80.0) print "true"; else print "false"; }')

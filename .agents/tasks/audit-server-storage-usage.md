@@ -1,14 +1,14 @@
 ---
 title: Audit Madeena Production Storage Topology and Utilization
 document_id: AGENT-TASK-ADMIN-INFRA-004
-version: 1.0
+version: 1.1
 status: Validated/Published
 language: en-US
-last_updated: 2026-09-16
+last_updated: 2026-09-17
 scope:
   - read-only mapping of production storage topology and disk utilization
   - root filesystem (/) capacity, LVM backing, and major consumer category breakdown
-  - attached HDD filesystem (/media/nextcloud-data) capacity and mapping
+  - additional storage mount (/media/nextcloud-data) capacity and mapping
   - effective DATA_PARTITIONS monitored mount targets identification
   - Nextcloud and MinIO storage filesystem mapping and co-location determination
   - evidence-based classification of future cleanup candidates without mutation
@@ -52,17 +52,19 @@ Designated Human Authority / Repository Planner
 
 In preceding production operations (Run ID `35054440176`), the critical disk-usage alert threshold on the Madeena production server was unified and raised to 80% for both the root filesystem (`/`) and configured `DATA_PARTITIONS`.
 
-Observed production evidence established that the root filesystem (`/dev/mapper/ubuntu--vg-ubuntu--lv`) is currently at 70% utilization, occupying approximately 157.6 GB (150.3 GiB) out of 237.7 GB (226.7 GiB) total capacity, leaving approximately 69.3 GB (66.1 GiB) available. In addition, an HDD storage mount `/media/nextcloud-data` and an active `DATA_PARTITIONS` definition are present on the production host.
+Observed production evidence established that the root filesystem (`/dev/mapper/ubuntu--vg-ubuntu--lv`) is currently at 70% utilization, occupying approximately 157.6 GB (150.3 GiB) out of 237.7 GB (226.7 GiB) total capacity, leaving approximately 69.3 GB (66.1 GiB) available. In addition, an additional storage mount `/media/nextcloud-data` and an active `DATA_PARTITIONS` definition are present on the production runner environment.
 
-To plan future storage management and remediation safely without service disruption or data loss, a comprehensive, read-only diagnostic audit is required. The audit must establish the exact physical and logical storage topology, determine where Nextcloud and MinIO object/file data reside, analyze what constitutes the ~158 GB root filesystem consumption, and identify evidence-based cleanup candidates.
+To plan future storage management and remediation safely without service disruption or data loss, a comprehensive, read-only diagnostic audit is required. The audit must establish the physical and logical storage topology from reliable evidence, determine where Nextcloud and MinIO object/file data reside, analyze what constitutes the ~158 GB root filesystem consumption, and identify evidence-based cleanup candidates.
 
 The audit itself MUST remain strictly read-only and fail-closed: it must not delete, prune, move, truncate, compact, rotate, or modify any production data, container, or configuration.
 
 ### Established Production Facts (Discovered & Verified)
-- **Production Host:** `simama-production-server-2` (Machine `server`, Group `madeena-devops`).
+- **Observed production runner:** `simama-production-server-2`
+- **Runner group:** `madeena-devops`
+- **Machine name:** `server`
 - **Root Filesystem Device:** `/dev/mapper/ubuntu--vg-ubuntu--lv`.
 - **Observed Baseline Root Usage (Run 35054440176):** Total ~237,708,024 KiB, Used ~157,657,264 KiB, Free ~69,281,200 KiB, Usage: 70%.
-- **Known Attached HDD Mount:** `/media/nextcloud-data`.
+- **Known Additional Storage Mount:** `/media/nextcloud-data`.
 - **Monitored Service:** `madeena-monitor.service` configured with exactly one active, non-empty `DATA_PARTITIONS` definition.
 - **Access Control Plane:** Production access is mediated strictly via GitHub Actions self-hosted runner labeled `[self-hosted, linux, x64, production]`.
 
@@ -90,13 +92,13 @@ The immutable revision is supplied externally by version-control history and rep
 
 ## Objective
 
-Produce a verified, read-only map of Madeena production storage topology and utilization, including root SSD/LVM, attached HDD/filesystems, monitored data partitions, Nextcloud and MinIO storage placement, major root-filesystem consumers, and evidence-based cleanup candidates, without modifying production state.
+Produce a verified, read-only map of Madeena production storage topology and utilization, including root storage / root filesystem / LVM-backed root, additional storage mount /media/nextcloud-data, monitored data partitions, Nextcloud and MinIO storage placement, major root-filesystem consumers, and evidence-based cleanup candidates, without modifying production state.
 
 ## Authoritative inputs
 
 ### Governing authority
 
-- User Operational Directive & Task Handoff: "Produce a verified, read-only map of Madeena production storage topology and utilization, including root SSD/LVM, attached HDD/filesystems, monitored data partitions, Nextcloud and MinIO storage placement, major root-filesystem consumers, and evidence-based cleanup candidates, without modifying production state."
+- User Operational Directive & Task Handoff: "Produce a verified, read-only map of Madeena production storage topology and utilization, including root storage / root filesystem / LVM-backed root, additional storage mount /media/nextcloud-data, monitored data partitions, Nextcloud and MinIO storage placement, major root-filesystem consumers, and evidence-based cleanup candidates, without modifying production state."
 - Verified Predecessor Production Evidence: Workflow Run `35054440176` on commit `8175e0212cddeb34233af2fea18eeb242e0c0962`.
 - Repository AI Delivery Contract: `.agents/AGENTS.md`
 - Normative Software Delivery Protocol: `.agents/software-workflow.md`
@@ -118,17 +120,18 @@ Produce a verified, read-only map of Madeena production storage topology and uti
 ### In scope
 
 - Implementation of a dedicated, manual-dispatch GitHub Actions workflow (`.github/workflows/server-storage-audit.yml`) targeting `[self-hosted, linux, x64, production]`.
-- Bounded, read-only inspection of block-device topology (`lsblk` allowlisted fields: name, type, size, fstype, mountpoint, model, rotational indicator).
+- Runtime probe for tool availability prior to execution (`command -v <tool>` for diagnostic utilities, failing gracefully if optional tools are absent).
+- Bounded, read-only inspection of block-device topology (`lsblk` allowlisted fields: name, type, size, fstype, mountpoint, model, rotational indicator; determine physical backing if reliable evidence exists, otherwise report UNRESOLVED).
 - Bounded, read-only inspection of filesystem and mount topology (`findmnt`, `df -P` for `/`, `/media/nextcloud-data`, monitored `DATA_PARTITIONS`, Nextcloud root, MinIO root).
-- Mapping LVM hierarchy for `/dev/mapper/ubuntu--vg-ubuntu--lv` (`pvdisplay`/`pvs`, `vgdisplay`/`vgs`, `lvdisplay`/`lvs` or equivalent read-only queries).
+- Mapping LVM hierarchy for `/dev/mapper/ubuntu--vg-ubuntu--lv` (`pvdisplay`/`pvs`, `vgdisplay`/`vgs`, `lvdisplay`/`lvs` or equivalent read-only queries if LVM tools are available; report UNRESOLVED if unavailable).
 - Safe extraction of the configured `DATA_PARTITIONS` mount path(s) from `/var/www/madeena-server-monitor/.env` without dumping unrestricted configuration or secret variables.
 - Determination of Nextcloud storage filesystem and path via allowlisted systemd, Docker container, or Docker Swarm service mount inspection (source, destination, mount type), redacting any secret or credential fields.
 - Determination of MinIO storage filesystem and path via allowlisted systemd, Docker container, or Docker Swarm service inspection, without dumping environment variables (access keys, secret keys).
-- Clear answer on whether Nextcloud and MinIO share the same underlying filesystem or use distinct filesystems.
+- Clear answer on whether Nextcloud and MinIO share the same underlying filesystem or use distinct filesystems (`SAME FILESYSTEM`, `DIFFERENT FILESYSTEMS`, or `UNRESOLVED` with explicit reason).
 - Bounded root-filesystem depth analysis (e.g., `du -x --max-depth=1 /` with strict timeout) and high-level categorization (Docker, logs, databases, `/var/lib`, `/var/www`, `/home`, `/opt`, backups, caches).
 - Bounded inventory of unusually large files on the root filesystem (e.g., files >= 1 GiB, top 50, path and size only, remaining strictly on `/`).
-- High-level Docker aggregate disk usage (`docker system df` if Docker is present), distinguishing images, containers, local volumes, and build cache.
-- Systemd journal aggregate disk usage (`journalctl --disk-usage`).
+- High-level Docker aggregate disk usage (`docker system df` if Docker is present; report `NOT PRESENT / UNAVAILABLE` if absent or inaccessible), distinguishing images, containers, local volumes, and build cache.
+- Systemd journal aggregate disk usage (`journalctl --disk-usage` if `journalctl` is available; report `UNRESOLVED` if unavailable).
 - Evidence-based classification of storage findings into:
   1. Potentially reclaimable;
   2. Requires application-specific review;
@@ -143,7 +146,7 @@ Produce a verified, read-only map of Madeena production storage topology and uti
 - Any LVM or filesystem modification (`lvextend`, `lvreduce`, `vgextend`, `resize2fs`, etc.).
 - Modification of monitor thresholds or alert intervals.
 - Package installation or host dependency updates.
-- Recursive scans of the multi-terabyte HDD storage (`/media/nextcloud-data`).
+- Recursive scans of the additional storage mount (`/media/nextcloud-data`).
 - Content inspection of user files, databases, or object storage.
 - Exposure of disk serial numbers, WWN, passwords, tokens, private keys, or application environment dumps.
 - Direct production SSH access or local execution bypass.
@@ -165,7 +168,7 @@ Produce a verified, read-only map of Madeena production storage topology and uti
 
 ### Approved assumptions
 
-- The production runner environment has standard Linux storage diagnostic tools installed (`lsblk`, `df`, `findmnt`, `du`, `awk`, `lvs`/`vgs`/`pvs`, `docker`, `journalctl`).
+- The production runner environment's available diagnostic tools will be probed at runtime (`command -v`), and probes will adapt gracefully without failing the entire audit.
 - The root filesystem `/dev/mapper/ubuntu--vg-ubuntu--lv` can be inspected locally with `du -x` without traversing into attached mounts.
 - Diagnostic operations can safely complete within a bounded 5-minute total job timeout, with individual commands bounded by strict sub-timeouts (e.g., 30–60s).
 
@@ -185,10 +188,11 @@ Produce a verified, read-only map of Madeena production storage topology and uti
 ### Constraints
 
 - **Strict Read-Only Execution:** Every diagnostic probe must be non-destructive and read-only.
+- **Runtime Tool Probing:** Test tool availability using safe read-only checks (`command -v <tool>`). Do not install missing packages or dependencies. If a tool is missing or inaccessible, report the exact status/limitation (`NOT PRESENT / UNAVAILABLE` or `UNRESOLVED`) and continue.
 - **No Unrestricted Environment/Secret Dumps:** Under no circumstances may `/proc/<pid>/environ`, container `.env` files, or MinIO/Nextcloud credentials be dumped to workflow logs or artifacts.
-- **Diagnostic Timeout Budget:** Hard job timeout of 5 minutes (`timeout-minutes: 5`); individual expensive probes (e.g. `du`) must be protected by internal timeouts (e.g., `timeout 60s`). If a probe times out, it must fail gracefully, record the timeout, and allow remaining probes to proceed.
+- **Diagnostic Timeout Budget:** Hard job timeout of 5 minutes (`timeout-minutes: 5`); individual expensive probes (e.g. `du`) must be protected by internal timeouts (e.g., `timeout 60s`). If a probe times out, it must fail gracefully, record the timeout as `UNRESOLVED (timeout)`, and allow remaining probes to proceed.
 - **Process Safety:** In the event of a probe timeout, only processes spawned by the audit probe itself may be killed.
-- **Fail-Closed Reporting:** If an item cannot be inspected safely or times out, report it as `UNRESOLVED` rather than guessing or expanding permissions.
+- **Fail-Closed Reporting:** If an item cannot be inspected safely or times out, report it as `UNRESOLVED` with explicit reason rather than guessing or expanding permissions.
 - **Filesystem Isolation:** Root usage analysis must strictly use `-x` (or `--one-file-system`) to prevent descending into `/media/nextcloud-data` or other mounted filesystems.
 - **Separation of Filesystem vs. Directory Metrics:** Do not sum percentages across different filesystems; clearly separate total storage capacity from directory-level consumed bytes.
 
@@ -196,20 +200,20 @@ Produce a verified, read-only map of Madeena production storage topology and uti
 
 - [ ] A dedicated read-only workflow (`.github/workflows/server-storage-audit.yml`) is authored, committed to `task/server-storage-audit`, and validated.
 - [ ] Workflow is manual-dispatch only (`workflow_dispatch`), uses `permissions: contents: read`, and targets `[self-hosted, linux, x64, production]`.
-- [ ] Block-device topology is captured with allowlisted fields (name, type, size, fstype, mountpoint, model, rotational indicator), identifying whether root storage is SSD/non-rotational.
+- [ ] Block-device topology is captured with allowlisted fields (name, type, size, fstype, mountpoint, model, rotational indicator). Physical backing (rotational/non-rotational/SSD/HDD) is reported as RESOLVED with evidence or UNRESOLVED with explicit reason; no premature inference.
 - [ ] Serial numbers, WWN, and unnecessary hardware identifiers are explicitly excluded.
-- [ ] Filesystem and mount topology maps `/`, `/media/nextcloud-data`, monitored `DATA_PARTITIONS`, Nextcloud root, and MinIO root with capacity, used, free, and percentage utilization.
-- [ ] LVM hierarchy is mapped for `/dev/mapper/ubuntu--vg-ubuntu--lv` (PV -> VG -> LV -> Filesystem).
-- [ ] Configured `DATA_PARTITIONS` mount target(s) are safely identified from monitor configuration without exposing secrets or dumping full environment files.
-- [ ] Nextcloud effective storage filesystem and path are identified via allowlisted runtime inspection without exposing credentials.
-- [ ] MinIO effective storage filesystem and path are identified via allowlisted runtime inspection without exposing access/secret keys.
-- [ ] The report explicitly answers whether Nextcloud and MinIO share the same filesystem or use distinct filesystems.
-- [ ] Root filesystem utilization is categorized by major consumers (`/var/lib/docker`, `/var/log`, `/var/lib`, `/var/www`, `/home`, `/opt`, backups, caches) using bounded `du -x`.
-- [ ] Top large files (>= 1 GiB, up to 50 entries) on the root filesystem are inventoried by path and size only.
-- [ ] Docker disk usage breakdown (images, containers, local volumes, build cache) is reported via `docker system df` if Docker is active.
-- [ ] Systemd journal disk usage is reported via `journalctl --disk-usage`.
+- [ ] Filesystem and mount topology maps `/`, `/media/nextcloud-data`, and monitored `DATA_PARTITIONS` targets with capacity, used, free, and percentage utilization (or UNRESOLVED with explicit reason if inaccessible).
+- [ ] LVM hierarchy is mapped for `/dev/mapper/ubuntu--vg-ubuntu--lv` (PV -> VG -> LV -> Filesystem) if LVM diagnostic tools are available; reported as UNRESOLVED with explicit reason if tooling or permissions are insufficient.
+- [ ] Configured `DATA_PARTITIONS` mount target(s) are safely identified from monitor configuration without exposing secrets or dumping full environment files (or UNRESOLVED with explicit reason if inaccessible).
+- [ ] Nextcloud effective storage filesystem and path are identified via allowlisted runtime inspection without exposing credentials (or UNRESOLVED with explicit reason if inaccessible/not running).
+- [ ] MinIO effective storage filesystem and path are identified via allowlisted runtime inspection without exposing access/secret keys (or UNRESOLVED with explicit reason if inaccessible/not running).
+- [ ] The report explicitly establishes whether Nextcloud and MinIO share the same filesystem or use distinct filesystems, with valid terminal states: `SAME FILESYSTEM`, `DIFFERENT FILESYSTEMS`, or `UNRESOLVED` (with explicit reason).
+- [ ] Root filesystem utilization is categorized by major consumers (`/var/lib/docker`, `/var/log`, `/var/lib`, `/var/www`, `/home`, `/opt`, backups, caches) using bounded `du -x` (or UNRESOLVED with explicit reason if timed out/inaccessible).
+- [ ] Top large files (>= 1 GiB, up to 50 entries) on the root filesystem are inventoried by path and size only (or UNRESOLVED with explicit reason if timed out).
+- [ ] Docker disk usage breakdown (images, containers, local volumes, build cache) is reported via `docker system df` if Docker is active; if Docker is absent or inaccessible, reported as `NOT PRESENT / UNAVAILABLE`.
+- [ ] Systemd journal disk usage is reported via `journalctl --disk-usage` if available, or reported as `UNRESOLVED` with explicit reason if unavailable.
 - [ ] Findings are categorized into evidence-based cleanup candidates (reclaimable, requires application review, must not touch) without authorizing mutation.
-- [ ] Zero production mutation is verified: no files deleted, no containers pruned, no services restarted.
+- [ ] Zero unauthorized mutation and zero destructive operations are verified: no files deleted, no containers pruned, no services restarted. All probe failures, unavailable tools, permission denials, and timeouts are explicitly reported with no silent omission or fabricated result.
 - [ ] Hard timeout of 5 minutes is enforced on the workflow job.
 
 ## Verification requirements
@@ -217,7 +221,7 @@ Produce a verified, read-only map of Madeena production storage topology and uti
 ### Required checks
 
 - Workflow syntax and structure validation (local YAML syntax check, GitHub Actions schema conformance).
-- Verification that all commands in the workflow use read-only flags and prohibit mutation.
+- Verification that all commands in the workflow use read-only flags, probe tool availability, and prohibit mutation.
 - Verification that timeouts (`timeout-minutes`, command-level `timeout`) are properly configured.
 - Verification of redaction and allowlist filtering for storage variables and runtime inspects.
 
@@ -228,11 +232,15 @@ The Executor MUST report:
 - Static workflow verification output.
 - Following authorized execution:
   - Workflow run ID, URL, runner machine, and execution duration.
-  - Complete block-device, filesystem, and LVM topology findings.
-  - Resolved Nextcloud and MinIO storage paths and co-location status.
+  - Complete block-device, filesystem, and LVM topology findings (with justified UNRESOLVED entries where applicable).
+  - Nextcloud and MinIO storage paths and co-location status (`SAME FILESYSTEM`, `DIFFERENT FILESYSTEMS`, or `UNRESOLVED`).
   - Root filesystem consumer breakdown and large-file inventory.
   - Formulated cleanup candidate classification.
-  - Confirmation of zero mutation and zero errors.
+  - Confirmation of:
+    - zero unauthorized mutation;
+    - zero destructive operations;
+    - all probe failures, unavailable tools, permission denials, and timeouts explicitly reported;
+    - no silent omission or fabricated result.
 
 ## Stop conditions
 

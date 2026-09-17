@@ -1,12 +1,13 @@
 ---
 title: Audit Madeena Production Storage Topology and Utilization
 document_id: AGENT-TASK-ADMIN-INFRA-004
-version: 1.1
+version: 1.2
 status: Validated/Published
 language: en-US
 last_updated: 2026-09-17
 scope:
   - read-only mapping of production storage topology and disk utilization
+  - reusable workflow architecture invoked via existing server-debug.yml control plane
   - root filesystem (/) capacity, LVM backing, and major consumer category breakdown
   - additional storage mount (/media/nextcloud-data) capacity and mapping
   - effective DATA_PARTITIONS monitored mount targets identification
@@ -71,6 +72,7 @@ The audit itself MUST remain strictly read-only and fail-closed: it must not del
 ### Execution & Environment Boundary Clarification
 - **Antigravity Local Shell ≠ Madeena Production Server:** The local shell environment contains repository code and development tools, but has no direct access to production. Production evidence must come solely from authorized GitHub Actions workflow runs.
 - **Separate Human Approval for Workflow Dispatch:** Authoring, validating, and publishing this task does NOT authorize dispatching any production workflow. Every workflow run against production requires separate, explicit human authorization.
+- **Dispatch Control Plane & Default Branch Constraint:** GitHub Actions `workflow_dispatch` requires the dispatched workflow file to exist on the default branch (`main`). Direct modification of `main` is outside current authority. Therefore, `.github/workflows/server-debug.yml` (which already exists on the default branch) serves as the manual dispatch entrypoint, and calls the dedicated `.github/workflows/server-storage-audit.yml` as a local reusable workflow (`workflow_call`), strictly gated to execute only on `task/server-storage-audit`.
 
 ## Baseline and task revision
 
@@ -92,13 +94,14 @@ The immutable revision is supplied externally by version-control history and rep
 
 ## Objective
 
-Produce a verified, read-only map of Madeena production storage topology and utilization, including root storage / root filesystem / LVM-backed root, additional storage mount /media/nextcloud-data, monitored data partitions, Nextcloud and MinIO storage placement, major root-filesystem consumers, and evidence-based cleanup candidates, without modifying production state.
+Produce a verified, read-only map of Madeena production storage topology and utilization, including root storage / root filesystem / LVM-backed root, additional storage mount /media/nextcloud-data, monitored data partitions, Nextcloud and MinIO storage placement, major root-filesystem consumers, and evidence-based cleanup candidates, without modifying production state. Execution is mediated via a reusable workflow architecture called by the existing manual-dispatch control-plane workflow on the isolated branch.
 
 ## Authoritative inputs
 
 ### Governing authority
 
 - User Operational Directive & Task Handoff: "Produce a verified, read-only map of Madeena production storage topology and utilization, including root storage / root filesystem / LVM-backed root, additional storage mount /media/nextcloud-data, monitored data partitions, Nextcloud and MinIO storage placement, major root-filesystem consumers, and evidence-based cleanup candidates, without modifying production state."
+- User Architectural Remediation Directive: Storage Audit Dispatch Architecture (reusable workflow called by existing `server-debug.yml` on branch gate `github.ref_name == 'task/server-storage-audit'`).
 - Verified Predecessor Production Evidence: Workflow Run `35054440176` on commit `8175e0212cddeb34233af2fea18eeb242e0c0962`.
 - Repository AI Delivery Contract: `.agents/AGENTS.md`
 - Normative Software Delivery Protocol: `.agents/software-workflow.md`
@@ -107,21 +110,26 @@ Produce a verified, read-only map of Madeena production storage topology and uti
 
 ### Requirement traceability
 
-- `REQ-STORAGE-AUDIT-TOPOLOGY` (Block-device, filesystem, and LVM topology mapping) → User Directive
+- `REQ-STORAGE-AUDIT-DISPATCH-ARCH` (Reusable workflow architecture via existing `server-debug.yml` without modifying default branch) → User Architecture Directive
+- `REQ-STORAGE-AUDIT-TOPOLOGY` (Block-device, filesystem, and LVM topology mapping with explicit allowlisted columns) → User Directive
 - `REQ-STORAGE-AUDIT-DATA-PARTITIONS` (Safe identification of monitored DATA_PARTITIONS mount targets) → User Directive
 - `REQ-STORAGE-AUDIT-APP-PLACEMENT` (Nextcloud & MinIO storage filesystem mapping and co-location determination) → User Directive
 - `REQ-STORAGE-AUDIT-ROOT-CONSUMERS` (Bounded root filesystem categorization and large-file inventory) → User Directive
 - `REQ-STORAGE-AUDIT-CLEANUP-CANDIDATES` (Evidence-based classification of cleanup candidates) → User Directive
 - `REQ-STORAGE-AUDIT-READONLY-SAFETY` (Strict read-only safety, zero mutation, timeout enforcement) → User Directive & Repository Policy
-- `REQ-STORAGE-AUDIT-SECRET-PRESERVATION` (Redaction of credentials, tokens, private environment variables) → User Directive & Security Policy
+- `REQ-STORAGE-AUDIT-SECRET-ISOLATION` (Strict isolation of secrets, no secret inheritance to reusable audit workflow) → User Directive & Security Policy
 
 ## Scope
 
 ### In scope
 
-- Implementation of a dedicated, manual-dispatch GitHub Actions workflow (`.github/workflows/server-storage-audit.yml`) targeting `[self-hosted, linux, x64, production]`.
+- Implementation of a dedicated reusable GitHub Actions workflow (`.github/workflows/server-storage-audit.yml`) defining `workflow_call`, targeting `[self-hosted, linux, x64, production]`, with least-privilege `permissions: contents: read`.
+- Addition of a storage-audit caller job in `.github/workflows/server-debug.yml` on branch `task/server-storage-audit` invoking `./.github/workflows/server-storage-audit.yml` (resolving from the same commit), strictly gated by `if: github.ref_name == 'task/server-storage-audit'`.
+- Adjustment of the legacy `full-audit` job condition in `server-debug.yml` so that `full-audit` is skipped on `task/server-storage-audit` (runs only when `ref_name` is neither `task/server-disk-alert-threshold-80` nor `task/server-storage-audit`).
+- Preservation of the existing `monitor-threshold-change` job in `server-debug.yml` (runs strictly on `task/server-disk-alert-threshold-80`).
+- Strict secret isolation: the storage audit caller does NOT pass secrets (`secrets: inherit` is forbidden; no database, Nextcloud, MinIO, or host credentials passed).
 - Runtime probe for tool availability prior to execution (`command -v <tool>` for diagnostic utilities, failing gracefully if optional tools are absent).
-- Bounded, read-only inspection of block-device topology (`lsblk` allowlisted fields: name, type, size, fstype, mountpoint, model, rotational indicator; determine physical backing if reliable evidence exists, otherwise report UNRESOLVED).
+- Bounded, read-only inspection of block-device topology using `lsblk` with explicit allowlisted output columns (`NAME,TYPE,SIZE,FSTYPE,MOUNTPOINTS,MODEL,ROTA`), determining physical backing if reliable evidence exists, otherwise reporting `UNRESOLVED`. Serial numbers and WWN are excluded.
 - Bounded, read-only inspection of filesystem and mount topology (`findmnt`, `df -P` for `/`, `/media/nextcloud-data`, monitored `DATA_PARTITIONS`, Nextcloud root, MinIO root).
 - Mapping LVM hierarchy for `/dev/mapper/ubuntu--vg-ubuntu--lv` (`pvdisplay`/`pvs`, `vgdisplay`/`vgs`, `lvdisplay`/`lvs` or equivalent read-only queries if LVM tools are available; report UNRESOLVED if unavailable).
 - Safe extraction of the configured `DATA_PARTITIONS` mount path(s) from `/var/www/madeena-server-monitor/.env` without dumping unrestricted configuration or secret variables.
@@ -140,12 +148,14 @@ Produce a verified, read-only map of Madeena production storage topology and uti
 
 ### Out of scope
 
+- Direct modification or push to `main` (default branch).
 - Any file, volume, container, image, or cache deletion or pruning (no `rm`, `truncate`, `vacuum`, `prune`).
 - Any modification to `.env`, service units, or production configuration.
 - Any service restart, container restart, or daemon reload.
 - Any LVM or filesystem modification (`lvextend`, `lvreduce`, `vgextend`, `resize2fs`, etc.).
 - Modification of monitor thresholds or alert intervals.
 - Package installation or host dependency updates.
+- Passing repository or host secrets to the storage audit workflow.
 - Recursive scans of the additional storage mount (`/media/nextcloud-data`).
 - Content inspection of user files, databases, or object storage.
 - Exposure of disk serial numbers, WWN, passwords, tokens, private keys, or application environment dumps.
@@ -154,6 +164,8 @@ Produce a verified, read-only map of Madeena production storage topology and uti
 ### Preserved behavior
 
 - Zero production mutation: all commands must be strictly passive/read-only.
+- The existing `monitor-threshold-change` job logic and conditions are strictly preserved.
+- The legacy `full-audit` job logic is strictly preserved (only its execution condition is updated to skip the storage-audit branch).
 - All running services, containers, and Swarm tasks remain undisturbed.
 - Host and container process environments remain private and unexposed.
 - Storage mount state, permissions, ownership, and volume mappings remain unchanged.
@@ -162,24 +174,26 @@ Produce a verified, read-only map of Madeena production storage topology and uti
 
 ### Dependencies
 
-- Workflow execution on self-hosted runner labeled `[self-hosted, linux, x64, production]`.
+- Manual dispatch entrypoint via `.github/workflows/server-debug.yml` on `[self-hosted, linux, x64, production]`.
+- Reusable workflow invocation via `./.github/workflows/server-storage-audit.yml` resolving from the same commit on branch `task/server-storage-audit`.
 - Explicit human approval required before any GitHub Actions workflow dispatch.
-- Workflow restricted to `permissions: contents: read`.
+- Reusable audit workflow restricted to `permissions: contents: read` with no inherited secrets.
 
 ### Approved assumptions
 
+- GitHub Actions supports same-repository local reusable workflow calls (`./.github/workflows/server-storage-audit.yml`) executed on the checked-out ref.
 - The production runner environment's available diagnostic tools will be probed at runtime (`command -v`), and probes will adapt gracefully without failing the entire audit.
 - The root filesystem `/dev/mapper/ubuntu--vg-ubuntu--lv` can be inspected locally with `du -x` without traversing into attached mounts.
 - Diagnostic operations can safely complete within a bounded 5-minute total job timeout, with individual commands bounded by strict sub-timeouts (e.g., 30–60s).
 
 ### Remaining approval requirements
 
-- **Designated Human Approval required before production workflow dispatch:** Task authoring and implementation do NOT grant dispatch authority; execution against production requires explicit, separate human authorization.
-- **Audit Plan and Implementation Review:** The workflow implementation must be reviewed and accepted prior to dispatch.
+- **Designated Human Approval required before production workflow dispatch:** Task authoring and implementation do NOT grant dispatch authority; execution against production requires explicit, separate human authorization following review of both workflow files.
+- **Audit Plan and Implementation Review:** The workflow implementations (`server-debug.yml` caller and `server-storage-audit.yml` reusable) must be reviewed and accepted prior to dispatch.
 
 ## Required capabilities
 
-- Repository read and write (for authoring `.github/workflows/server-storage-audit.yml` and task documentation).
+- Repository read and write (for authoring `.github/workflows/server-storage-audit.yml`, updating caller in `server-debug.yml`, and task documentation).
 - Local Git inspection and shell execution within bounded timeouts.
 - GitHub Actions workflow inspection and dispatch capability (contingent upon human authorization).
 
@@ -187,10 +201,18 @@ Produce a verified, read-only map of Madeena production storage topology and uti
 
 ### Constraints
 
+- **Dispatch Architecture:** `server-debug.yml` remains the manual `workflow_dispatch` entrypoint. On branch `task/server-storage-audit`, a caller job invokes `./.github/workflows/server-storage-audit.yml`. No modification of `main` is permitted.
+- **Exact Branch Gating:**
+  - Storage audit caller job in `server-debug.yml` runs only when `github.ref_name == 'task/server-storage-audit'`.
+  - Legacy `full-audit` job in `server-debug.yml` is skipped on `task/server-storage-audit` and `task/server-disk-alert-threshold-80`.
+  - Legacy threshold change job in `server-debug.yml` runs only on `task/server-disk-alert-threshold-80`.
+- **Secret Isolation:** The storage-audit caller MUST NOT pass repository secrets (`secrets: inherit` is prohibited; no database, Nextcloud, MinIO, or host credentials). If a secret-derived path is genuinely needed to resolve topology, STOP and return to Planner/Reviewer rather than passing secrets.
+- **Token Permissions:** The reusable audit workflow uses least-privilege `permissions: contents: read`. No write permissions are granted.
 - **Strict Read-Only Execution:** Every diagnostic probe must be non-destructive and read-only.
 - **Runtime Tool Probing:** Test tool availability using safe read-only checks (`command -v <tool>`). Do not install missing packages or dependencies. If a tool is missing or inaccessible, report the exact status/limitation (`NOT PRESENT / UNAVAILABLE` or `UNRESOLVED`) and continue.
+- **Explicit Allowlisted Output Columns:** `lsblk` must use explicit allowlisted columns (`NAME,TYPE,SIZE,FSTYPE,MOUNTPOINTS,MODEL,ROTA`). Do not request serial or WWN fields.
 - **No Unrestricted Environment/Secret Dumps:** Under no circumstances may `/proc/<pid>/environ`, container `.env` files, or MinIO/Nextcloud credentials be dumped to workflow logs or artifacts.
-- **Diagnostic Timeout Budget:** Hard job timeout of 5 minutes (`timeout-minutes: 5`); individual expensive probes (e.g. `du`) must be protected by internal timeouts (e.g., `timeout 60s`). If a probe times out, it must fail gracefully, record the timeout as `UNRESOLVED (timeout)`, and allow remaining probes to proceed.
+- **Diagnostic Timeout Budget:** Hard job timeout of 5 minutes (`timeout-minutes: 5`) on the reusable audit job; individual expensive probes (e.g. `du`) must be protected by internal timeouts (e.g., `timeout 60s`). If a probe times out, it must fail gracefully, record the timeout as `UNRESOLVED (timeout)`, and allow remaining probes to proceed.
 - **Process Safety:** In the event of a probe timeout, only processes spawned by the audit probe itself may be killed.
 - **Fail-Closed Reporting:** If an item cannot be inspected safely or times out, report it as `UNRESOLVED` with explicit reason rather than guessing or expanding permissions.
 - **Filesystem Isolation:** Root usage analysis must strictly use `-x` (or `--one-file-system`) to prevent descending into `/media/nextcloud-data` or other mounted filesystems.
@@ -198,9 +220,16 @@ Produce a verified, read-only map of Madeena production storage topology and uti
 
 ## Acceptance criteria
 
-- [ ] A dedicated read-only workflow (`.github/workflows/server-storage-audit.yml`) is authored, committed to `task/server-storage-audit`, and validated.
-- [ ] Workflow is manual-dispatch only (`workflow_dispatch`), uses `permissions: contents: read`, and targets `[self-hosted, linux, x64, production]`.
-- [ ] Block-device topology is captured with allowlisted fields (name, type, size, fstype, mountpoint, model, rotational indicator). Physical backing (rotational/non-rotational/SSD/HDD) is reported as RESOLVED with evidence or UNRESOLVED with explicit reason; no premature inference.
+- [ ] A dedicated reusable read-only workflow (`.github/workflows/server-storage-audit.yml`) defining `workflow_call` is authored, committed to `task/server-storage-audit`, and validated.
+- [ ] `.github/workflows/server-debug.yml` remains the manual `workflow_dispatch` entrypoint and is updated on `task/server-storage-audit` with a caller job referencing `./.github/workflows/server-storage-audit.yml`.
+- [ ] Storage audit caller job in `server-debug.yml` runs strictly when `github.ref_name == 'task/server-storage-audit'`.
+- [ ] Legacy `full-audit` job in `server-debug.yml` is skipped on `task/server-storage-audit` (runs only when `ref_name` is neither `task/server-disk-alert-threshold-80` nor `task/server-storage-audit`).
+- [ ] Existing `monitor-threshold-change` job in `server-debug.yml` remains unchanged and skipped on `task/server-storage-audit`.
+- [ ] Reusable workflow call resolves from the same running commit without requiring changes to the repository default branch (`main`).
+- [ ] No repository secrets are passed to the reusable audit workflow (`secrets: inherit` is not used).
+- [ ] Reusable audit workflow has only `permissions: contents: read` and targets `[self-hosted, linux, x64, production]`.
+- [ ] Hard timeout of 5 minutes (`timeout-minutes: 5`) is enforced on the audit job.
+- [ ] Block-device topology is captured with explicit allowlisted fields (`NAME,TYPE,SIZE,FSTYPE,MOUNTPOINTS,MODEL,ROTA`). Physical backing (rotational/non-rotational/SSD/HDD) is reported as RESOLVED with evidence or UNRESOLVED with explicit reason; no premature inference.
 - [ ] Serial numbers, WWN, and unnecessary hardware identifiers are explicitly excluded.
 - [ ] Filesystem and mount topology maps `/`, `/media/nextcloud-data`, and monitored `DATA_PARTITIONS` targets with capacity, used, free, and percentage utilization (or UNRESOLVED with explicit reason if inaccessible).
 - [ ] LVM hierarchy is mapped for `/dev/mapper/ubuntu--vg-ubuntu--lv` (PV -> VG -> LV -> Filesystem) if LVM diagnostic tools are available; reported as UNRESOLVED with explicit reason if tooling or permissions are insufficient.
@@ -214,14 +243,15 @@ Produce a verified, read-only map of Madeena production storage topology and uti
 - [ ] Systemd journal disk usage is reported via `journalctl --disk-usage` if available, or reported as `UNRESOLVED` with explicit reason if unavailable.
 - [ ] Findings are categorized into evidence-based cleanup candidates (reclaimable, requires application review, must not touch) without authorizing mutation.
 - [ ] Zero unauthorized mutation and zero destructive operations are verified: no files deleted, no containers pruned, no services restarted. All probe failures, unavailable tools, permission denials, and timeouts are explicitly reported with no silent omission or fabricated result.
-- [ ] Hard timeout of 5 minutes is enforced on the workflow job.
 
 ## Verification requirements
 
 ### Required checks
 
-- Workflow syntax and structure validation (local YAML syntax check, GitHub Actions schema conformance).
-- Verification that all commands in the workflow use read-only flags, probe tool availability, and prohibit mutation.
+- Workflow syntax and structure validation for both `.github/workflows/server-debug.yml` and `.github/workflows/server-storage-audit.yml` (local YAML syntax check, GitHub Actions schema conformance).
+- Verification of branch conditions: storage audit caller executes only on `task/server-storage-audit`, `full-audit` is skipped on both task branches, `monitor-threshold-change` runs only on threshold branch.
+- Verification that reusable workflow call passes no secrets (`secrets: inherit` absent).
+- Verification that all commands in the audit workflow use read-only flags, probe tool availability, and prohibit mutation.
 - Verification that timeouts (`timeout-minutes`, command-level `timeout`) are properly configured.
 - Verification of redaction and allowlist filtering for storage variables and runtime inspects.
 
@@ -229,7 +259,7 @@ Produce a verified, read-only map of Madeena production storage topology and uti
 
 The Executor MUST report:
 - Implementation Git revision on branch `task/server-storage-audit`.
-- Static workflow verification output.
+- Static workflow verification output for both workflow files.
 - Following authorized execution:
   - Workflow run ID, URL, runner machine, and execution duration.
   - Complete block-device, filesystem, and LVM topology findings (with justified UNRESOLVED entries where applicable).
@@ -247,6 +277,7 @@ The Executor MUST report:
 The Executor MUST stop implementation and return the issue to planning when:
 - An audit probe requires destructive commands or write access.
 - A required observation cannot be completed without dumping passwords, access keys, or secret tokens.
+- Secret passing or inheritance to the reusable workflow is demanded.
 - Production access outside GitHub Actions self-hosted runners is required.
 - Workflow execution cannot be constrained to the 5-minute diagnostic time budget.
 - The Executor is asked to perform file deletion, container pruning, or storage cleanup.
@@ -258,6 +289,7 @@ The Executor MUST stop implementation and return the issue to planning when:
 
 - Authoring, committing, and pushing this validated task document to the isolated branch `task/server-storage-audit`.
 - Authoring, committing, and pushing `.github/workflows/server-storage-audit.yml` to `task/server-storage-audit` during execution.
+- Updating, committing, and pushing the caller job in `.github/workflows/server-debug.yml` on `task/server-storage-audit` during execution.
 - Local syntax and schema validation checks.
 - No direct commit to `main`, no workflow dispatch, and no production modification is authorized by this task publication.
 
@@ -266,7 +298,8 @@ The Executor MUST stop implementation and return the issue to planning when:
 ### Review Required
 
 - When the task document is validated, published, committed, and pushed to the isolated branch `task/server-storage-audit`.
-- Following subsequent authorized implementation and production execution, when diagnostic findings and evidence are ready for Reviewer evaluation.
+- Following subsequent authorized implementation, when both workflow definitions are ready for Reviewer evaluation prior to dispatch.
+- Following subsequent authorized production execution, when diagnostic findings and evidence are ready for Reviewer evaluation.
 
 ### Planning Required
 

@@ -987,9 +987,16 @@ jobs:
           _sudo rm -rf "$backup_dir"
           echo "Backup directory cleaned up successfully."
           echo "=== TRANSACTION COMPLETE: ROOT_DISK_THRESHOLD=80 ACTIVATED & VERIFIED ==="
+  storage-audit:
+    name: "Production Storage Audit — Read Only"
+    if: github.ref_name == 'task/server-storage-audit'
+    permissions:
+      contents: read
+    uses: ./.github/workflows/server-storage-audit.yml
+
   full-audit:
     name: "Full Server Audit"
-    if: github.ref_name != 'task/server-disk-alert-threshold-80'
+    if: github.ref_name != 'task/server-disk-alert-threshold-80' && github.ref_name != 'task/server-storage-audit'
     runs-on: [self-hosted, linux, x64, production]
     permissions:
       contents: read

@@ -456,7 +456,7 @@ jobs:
               VAL_OUT=$(awk -F'\t' '
                 BEGIN { total_mounts = 0; valid_containers = 0; expected_count = 0; err = 0 }
                 NR == FNR {
-                  if (length($0) >= 12 && length($0) <= 64 && $0 ~ /^[0-9a-f]+$/) {
+                  if ((length($0) == 12 || length($0) == 64) && $0 ~ /^[0-9a-f]+$/) {
                     expected[$0] = 1; expected_count++
                   } else if ($0 != "") {
                     print "INVALID_EXPECTED_CID"; err = 1; exit 1
@@ -468,19 +468,33 @@ jobs:
                     print "MALFORMED_RECORD_STRUCTURE"; err = 1; exit 1
                   }
                   cid = $1; cname = $2
-                  if (!(cid in expected)) {
-                    matched = ""
+
+                  # 1. Validate container ID format and explicitly supported representations (12 or 64 hex chars)
+                  if (!((length(cid) == 12 || length(cid) == 64) && cid ~ /^[0-9a-f]+$/)) {
+                    print "INVALID_CONTAINER_ID"; err = 1; exit 1
+                  }
+
+                  # 2. Match against expected container inventory (exact or length-validated prefix)
+                  matched_cid = ""
+                  if (cid in expected) {
+                    matched_cid = cid
+                  } else {
                     for (e in expected) {
-                      if (substr(cid, 1, length(e)) == e || substr(e, 1, length(cid)) == cid) {
-                        if (matched != "") { matched = "AMBIGUOUS"; break }
-                        matched = e
+                      if ((length(cid) == 64 && length(e) == 12 && substr(cid, 1, 12) == e) || \
+                          (length(cid) == 12 && length(e) == 64 && substr(e, 1, 12) == cid)) {
+                        if (matched_cid != "") {
+                          print "AMBIGUOUS_CONTAINER_ID"; err = 1; exit 1
+                        }
+                        matched_cid = e
                       }
                     }
-                    if (matched == "" || matched == "AMBIGUOUS") {
-                      print "UNEXPECTED_CONTAINER_ID"; err = 1; exit 1
-                    }
-                    cid = matched
                   }
+
+                  if (matched_cid == "") {
+                    print "UNEXPECTED_CONTAINER_ID"; err = 1; exit 1
+                  }
+                  cid = matched_cid
+
                   if (seen[cid]++) {
                     print "DUPLICATE_RECORD"; err = 1; exit 1
                   }

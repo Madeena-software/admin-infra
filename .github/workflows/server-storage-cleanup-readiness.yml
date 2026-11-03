@@ -442,19 +442,81 @@ jobs:
           elif [ "$NC" -eq 0 ]; then
             echo "Container mount sources: 0 (0 active or stopped containers)"
           else
-            MNTS_OUT=$(timeout 15 $D inspect --format '{{.Name}}{{range .Mounts}} [{{.Type}}] {{.Source}}{{end}}' $CIDS 2>/dev/null); MNTS_RC=$?
+            # Save expected container IDs to state file for structured validation
+            printf '%s\n' "$CIDS" > "$STATE_DIR/cids.txt"
+            MNTS_RAW=$(timeout 15 $D inspect --format '{{.Id}}	{{.Name}}{{range .Mounts}}	{{.Type}}|{{.Source}}{{end}}' $CIDS 2>/dev/null); MNTS_RC=$?
             if [ $MNTS_RC -eq 124 ]; then
               M_INC="container inspect mounts timeout >15s"
             elif [ $MNTS_RC -ne 0 ]; then
               M_INC="container inspect mounts failed (exit $MNTS_RC)"
+            elif [ -z "$MNTS_RAW" ]; then
+              M_INC="container inspect mounts returned empty output for $NC expected containers"
             else
-              N_INSP=$(printf '%s\n' "$MNTS_OUT" | grep -c .)
-              if [ "$N_INSP" -ne "$NC" ]; then
-                M_INC="container inspect mounts returned $N_INSP of $NC container records"
+              printf '%s\n' "$MNTS_RAW" > "$STATE_DIR/inspect_mounts.tsv"
+              VAL_OUT=$(awk -F'\t' '
+                BEGIN { total_mounts = 0; valid_containers = 0; expected_count = 0; err = 0 }
+                NR == FNR {
+                  if (length($0) >= 12 && length($0) <= 64 && $0 ~ /^[0-9a-f]+$/) {
+                    expected[$0] = 1; expected_count++
+                  } else if ($0 != "") {
+                    print "invalid expected container ID: " $0; err = 1; exit 1
+                  }
+                  next
+                }
+                {
+                  cid = $1; cname = $2
+                  if (!(cid in expected)) {
+                    matched = ""
+                    for (e in expected) {
+                      if (substr(cid, 1, length(e)) == e || substr(e, 1, length(cid)) == cid) {
+                        if (matched != "") { matched = "AMBIGUOUS"; break }
+                        matched = e
+                      }
+                    }
+                    if (matched == "" || matched == "AMBIGUOUS") {
+                      print "unexpected container ID in inspect output: " cid; err = 1; exit 1
+                    }
+                    cid = matched
+                  }
+                  if (seen[cid]++) {
+                    print "duplicate container record in inspect output: " cid; err = 1; exit 1
+                  }
+                  if (cname !~ /^\/[A-Za-z0-9_.-]+$/) {
+                    print "malformed container name in inspect output: " cname; err = 1; exit 1
+                  }
+                  for (i = 3; i <= NF; i++) {
+                    if ($i == "") continue
+                    sep = index($i, "|")
+                    if (sep <= 1 || sep == length($i)) {
+                      print "malformed mount record (missing delimiter): " $i; err = 1; exit 1
+                    }
+                    mtype = substr($i, 1, sep - 1)
+                    msrc = substr($i, sep + 1)
+                    if (mtype !~ /^[a-z]+$/ || msrc == "") {
+                      print "invalid mount type or source: " $i; err = 1; exit 1
+                    }
+                    total_mounts++
+                  }
+                  valid_containers++
+                }
+                END {
+                  if (err) exit err
+                  if (NR == FNR && expected_count > 0) {
+                    print "empty inspect output"; exit 1
+                  }
+                  if (valid_containers != expected_count) {
+                    print "container record count mismatch: expected " expected_count ", got " valid_containers; exit 1
+                  }
+                  print "VALID:" total_mounts
+                }
+              ' "$STATE_DIR/cids.txt" "$STATE_DIR/inspect_mounts.tsv" 2>&1); VAL_RC=$?
+
+              if [ $VAL_RC -ne 0 ] || ! printf '%s' "$VAL_OUT" | grep -q '^VALID:[0-9]\+$'; then
+                M_INC="container mounts validation failed: $VAL_OUT"
               else
-                N_MNT=$(printf '%s\n' "$MNTS_OUT" | grep -o '\[[a-z]*\]' | wc -l)
-                echo "Container mount sources ($N_MNT mount(s) across $NC container(s)):"
-                printf '%s\n' "$MNTS_OUT" | head -40
+                N_MNT=$(printf '%s' "$VAL_OUT" | sed 's/^VALID://')
+                echo "Container mount sources ($N_MNT mount(s) across $NC container(s)): [VALIDATED]"
+                awk -F'\t' '{ printf "  %s (%s): ", $2, substr($1,1,12); if (NF>2) { for(i=3;i<=NF;i++) printf "[%s] ", $i; print "" } else { print "0 mounts" } }' "$STATE_DIR/inspect_mounts.tsv" | head -40
               fi
             fi
           fi

@@ -28,6 +28,7 @@ jobs:
           mkdir -p "$STATE_DIR"
           : > "$STATE_DIR/matrix.tsv"
           : > "$STATE_DIR/reconciliation.tsv"
+          : > "$STATE_DIR/seen_identities.txt"
 
           # Shared read-only helpers sourced by later steps.
           cat > "$STATE_DIR/lib.sh" <<'LIB'
@@ -57,8 +58,56 @@ jobs:
             printf '%s' "$v" | grep -Eq '^[0-9]+$' || { KWHY="non-numeric du output"; return 1; }
             K="$v"; return 0
           }
-          # row_root KIND PARENT NAME USAGE_KIB STATUS NOTES
-          row_root() { printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$@" >> "$STATE_DIR/reconciliation.tsv"; }
+          # get_devino PATH : returns "st_dev:st_ino" or "none"
+          get_devino() {
+            _di=""
+            if [ -n "$1" ] && $S test -e "$1" 2>/dev/null; then
+              _di=$(timeout 15 $S stat -L -c '%d:%i' -- "$1" 2>/dev/null)
+            fi
+            if printf '%s' "$_di" | grep -Eq '^[0-9]+:[0-9]+$'; then
+              printf '%s' "$_di"
+            else
+              printf 'none'
+            fi
+          }
+          # get_realpath PATH : returns canonical realpath or literal path or none
+          get_realpath() {
+            _rp=""
+            if [ -n "$1" ] && $S test -e "$1" 2>/dev/null; then
+              _rp=$(timeout 15 $S realpath -- "$1" 2>/dev/null)
+            fi
+            if valid_path "$_rp"; then
+              printf '%s' "$_rp"
+            elif valid_path "$1"; then
+              printf '%s' "$1"
+            else
+              printf 'none'
+            fi
+          }
+          # record_identity PATH DEVINO REALPATH
+          record_identity() {
+            _p="$1"; _di="$2"; _rp="$3"
+            [ -n "$_di" ] && [ "$_di" != "none" ] && echo "devino:$_di" >> "$STATE_DIR/seen_identities.txt"
+            [ -n "$_rp" ] && [ "$_rp" != "none" ] && echo "path:$_rp" >> "$STATE_DIR/seen_identities.txt"
+            [ -n "$_p" ] && [ "$_p" != "none" ] && echo "path:$_p" >> "$STATE_DIR/seen_identities.txt"
+          }
+          # is_seen_identity PATH DEVINO REALPATH
+          is_seen_identity() {
+            _p="$1"; _di="$2"; _rp="$3"
+            [ -s "$STATE_DIR/seen_identities.txt" ] || return 1
+            if [ -n "$_di" ] && [ "$_di" != "none" ] && grep -Fqx "devino:$_di" "$STATE_DIR/seen_identities.txt" 2>/dev/null; then
+              return 0
+            fi
+            if [ -n "$_rp" ] && [ "$_rp" != "none" ] && grep -Fqx "path:$_rp" "$STATE_DIR/seen_identities.txt" 2>/dev/null; then
+              return 0
+            fi
+            if [ -n "$_p" ] && [ "$_p" != "none" ] && grep -Fqx "path:$_p" "$STATE_DIR/seen_identities.txt" 2>/dev/null; then
+              return 0
+            fi
+            return 1
+          }
+          # row_root KIND PARENT NAME PATH DEV_INO REAL_PATH USAGE_KIB STATUS NOTES
+          row_root() { printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$@" >> "$STATE_DIR/reconciliation.tsv"; }
           # sized CATEGORY PATH RISK DEPENDENCY ACTION : measure and add a matrix row
           sized() {
             if $S test -e "$2" 2>/dev/null; then
@@ -82,33 +131,37 @@ jobs:
           # sized_level NAME PATH KIND PARENT RISK DEPENDENCY ACTION
           sized_level() {
             _name="$1"; _path="$2"; _kind="$3"; _parent="$4"; _risk="$5"; _dep="$6"; _act="$7"
+            _di=$(get_devino "$_path")
+            _rp=$(get_realpath "$_path")
+
             if [ "$_kind" = "LEVEL1" ]; then
               if $S test -e "$_path" 2>/dev/null; then
                 placement "$_path"
                 if [ "$PL" = "SECONDARY" ]; then
                   echo "$_path is on a separate filesystem mount: $PL_TGT on $PL_SRC ($PL_MED); excluded from root SSD accounting."
                   if du_k "$_path"; then
-                    row_root "SECONDARY" "$PL_TGT" "$_name" "$K" "RESOLVED (separate mount: $PL_TGT)" "$_risk; $_dep"
+                    row_root "SECONDARY" "$PL_TGT" "$_name" "$_path" "$_di" "$_rp" "$K" "RESOLVED (separate mount: $PL_TGT)" "$_risk; $_dep"
                     row "$_name (separate mount: $PL_TGT)" "$(gib "$K") physical" "not on root fs" "du -sxk $_path" "RESOLVED" "$_risk" "$_dep" "$_act" "Yes"
                   else
-                    row_root "SECONDARY" "$PL_TGT" "$_name" "unknown" "UNRESOLVED ($KWHY)" "$_risk; $_dep"
+                    row_root "SECONDARY" "$PL_TGT" "$_name" "$_path" "$_di" "$_rp" "unknown" "UNRESOLVED ($KWHY)" "$_risk; $_dep"
                     row "$_name (separate mount: $PL_TGT)" "unknown" "unknown" "du -sxk $_path" "UNRESOLVED ($KWHY)" "$_risk" "$_dep" "$_act" "Yes"
                   fi
                   return 0
                 elif [ "$PL" = "UNRESOLVED" ]; then
                   echo "UNRESOLVED placement for $_path ($PL_WHY)"
-                  row_root "LEVEL1" "$_parent" "$_name" "unknown" "UNRESOLVED (placement: $PL_WHY)" "$_risk; $_dep"
+                  row_root "LEVEL1" "$_parent" "$_name" "$_path" "$_di" "$_rp" "unknown" "UNRESOLVED (placement: $PL_WHY)" "$_risk; $_dep"
                   row "$_name" "unknown" "unknown" "findmnt/df placement check" "UNRESOLVED (placement: $PL_WHY)" "$_risk" "$_dep" "$_act" "Yes"
                   return 0
                 fi
+                record_identity "$_path" "$_di" "$_rp"
               else
                 if [ -n "$S" ]; then
                   echo "Absent: $_path"
-                  row_root "LEVEL1" "$_parent" "$_name" "0" "RESOLVED (absent)" "path not present"
+                  row_root "LEVEL1" "$_parent" "$_name" "$_path" "$_di" "$_rp" "0" "RESOLVED (absent)" "path not present"
                   row "$_name" "0 GiB" "none" "test -e" "RESOLVED (absent)" "$_risk" "$_dep" "$_act" "Yes"
                 else
                   echo "UNRESOLVED ($_path: not accessible without sudo)"
-                  row_root "LEVEL1" "$_parent" "$_name" "unknown" "UNRESOLVED (not accessible without sudo)" "$_risk; $_dep"
+                  row_root "LEVEL1" "$_parent" "$_name" "$_path" "$_di" "$_rp" "unknown" "UNRESOLVED (not accessible without sudo)" "$_risk; $_dep"
                   row "$_name" "unknown" "unknown" "test -e" "UNRESOLVED (not accessible without sudo)" "$_risk" "$_dep" "$_act" "Yes"
                 fi
                 return 0
@@ -119,21 +172,21 @@ jobs:
             if $S test -e "$_path" 2>/dev/null; then
               if du_k "$_path"; then
                 echo "RESOLVED with evidence: $_path = $(gib "$K")"
-                row_root "$_kind" "$_parent" "$_name" "$K" "RESOLVED" "$_risk; $_dep"
+                row_root "$_kind" "$_parent" "$_name" "$_path" "$_di" "$_rp" "$K" "RESOLVED" "$_risk; $_dep"
                 row "$_name" "$(gib "$K") physical" "not estimated" "du -sxk $_path" "RESOLVED" "$_risk" "$_dep" "$_act" "Yes"
               else
                 echo "UNRESOLVED ($_path: $KWHY)"
-                row_root "$_kind" "$_parent" "$_name" "unknown" "UNRESOLVED ($KWHY)" "$_risk; $_dep"
+                row_root "$_kind" "$_parent" "$_name" "$_path" "$_di" "$_rp" "unknown" "UNRESOLVED ($KWHY)" "$_risk; $_dep"
                 row "$_name" "unknown" "unknown" "du -sxk $_path" "UNRESOLVED ($KWHY)" "$_risk" "$_dep" "$_act" "Yes"
               fi
             else
               if [ -n "$S" ]; then
                 echo "Absent: $_path"
-                row_root "$_kind" "$_parent" "$_name" "0" "RESOLVED (absent)" "path not present"
+                row_root "$_kind" "$_parent" "$_name" "$_path" "$_di" "$_rp" "0" "RESOLVED (absent)" "path not present"
                 row "$_name" "0 GiB" "none" "test -e" "RESOLVED (absent)" "$_risk" "$_dep" "$_act" "Yes"
               else
                 echo "UNRESOLVED ($_path: not accessible without sudo)"
-                row_root "$_kind" "$_parent" "$_name" "unknown" "UNRESOLVED (not accessible without sudo)" "$_risk; $_dep"
+                row_root "$_kind" "$_parent" "$_name" "$_path" "$_di" "$_rp" "unknown" "UNRESOLVED (not accessible without sudo)" "$_risk; $_dep"
                 row "$_name" "unknown" "unknown" "test -e" "UNRESOLVED (not accessible without sudo)" "$_risk" "$_dep" "$_act" "Yes"
               fi
             fi
@@ -373,7 +426,7 @@ jobs:
             done
           else
             echo "UNRESOLVED (Docker Root Dir missing or not a strict path)"
-            row_root "LEVEL1" "/" "Docker Root (/var/lib/docker)" "unknown" "UNRESOLVED (root dir not determinable)" "Docker root dir missing or invalid"
+            row_root "LEVEL1" "/" "Docker Root (/var/lib/docker)" "/var/lib/docker" "none" "/var/lib/docker" "unknown" "UNRESOLVED (root dir not determinable)" "Docker root dir missing or invalid"
             row "Docker root dir" "unknown" "unknown" "docker info" "UNRESOLVED (root dir not determinable)" "Medium" "n/a" "n/a" "Yes"
           fi
           echo ""
@@ -386,7 +439,7 @@ jobs:
             if [ $C_FIND_RC -ne 0 ]; then
               if [ $C_FIND_RC -eq 124 ]; then C_FAIL="timeout >15s"; else C_FAIL="find exit $C_FIND_RC"; fi
               echo "Containerd immediate enumeration: UNRESOLVED ($C_FAIL)"
-              row_root "LEVEL1" "/var/lib/containerd" "containerd (unmeasured entries)" "unknown" "UNRESOLVED ($C_FAIL)" "Immediate subdirectory enumeration incomplete"
+              row_root "LEVEL1" "/var/lib/containerd" "containerd (unmeasured entries)" "/var/lib/containerd" "none" "/var/lib/containerd" "unknown" "UNRESOLVED ($C_FAIL)" "Immediate subdirectory enumeration incomplete"
               row "containerd inventory" "unknown" "unknown" "find /var/lib/containerd" "UNRESOLVED ($C_FAIL)" "Medium" "containerd inventory incomplete" "None" "Yes"
             else
               cat "$STATE_DIR/containerd_entries.tsv" 2>/dev/null | head -30
@@ -400,6 +453,8 @@ jobs:
 
             # 3. Metadata database (distinguishing allocated physical blocks from apparent logical size)
             BOLT_FILE="/var/lib/containerd/io.containerd.metadata.v1.bolt/meta.db"
+            b_di=$(get_devino "$BOLT_FILE")
+            b_rp=$(get_realpath "$BOLT_FILE")
             if $S test -f "$BOLT_FILE" 2>/dev/null; then
               du_k "$BOLT_FILE"
               b_alloc="$K"; b_why="$KWHY"
@@ -408,21 +463,21 @@ jobs:
                 b_alloc_h=$(gib "$b_alloc")
                 b_app_h=$(awk -v b="$b_app" 'BEGIN{printf "%.2f MiB", b/(1024*1024)}')
                 echo "RESOLVED with evidence: $BOLT_FILE = $b_alloc_h physical allocated ($b_app_h apparent size)"
-                row_root "LEVEL1" "/var/lib/containerd" "containerd/io.containerd.metadata.v1.bolt" "$b_alloc" "RESOLVED" "$b_alloc_h physical allocated ($b_app_h apparent)"
+                row_root "LEVEL1" "/var/lib/containerd" "containerd/io.containerd.metadata.v1.bolt" "$BOLT_FILE" "$b_di" "$b_rp" "$b_alloc" "RESOLVED" "$b_alloc_h physical allocated ($b_app_h apparent)"
                 row "Containerd metadata DB (meta.db)" "$b_alloc_h physical allocated ($b_app_h apparent)" "none" "du -sxk + stat -c %s meta.db" "RESOLVED" "High" "Active metadata database" "None (protected)" "Yes"
               else
                 echo "UNRESOLVED ($BOLT_FILE: ${b_why:-stat exit $b_rc})"
-                row_root "LEVEL1" "/var/lib/containerd" "containerd/io.containerd.metadata.v1.bolt" "unknown" "UNRESOLVED (${b_why:-stat failed})" "allocated size unknown"
+                row_root "LEVEL1" "/var/lib/containerd" "containerd/io.containerd.metadata.v1.bolt" "$BOLT_FILE" "$b_di" "$b_rp" "unknown" "UNRESOLVED (${b_why:-stat failed})" "allocated size unknown"
                 row "Containerd metadata DB (meta.db)" "unknown" "none" "du -sxk + stat -c %s meta.db" "UNRESOLVED (${b_why:-stat failed})" "High" "Active metadata database" "None (protected)" "Yes"
               fi
             else
               if [ -n "$S" ]; then
                 echo "Absent: $BOLT_FILE"
-                row_root "LEVEL1" "/var/lib/containerd" "containerd/io.containerd.metadata.v1.bolt" "0" "RESOLVED (absent)" "file not present"
+                row_root "LEVEL1" "/var/lib/containerd" "containerd/io.containerd.metadata.v1.bolt" "$BOLT_FILE" "$b_di" "$b_rp" "0" "RESOLVED (absent)" "file not present"
                 row "Containerd metadata DB (meta.db)" "absent" "none" "test -f" "RESOLVED (absent)" "Low" "n/a" "None" "Yes"
               else
                 echo "UNRESOLVED ($BOLT_FILE: not accessible without sudo)"
-                row_root "LEVEL1" "/var/lib/containerd" "containerd/io.containerd.metadata.v1.bolt" "unknown" "UNRESOLVED (not accessible without sudo)" "permission denied or absent"
+                row_root "LEVEL1" "/var/lib/containerd" "containerd/io.containerd.metadata.v1.bolt" "$BOLT_FILE" "$b_di" "$b_rp" "unknown" "UNRESOLVED (not accessible without sudo)" "permission denied or absent"
                 row "Containerd metadata DB (meta.db)" "unknown" "none" "test -f" "UNRESOLVED (not accessible without sudo)" "High" "Active metadata database" "None (protected)" "Yes"
               fi
             fi
@@ -444,11 +499,11 @@ jobs:
             fi
           elif [ -n "$S" ] && ! $S test -e "/var/lib/containerd" 2>/dev/null; then
             echo "/var/lib/containerd: NOT PRESENT"
-            row_root "LEVEL1" "/" "/var/lib/containerd" "0" "RESOLVED (absent)" "directory not present"
+            row_root "LEVEL1" "/" "/var/lib/containerd" "/var/lib/containerd" "none" "/var/lib/containerd" "0" "RESOLVED (absent)" "directory not present"
             row "containerd storage" "0 GiB" "none" "test -e" "RESOLVED (absent)" "Low" "n/a" "None" "Yes"
           else
             echo "/var/lib/containerd: UNRESOLVED (not accessible)"
-            row_root "LEVEL1" "/" "/var/lib/containerd" "unknown" "UNRESOLVED (not accessible)" "Directory not accessible"
+            row_root "LEVEL1" "/" "/var/lib/containerd" "/var/lib/containerd" "none" "/var/lib/containerd" "unknown" "UNRESOLVED (not accessible)" "Directory not accessible"
             row "containerd storage" "unknown" "unknown" "test -d" "UNRESOLVED (not accessible)" "Medium" "n/a" "None" "Yes"
           fi
           echo ""
@@ -810,12 +865,17 @@ jobs:
             if [ $VLIB_FIND_RC -ne 0 ]; then
               if [ $VLIB_FIND_RC -eq 124 ]; then VLIB_FAIL="timeout >15s"; else VLIB_FAIL="find exit $VLIB_FIND_RC"; fi
               echo "UNRESOLVED (/var/lib enumeration failed: $VLIB_FAIL)"
-              row_root "LEVEL1" "/" "/var/lib (system & other)" "unknown" "UNRESOLVED ($VLIB_FAIL)" "Enumeration failed"
+              row_root "LEVEL1" "/" "/var/lib (system & other)" "/var/lib" "none" "/var/lib" "unknown" "UNRESOLVED ($VLIB_FAIL)" "Enumeration failed"
               row "/var/lib (system & other)" "unknown" "unknown" "find /var/lib" "UNRESOLVED ($VLIB_FAIL)" "Medium" "System and application state outside docker/containerd" "None" "Yes"
             else
               VLIB_OTHER_KIB=0
               VLIB_OTHER_UNRESOLVED=0
               VLIB_TOTAL_COUNT=0
+              ROOT_FS_DEV=$(timeout 15 $S stat -c %d / 2>/dev/null)
+              if ! printf '%s' "$ROOT_FS_DEV" | grep -Eq '^[0-9]+$'; then
+                ROOT_FS_DEV=""
+              fi
+
               while IFS=$'\t' read -r v_entry v_type; do
                 [ -z "$v_entry" ] && continue
                 case "$v_entry" in
@@ -828,19 +888,67 @@ jobs:
                   VLIB_OTHER_UNRESOLVED=$((VLIB_OTHER_UNRESOLVED + 1))
                   case "$bname" in
                     simama|madeena_cp|mhcs_core|madeena-iam)
-                      row_root "CHILD" "/var/lib (system & other)" "App storage: /var/lib/$bname" "unknown" "UNRESOLVED (invalid path)" "Application persistent state (nested under /var/lib)"
+                      row_root "CHILD" "/var/lib (system & other)" "App storage: /var/lib/$bname" "$v_entry" "none" "$v_entry" "unknown" "UNRESOLVED (invalid path)" "Application persistent state (nested under /var/lib)"
                       row "App storage: /var/lib/$bname" "unknown" "unknown" "valid_path" "UNRESOLVED (invalid path)" "High" "Application state" "None (protected)" "Yes"
                       ;;
                   esac
                   continue
                 fi
 
+                v_di=$(get_devino "$v_entry")
+                v_rp=$(get_realpath "$v_entry")
+                v_dev=$(timeout 15 $S stat -L -c %d -- "$v_entry" 2>/dev/null)
+
+                # 1. Verify filesystem identity and mount relationship
+                placement "$v_entry"
+                if [ "$PL" = "UNRESOLVED" ]; then
+                  echo "UNRESOLVED placement for $v_entry ($PL_WHY)"
+                  VLIB_OTHER_UNRESOLVED=$((VLIB_OTHER_UNRESOLVED + 1))
+                  continue
+                fi
+
+                if [ -z "$ROOT_FS_DEV" ] || ! printf '%s' "$v_dev" | grep -Eq '^[0-9]+$'; then
+                  echo "UNRESOLVED ($v_entry: cannot determine filesystem device ID)"
+                  VLIB_OTHER_UNRESOLVED=$((VLIB_OTHER_UNRESOLVED + 1))
+                  continue
+                fi
+
+                if [ "$PL" = "SECONDARY" ] || [ "$v_dev" != "$ROOT_FS_DEV" ]; then
+                  echo "$v_entry is on a separate filesystem mount (${PL_TGT:-$v_entry}); excluded from root SSD total."
+                  if du_k "$v_entry"; then
+                    row_root "SECONDARY" "${PL_TGT:-$v_entry}" "/var/lib/$bname" "$v_entry" "$v_di" "$v_rp" "$K" "RESOLVED (separate mount: ${PL_TGT:-$v_entry})" "Separate mount under /var/lib; excluded from root sum"
+                    row "/var/lib/$bname (separate mount)" "$(gib "$K") physical" "not on root fs" "du -sxk $v_entry" "RESOLVED" "Medium" "Separate filesystem mount; excluded from root sum" "None" "Yes"
+                  else
+                    row_root "SECONDARY" "${PL_TGT:-$v_entry}" "/var/lib/$bname" "$v_entry" "$v_di" "$v_rp" "unknown" "UNRESOLVED ($KWHY)" "Separate mount under /var/lib; excluded from root sum"
+                    row "/var/lib/$bname (separate mount)" "unknown" "unknown" "du -sxk $v_entry" "UNRESOLVED ($KWHY)" "Medium" "Separate filesystem mount; excluded from root sum" "None" "Yes"
+                  fi
+                  continue
+                fi
+
+                # 2. Detect symlinks / aliases
+                if $S test -L "$v_entry" 2>/dev/null; then
+                  echo "$v_entry is a symbolic link to $v_rp; excluded from root sum to prevent double-counting."
+                  row_root "CHILD" "/var/lib (system & other)" "/var/lib/$bname (symlink)" "$v_entry" "$v_di" "$v_rp" "0" "RESOLVED (symlink)" "Symlink to $v_rp; excluded from physical sum"
+                  row "/var/lib/$bname (symlink)" "0 GiB" "none" "test -L + realpath" "RESOLVED (symlink)" "Low" "Symlink to $v_rp" "None" "Yes"
+                  continue
+                fi
+
+                # 3. Detect bind-mounted or aliased paths duplicating already measured root storage
+                if is_seen_identity "$v_entry" "$v_di" "$v_rp"; then
+                  echo "$v_entry shares filesystem identity with an already measured component ($v_di, $v_rp); excluded to prevent double-counting."
+                  row_root "CHILD" "/var/lib (system & other)" "/var/lib/$bname (alias/bind-mount)" "$v_entry" "$v_di" "$v_rp" "0" "RESOLVED (alias)" "Bind-mount or alias of already measured path; excluded from sum"
+                  row "/var/lib/$bname (alias/bind-mount)" "0 GiB physical" "none" "identity match" "RESOLVED (alias)" "Medium" "Bind mount or alias; excluded from sum" "None" "Yes"
+                  continue
+                fi
+
+                # 4. Measure genuine disjoint root-backed entry
                 if du_k "$v_entry"; then
                   echo "RESOLVED with evidence: $v_entry = $(gib "$K")"
                   VLIB_OTHER_KIB=$((VLIB_OTHER_KIB + K))
+                  record_identity "$v_entry" "$v_di" "$v_rp"
                   case "$bname" in
                     simama|madeena_cp|mhcs_core|madeena-iam)
-                      row_root "CHILD" "/var/lib (system & other)" "App storage: /var/lib/$bname" "$K" "RESOLVED" "Application persistent state (nested under /var/lib)"
+                      row_root "CHILD" "/var/lib (system & other)" "App storage: /var/lib/$bname" "$v_entry" "$v_di" "$v_rp" "$K" "RESOLVED" "Application persistent state (nested under /var/lib)"
                       row "App storage: /var/lib/$bname" "$(gib "$K") physical" "not estimated" "du -sxk $v_entry" "RESOLVED" "High" "Application state; nested under /var/lib" "None (protected)" "Yes"
                       ;;
                   esac
@@ -849,31 +957,33 @@ jobs:
                   VLIB_OTHER_UNRESOLVED=$((VLIB_OTHER_UNRESOLVED + 1))
                   case "$bname" in
                     simama|madeena_cp|mhcs_core|madeena-iam)
-                      row_root "CHILD" "/var/lib (system & other)" "App storage: /var/lib/$bname" "unknown" "UNRESOLVED ($KWHY)" "Application persistent state (nested under /var/lib)"
+                      row_root "CHILD" "/var/lib (system & other)" "App storage: /var/lib/$bname" "$v_entry" "$v_di" "$v_rp" "unknown" "UNRESOLVED ($KWHY)" "Application persistent state (nested under /var/lib)"
                       row "App storage: /var/lib/$bname" "unknown" "unknown" "du -sxk $v_entry" "UNRESOLVED ($KWHY)" "High" "Application state" "None (protected)" "Yes"
                       ;;
                   esac
                 fi
               done < "$STATE_DIR/vlib_raw.tsv"
 
+              vlib_di=$(get_devino /var/lib)
+              vlib_rp=$(get_realpath /var/lib)
               if [ $VLIB_OTHER_UNRESOLVED -eq 0 ]; then
                 vlib_h=$(gib "$VLIB_OTHER_KIB")
                 echo "RESOLVED with evidence: /var/lib (system & other) = $vlib_h across $VLIB_TOTAL_COUNT entry(ies)"
-                row_root "LEVEL1" "/" "/var/lib (system & other)" "$VLIB_OTHER_KIB" "RESOLVED" "Disjoint /var/lib entries ($VLIB_TOTAL_COUNT entries, excluding docker & containerd)"
+                row_root "LEVEL1" "/" "/var/lib (system & other)" "/var/lib" "$vlib_di" "$vlib_rp" "$VLIB_OTHER_KIB" "RESOLVED" "Disjoint /var/lib entries ($VLIB_TOTAL_COUNT entries, excluding docker & containerd)"
                 row "/var/lib (system & other)" "$vlib_h physical" "not estimated" "sum of $VLIB_TOTAL_COUNT individual du -sxk entries" "RESOLVED" "Medium" "System and application state outside docker/containerd" "None" "Yes"
               else
                 echo "UNRESOLVED (/var/lib system & other: $VLIB_OTHER_UNRESOLVED of $VLIB_TOTAL_COUNT entry(ies) unmeasured)"
-                row_root "LEVEL1" "/" "/var/lib (system & other)" "unknown" "UNRESOLVED ($VLIB_OTHER_UNRESOLVED unmeasured)" "Disjoint /var/lib entries (excluding docker & containerd)"
+                row_root "LEVEL1" "/" "/var/lib (system & other)" "/var/lib" "$vlib_di" "$vlib_rp" "unknown" "UNRESOLVED ($VLIB_OTHER_UNRESOLVED unmeasured)" "Disjoint /var/lib entries (excluding docker & containerd)"
                 row "/var/lib (system & other)" "unknown" "unknown" "sum of individual du -sxk entries" "UNRESOLVED ($VLIB_OTHER_UNRESOLVED unmeasured)" "Medium" "System and application state outside docker/containerd" "None" "Yes"
               fi
             fi
           elif [ -n "$S" ] && ! $S test -e "/var/lib" 2>/dev/null; then
             echo "/var/lib: NOT PRESENT"
-            row_root "LEVEL1" "/" "/var/lib (system & other)" "0" "RESOLVED (absent)" "directory not present"
+            row_root "LEVEL1" "/" "/var/lib (system & other)" "/var/lib" "none" "/var/lib" "0" "RESOLVED (absent)" "directory not present"
             row "/var/lib (system & other)" "0 GiB" "none" "test -e" "RESOLVED (absent)" "Medium" "n/a" "None" "Yes"
           else
             echo "/var/lib: UNRESOLVED (not accessible)"
-            row_root "LEVEL1" "/" "/var/lib (system & other)" "unknown" "UNRESOLVED (not accessible)" "Directory not accessible"
+            row_root "LEVEL1" "/" "/var/lib (system & other)" "/var/lib" "none" "/var/lib" "unknown" "UNRESOLVED (not accessible)" "Directory not accessible"
             row "/var/lib (system & other)" "unknown" "unknown" "test -d" "UNRESOLVED (not accessible)" "Medium" "n/a" "None" "Yes"
           fi
           echo ""
@@ -895,13 +1005,15 @@ jobs:
               od_p="$OD_BASE/$od_sub"
               if $S test -e "$od_p" 2>/dev/null; then
                 du_k "$od_p"
+                od_di=$(get_devino "$od_p")
+                od_rp=$(get_realpath "$od_p")
                 if [ -n "$K" ]; then
                   echo "RESOLVED with evidence: $od_p = $(gib "$K")"
-                  row_root "CHILD" "/home" "OpenDICOM DB mount ($od_sub)" "$K" "RESOLVED" "Live container 325dfa4f3e78 bind mount; STRICTLY PROTECTED"
+                  row_root "CHILD" "/home" "OpenDICOM DB mount ($od_sub)" "$od_p" "$od_di" "$od_rp" "$K" "RESOLVED" "Live container 325dfa4f3e78 bind mount; STRICTLY PROTECTED"
                   row "OpenDICOM DB: $od_sub" "$(gib "$K") physical" "none" "du -sxk (metadata only)" "RESOLVED" "CRITICAL" "Active production DB; running container 325dfa4f3e78 binds this path" "PROTECTED (Zero Cleanup)" "Yes"
                 else
                   echo "UNRESOLVED ($od_p: $KWHY)"
-                  row_root "CHILD" "/home" "OpenDICOM DB mount ($od_sub)" "unknown" "UNRESOLVED ($KWHY)" "Live container mount; STRICTLY PROTECTED"
+                  row_root "CHILD" "/home" "OpenDICOM DB mount ($od_sub)" "$od_p" "$od_di" "$od_rp" "unknown" "UNRESOLVED ($KWHY)" "Live container mount; STRICTLY PROTECTED"
                   row "OpenDICOM DB: $od_sub" "unknown" "none" "du -sxk (metadata only)" "UNRESOLVED ($KWHY)" "CRITICAL" "Active production DB; running container 325dfa4f3e78 binds this path" "PROTECTED (Zero Cleanup)" "Yes"
                 fi
               else
@@ -1018,19 +1130,30 @@ jobs:
                 next
               }
               {
-                kind = $1; parent = $2; name = $3; usage = $4; status = $5; notes = $6
+                kind = $1; parent = $2; name = $3; path = $4; devino = $5; realpath = $6; usage = $7; status = $8; notes = $9
                 if (kind == "LEVEL1") {
-                  if (seen_l1[name]++) {
+                  # Deduplicate by device:inode, canonical path, and literal path
+                  is_dup = 0
+                  if (devino != "" && devino != "none" && seen_l1_devino[devino]++) { is_dup = 1 }
+                  if (realpath != "" && realpath != "none" && seen_l1_realpath[realpath]++) { is_dup = 1 }
+                  if (path != "" && seen_l1_path[path]++) { is_dup = 1 }
+                  if (is_dup) {
                     l1_dup_count++
                     next
                   }
                   l1_count++
                   l1_name[l1_count] = name
+                  l1_path[l1_count] = path
+                  l1_devino[l1_count] = devino
+                  l1_realpath[l1_count] = realpath
                   l1_usage[l1_count] = usage
                   l1_status[l1_count] = status
                   l1_notes[l1_count] = notes
+
                   if (status == "RESOLVED" && usage ~ /^[0-9]+$/) {
                     l1_resolved_sum += usage
+                  } else if (status == "RESOLVED (absent)" && (usage == "0" || usage == 0)) {
+                    # Confirmed absent Level 1 component: zero contribution, NOT unresolved!
                   } else {
                     l1_unresolved_count++
                   }
@@ -1072,6 +1195,8 @@ jobs:
                   n = l1_name[i]; u = l1_usage[i]; s = l1_status[i]; nt = l1_notes[i]
                   if (s == "RESOLVED" && u ~ /^[0-9]+$/) {
                     u_str = sprintf("%.2f GiB (%d KiB)", u/1048576, u)
+                  } else if (s == "RESOLVED (absent)" && (u == "0" || u == 0)) {
+                    u_str = "0.00 GiB (0 KiB) [absent]"
                   } else {
                     u_str = "unknown"
                   }
@@ -1082,10 +1207,26 @@ jobs:
                       cn = c_name[n, j]; cu = c_usage[n, j]; cs = c_status[n, j]; cnt = c_notes[n, j]
                       if (cs == "RESOLVED" && cu ~ /^[0-9]+$/) {
                         cu_str = sprintf("%.2f GiB", cu/1048576)
+                      } else if (cs == "RESOLVED (absent)" && (cu == "0" || cu == 0)) {
+                        cu_str = "0.00 GiB [absent]"
                       } else {
                         cu_str = "unknown"
                       }
                       printf "| &nbsp;&nbsp;↳ *Level 2 [Child Breakdown]* | `%s` | %s | %s | *Informational only; NOT added to root sum* (%s) |\n", cn, cu_str, cs, cnt
+
+                      if (cn in c_count) {
+                        for (k = 1; k <= c_count[cn]; k++) {
+                          gcn = c_name[cn, k]; gcu = c_usage[cn, k]; gcs = c_status[cn, k]; gcnt = c_notes[cn, k]
+                          if (gcs == "RESOLVED" && gcu ~ /^[0-9]+$/) {
+                            gcu_str = sprintf("%.2f GiB", gcu/1048576)
+                          } else if (gcs == "RESOLVED (absent)" && (gcu == "0" || gcu == 0)) {
+                            gcu_str = "0.00 GiB [absent]"
+                          } else {
+                            gcu_str = "unknown"
+                          }
+                          printf "| &nbsp;&nbsp;&nbsp;&nbsp;↳↳ *Level 3 [Sub-breakdown]* | `%s` | %s | %s | *Informational only; NOT added to root sum* (%s) |\n", gcn, gcu_str, gcs, gcnt
+                        }
+                      }
                     }
                   }
                 }
@@ -1096,7 +1237,7 @@ jobs:
                   printf "|---|---|---|---|---|\n"
                   for (k = 1; k <= sec_count; k++) {
                     sn = sec_name[k]; sp = sec_parent[k]; su = sec_usage[k]; ss = sec_status[k]; snt = sec_notes[k]
-                    if (ss ~ /^RESOLVED/ && su ~ /^[0-9]+$/) {
+                    if ((ss == "RESOLVED" || ss ~ /^RESOLVED \(/) && su ~ /^[0-9]+$/) {
                       su_str = sprintf("%.2f GiB (%d KiB)", su/1048576, su)
                     } else {
                       su_str = "unknown"
@@ -1107,7 +1248,7 @@ jobs:
 
                 if (l1_dup_count > 0) {
                   printf "\n> [!CAUTION]\n"
-                  printf "> %d duplicate Level 1 entry(ies) detected and excluded to prevent double-counting.\n\n", l1_dup_count
+                  printf "> %d duplicate Level 1 entry(ies) detected by path/identity and excluded to prevent double-counting.\n\n", l1_dup_count
                 }
 
                 printf "\n### Reconciliation Balance\n\n"

@@ -451,8 +451,11 @@ jobs:
             # 2. Content store (CAS content blobs)
             sized_level "containerd/io.containerd.content.v1.content" "/var/lib/containerd/io.containerd.content.v1.content" "LEVEL1" "/var/lib/containerd" "Medium" "Image content blobs" "See Docker image rows"
 
-            # 3. Metadata database (distinguishing allocated physical blocks from apparent logical size)
-            BOLT_FILE="/var/lib/containerd/io.containerd.metadata.v1.bolt/meta.db"
+            # 3. Metadata store directory (Level 1 component) and meta.db apparent/allocated breakdown (Child)
+            BOLT_DIR="/var/lib/containerd/io.containerd.metadata.v1.bolt"
+            sized_level "containerd/io.containerd.metadata.v1.bolt" "$BOLT_DIR" "LEVEL1" "/var/lib/containerd" "High" "Active metadata database directory" "None (protected)"
+
+            BOLT_FILE="$BOLT_DIR/meta.db"
             b_di=$(get_devino "$BOLT_FILE")
             b_rp=$(get_realpath "$BOLT_FILE")
             if $S test -f "$BOLT_FILE" 2>/dev/null; then
@@ -463,21 +466,21 @@ jobs:
                 b_alloc_h=$(gib "$b_alloc")
                 b_app_h=$(awk -v b="$b_app" 'BEGIN{printf "%.2f MiB", b/(1024*1024)}')
                 echo "RESOLVED with evidence: $BOLT_FILE = $b_alloc_h physical allocated ($b_app_h apparent size)"
-                row_root "LEVEL1" "/var/lib/containerd" "containerd/io.containerd.metadata.v1.bolt" "$BOLT_FILE" "$b_di" "$b_rp" "$b_alloc" "RESOLVED" "$b_alloc_h physical allocated ($b_app_h apparent)"
-                row "Containerd metadata DB (meta.db)" "$b_alloc_h physical allocated ($b_app_h apparent)" "none" "du -sxk + stat -c %s meta.db" "RESOLVED" "High" "Active metadata database" "None (protected)" "Yes"
+                row_root "CHILD" "containerd/io.containerd.metadata.v1.bolt" "Containerd metadata DB (meta.db)" "$BOLT_FILE" "$b_di" "$b_rp" "$b_alloc" "RESOLVED" "$b_alloc_h physical allocated ($b_app_h apparent size)"
+                row "Containerd metadata DB (meta.db)" "$b_alloc_h physical allocated ($b_app_h apparent)" "none" "du -sxk + stat -c %s meta.db" "RESOLVED" "High" "Active metadata database (nested under containerd metadata)" "None (protected)" "Yes"
               else
                 echo "UNRESOLVED ($BOLT_FILE: ${b_why:-stat exit $b_rc})"
-                row_root "LEVEL1" "/var/lib/containerd" "containerd/io.containerd.metadata.v1.bolt" "$BOLT_FILE" "$b_di" "$b_rp" "unknown" "UNRESOLVED (${b_why:-stat failed})" "allocated size unknown"
+                row_root "CHILD" "containerd/io.containerd.metadata.v1.bolt" "Containerd metadata DB (meta.db)" "$BOLT_FILE" "$b_di" "$b_rp" "unknown" "UNRESOLVED (${b_why:-stat failed})" "allocated size unknown"
                 row "Containerd metadata DB (meta.db)" "unknown" "none" "du -sxk + stat -c %s meta.db" "UNRESOLVED (${b_why:-stat failed})" "High" "Active metadata database" "None (protected)" "Yes"
               fi
             else
               if [ -n "$S" ]; then
                 echo "Absent: $BOLT_FILE"
-                row_root "LEVEL1" "/var/lib/containerd" "containerd/io.containerd.metadata.v1.bolt" "$BOLT_FILE" "$b_di" "$b_rp" "0" "RESOLVED (absent)" "file not present"
-                row "Containerd metadata DB (meta.db)" "absent" "none" "test -f" "RESOLVED (absent)" "Low" "n/a" "None" "Yes"
+                row_root "CHILD" "containerd/io.containerd.metadata.v1.bolt" "Containerd metadata DB (meta.db)" "$BOLT_FILE" "$b_di" "$b_rp" "0" "RESOLVED (absent)" "file not present"
+                row "Containerd metadata DB (meta.db)" "0 GiB" "none" "test -f" "RESOLVED (absent)" "Low" "n/a" "None" "Yes"
               else
                 echo "UNRESOLVED ($BOLT_FILE: not accessible without sudo)"
-                row_root "LEVEL1" "/var/lib/containerd" "containerd/io.containerd.metadata.v1.bolt" "$BOLT_FILE" "$b_di" "$b_rp" "unknown" "UNRESOLVED (not accessible without sudo)" "permission denied or absent"
+                row_root "CHILD" "containerd/io.containerd.metadata.v1.bolt" "Containerd metadata DB (meta.db)" "$BOLT_FILE" "$b_di" "$b_rp" "unknown" "UNRESOLVED (not accessible without sudo)" "permission denied or absent"
                 row "Containerd metadata DB (meta.db)" "unknown" "none" "test -f" "UNRESOLVED (not accessible without sudo)" "High" "Active metadata database" "None (protected)" "Yes"
               fi
             fi

@@ -2,7 +2,9 @@ name: "Reusable Production Storage Cleanup Readiness — Read Only"
 
 # Governing contract: .agents/tasks/plan-server-storage-cleanup.md
 # STRICTLY READ-ONLY. No prune, delete, vacuum, restart, or config change.
-# Every probe: timeout <= 15s, allowlisted fields only, RESOLVED / UNRESOLVED outcome.
+# Every probe: timeout <= 15s, allowlisted/validated fields only, RESOLVED / UNRESOLVED outcome.
+# Fail-closed: a command failure, timeout, permission denial, malformed or partial output is
+# UNRESOLVED, never a zero value, a confirmed placement, or a cleanup candidate.
 # `sudo -n` is used only for read-only inspection when already available (never escalated).
 
 on:
@@ -31,32 +33,76 @@ jobs:
           STATE_DIR="${RUNNER_TEMP:-/tmp}/cleanup_readiness_${GITHUB_RUN_ID:-local}"
           S=""
           if command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then S="sudo -n"; fi
-          # Mask anything credential-like before printing.
-          redact() { sed -E 's/([A-Za-z_]*(PASSWORD|SECRET|TOKEN|ACCESS_KEY|SECRET_KEY|ROOT_USER|PASS)[A-Za-z_]*)[=:][^[:space:];]*/\1=***REDACTED***/Ig; s#//[^/@[:space:]]+@#//***@#g'; }
-          # Size in KiB of a path (empty when timeout/denied/missing). du -x: no filesystem crossing.
-          kib() { timeout 15 $S du -sxk -- "$1" 2>/dev/null | awk 'NR==1{print $1}'; }
+          # Strict literal absolute path: only [A-Za-z0-9._/@+-], no "..", bounded length.
+          valid_path() {
+            [ "${#1}" -le 512 ] || return 1
+            printf '%s' "$1" | grep -Eq '^/[A-Za-z0-9._/@+-]*$' || return 1
+            printf '%s' "$1" | grep -Eq '(^|/)\.\.(/|$)' && return 1
+            return 0
+          }
           gib() { awk -v k="$1" 'BEGIN{printf "%.2f GiB", k/1048576}'; }
-          mnt() { timeout 15 findmnt -n -T "$1" -o TARGET,SOURCE,FSTYPE 2>&1 | head -1; timeout 15 df -P -- "$1" 2>&1 | tail -1; }
-          mnt_target() { timeout 15 findmnt -n -T "$1" -o TARGET 2>/dev/null | head -1; }
           # row CATEGORY USAGE RECLAIMABLE EVIDENCE STATUS RISK DEPENDENCY ACTION APPROVAL
           row() { printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$@" >> "$STATE_DIR/matrix.tsv"; }
-          # sized CATEGORY PATH RISK DEPENDENCY ACTION APPROVAL : measure and add a matrix row
+          # du_k PATH : sets K (KiB) on success, else K="" and KWHY. Requires exit 0, no timeout,
+          # numeric output. du -x never crosses filesystems. Partial/denied scans are not trusted.
+          du_k() {
+            K=""; KWHY=""
+            valid_path "$1" || { KWHY="invalid path"; return 1; }
+            $S test -e "$1" 2>/dev/null || { KWHY="missing or not accessible"; return 1; }
+            out=$(timeout 15 $S du -sxk -- "$1" 2>/dev/null); rc=$?
+            [ $rc -eq 124 ] && { KWHY="timeout >15s"; return 1; }
+            [ $rc -ne 0 ] && { KWHY="du exit $rc (partial/denied; value not trusted)"; return 1; }
+            v=$(printf '%s\n' "$out" | awk 'NR==1{print $1}')
+            printf '%s' "$v" | grep -Eq '^[0-9]+$' || { KWHY="non-numeric du output"; return 1; }
+            K="$v"; return 0
+          }
+          # sized CATEGORY PATH RISK DEPENDENCY ACTION : measure and add a matrix row
           sized() {
-            k=$(kib "$2")
-            if [ -n "$k" ]; then
-              echo "RESOLVED with evidence: $2 = $(gib "$k")"
-              row "$1" "$(gib "$k") physical" "not estimated" "du -sxk $2" "RESOLVED" "$3" "$4" "$5" "Yes"
+            if du_k "$2"; then
+              echo "RESOLVED with evidence: $2 = $(gib "$K")"
+              row "$1" "$(gib "$K") physical" "not estimated" "du -sxk $2" "RESOLVED" "$3" "$4" "$5" "Yes"
             else
-              echo "UNRESOLVED (no du result for $2: missing, permission denied, or >15s timeout)"
-              row "$1" "unknown" "unknown" "du -sxk $2" "UNRESOLVED (missing/denied/timeout)" "$3" "$4" "$5" "Yes"
+              echo "UNRESOLVED ($2: $KWHY)"
+              row "$1" "unknown" "unknown" "du -sxk $2" "UNRESOLVED ($KWHY)" "$3" "$4" "$5" "Yes"
             fi
           }
-          # Top consumers, depth <= 2, bounded. Partial output is reported as such.
+          # placement PATH : fail-closed filesystem placement.
+          # Sets PL = ROOT | SECONDARY | UNRESOLVED, plus PL_TGT, PL_SRC, PL_WHY, PL_MED.
+          # SECONDARY is reported only when findmnt AND df both succeed, parse, and agree.
+          placement() {
+            PL="UNRESOLVED"; PL_TGT=""; PL_SRC=""; PL_WHY=""; PL_MED="unresolved"
+            valid_path "$1" || { PL_WHY="invalid path"; return 1; }
+            $S test -e "$1" 2>/dev/null || { PL_WHY="path missing or not accessible"; return 1; }
+            fm=$(timeout 15 findmnt -n -T "$1" -o TARGET,SOURCE,FSTYPE 2>/dev/null); rc=$?
+            [ $rc -ne 0 ] && { PL_WHY="findmnt failed (exit $rc)"; return 1; }
+            PL_TGT=$(printf '%s\n' "$fm" | awk 'NR==1{print $1}'); PL_SRC=$(printf '%s\n' "$fm" | awk 'NR==1{print $2}')
+            { [ -n "$PL_TGT" ] && [ -n "$PL_SRC" ] && valid_path "$PL_TGT"; } || { PL_WHY="findmnt output malformed"; PL="UNRESOLVED"; return 1; }
+            dfo=$(timeout 15 df -P -- "$1" 2>/dev/null); rc=$?
+            [ $rc -ne 0 ] && { PL_WHY="df failed (exit $rc)"; return 1; }
+            dfl=$(printf '%s\n' "$dfo" | awk 'NR==2')
+            printf '%s\n' "$dfl" | awk '$2 ~ /^[0-9]+$/ && $3 ~ /^[0-9]+$/ && $6 ~ /^\//{ok=1} END{exit !ok}' || { PL_WHY="df output malformed"; return 1; }
+            [ "$(printf '%s\n' "$dfl" | awk '{print $6}')" = "$PL_TGT" ] || { PL_WHY="findmnt and df disagree on mount point"; return 1; }
+            if [ "$PL_TGT" = "/" ]; then PL="ROOT"; else PL="SECONDARY"; fi
+            case "$PL_SRC" in
+              /dev/*) r=$(timeout 15 lsblk -no ROTA "$PL_SRC" 2>/dev/null | head -1 | tr -d ' ')
+                      case "$r" in 0) PL_MED="non-rotational (ROTA=0)";; 1) PL_MED="rotational (ROTA=1)";; *) PL_MED="unresolved (lsblk ROTA not determinable)";; esac ;;
+              *) PL_MED="unresolved (source is not a block device path)" ;;
+            esac
+            return 0
+          }
+          # placement_text : human summary of the last placement() call
+          placement_text() {
+            if [ "$PL" = "UNRESOLVED" ]; then echo "UNRESOLVED placement ($PL_WHY)"
+            elif [ "$PL" = "ROOT" ]; then echo "root filesystem / on $PL_SRC, $PL_MED"
+            else echo "secondary mount $PL_TGT on $PL_SRC, $PL_MED"; fi
+          }
+          # Top consumers, depth <= 2, bounded. Non-zero exit (timeout/denied) is reported as partial.
           topdu() {
             timeout 15 $S du -x --max-depth="$2" -h -- "$1" > "$STATE_DIR/topdu.out" 2>/dev/null
             rc=$?
             sort -rh "$STATE_DIR/topdu.out" | head -15
-            [ $rc -eq 0 ] && echo "RESOLVED with evidence: $1 (depth $2)" || echo "UNRESOLVED/PARTIAL ($1 depth $2: du exit $rc; 124 = 15s timeout)"
+            if [ $rc -eq 0 ]; then echo "RESOLVED with evidence: $1 (depth $2)"
+            else echo "UNRESOLVED/PARTIAL ($1 depth $2: du exit $rc; 124 = 15s timeout; listing not authoritative)"; fi
           }
           LIB
           . "$STATE_DIR/lib.sh"
@@ -93,23 +139,28 @@ jobs:
           CFG=/var/snap/nextcloud/current/nextcloud/config/config.php
           DD=""
           if $S test -f "$CFG" 2>/dev/null; then
-            # Only the datadirectory line is read; no other config key is ever printed.
+            # Only the datadirectory line is read; the value is printed only if it is a strict literal path.
             DD=$(timeout 15 $S grep -E "^[[:space:]]*['\"]datadirectory['\"][[:space:]]*=>" "$CFG" 2>/dev/null | head -1 | sed -E "s/.*=>[[:space:]]*['\"]([^'\"]*)['\"].*/\1/")
-            case "$DD" in /*) ;; *) DD="" ;; esac
+            valid_path "$DD" || DD=""
           fi
           if [ -z "$DD" ]; then
-            echo "UNRESOLVED (config.php missing, not readable without sudo, or datadirectory not an absolute path)"
-            row "Nextcloud data directory" "unknown" "n/a" "config.php datadirectory key" "UNRESOLVED (config not readable/absent)" "High" "Persistent user data; never touch" "None (protected)" "Yes"
+            echo "UNRESOLVED (config.php missing, not readable without sudo, or datadirectory not a strict absolute path)"
+            row "Nextcloud data directory" "unknown" "n/a" "config.php datadirectory key" "UNRESOLVED (config not readable/absent/invalid)" "High" "Persistent user data; never touch" "None (protected)" "Yes"
           else
             echo "RESOLVED with evidence: datadirectory = $DD"
-            echo "Backing mount:"; mnt "$DD"
-            if [ "$(mnt_target "$DD")" = "/" ]; then
-              echo "Data directory is on the root filesystem; bounded size measurement:"
-              sized "Nextcloud data directory (root fs)" "$DD" "High" "Persistent user data; consider HDD relocation only via dedicated plan" "None (protected); relocation plan only" "Yes"
-            else
-              echo "Data directory is on a secondary mount; user files NOT scanned (exclusion rule)."
-              row "Nextcloud data directory (secondary mount)" "not scanned" "n/a" "findmnt -T $DD" "RESOLVED" "High" "Not on SSD root; protected" "None" "Yes"
-            fi
+            placement "$DD"
+            echo "Placement: $(placement_text)"
+            case "$PL" in
+              ROOT)
+                echo "Data directory is on the root filesystem; bounded size measurement:"
+                sized "Nextcloud data directory (root fs; $PL_MED)" "$DD" "High" "Persistent user data; relocation only via dedicated plan" "None (protected); relocation plan only" ;;
+              SECONDARY)
+                echo "Data directory is on a verified secondary mount; user files NOT scanned (exclusion rule)."
+                row "Nextcloud data directory (verified secondary mount $PL_TGT)" "not scanned" "n/a" "findmnt -T + df -P agree; medium: $PL_MED" "RESOLVED" "High" "Not on root filesystem; protected" "None" "Yes" ;;
+              *)
+                echo "UNRESOLVED: placement not reliably established, so no scan and no secondary-mount claim."
+                row "Nextcloud data directory" "not scanned" "n/a" "findmnt/df placement check" "UNRESOLVED (placement: $PL_WHY)" "High" "Placement unknown; protected" "None" "Yes" ;;
+            esac
           fi
           echo ""
           echo "=== NEXTCLOUD SNAP FOOTPRINT (bounded du -sx) ==="
@@ -119,55 +170,64 @@ jobs:
           sized "Nextcloud snap logs" /var/snap/nextcloud/current/logs/ "Medium" "Application logs" "Review retention in dedicated plan"
           sized "Nextcloud snap config" /var/snap/nextcloud/current/nextcloud/config/ "High" "Configuration" "None (protected)"
 
-      - name: "3. MinIO storage (allowlisted properties, credential redaction)"
+      - name: "3. MinIO storage (strict allowlist; no raw ExecStart or env values)"
         timeout-minutes: 2
         run: |
           set +e
+          set -f
           . "${RUNNER_TEMP:-/tmp}/cleanup_readiness_${GITHUB_RUN_ID:-local}/lib.sh"
-          echo "=== MINIO SERVICE (allowlisted systemctl properties) ==="
-          if ! command -v systemctl >/dev/null 2>&1; then
-            echo "UNRESOLVED (systemctl unavailable)"
-            row "MinIO object storage" "unknown" "n/a" "systemctl" "UNRESOLVED (systemctl unavailable)" "High" "Object data" "None (protected)" "Yes"
-            exit 0
-          fi
-          PROPS=$(timeout 15 systemctl show minio.service -p ActiveState -p FragmentPath -p ExecStart -p EnvironmentFiles -p User -p WorkingDirectory 2>&1 | redact)
-          echo "$PROPS"
-          if ! echo "$PROPS" | grep -q '^FragmentPath=/'; then
-            echo "UNRESOLVED (minio.service not found or no unit file)"
-            row "MinIO object storage" "unknown" "n/a" "systemctl show minio.service" "UNRESOLVED (unit not found)" "High" "Object data" "None (protected)" "Yes"
-            exit 0
-          fi
+          unresolved() { echo "UNRESOLVED ($1)"; row "MinIO object storage" "unknown" "n/a" "systemctl show minio.service + MINIO_VOLUMES key" "UNRESOLVED ($1)" "High" "Object data" "None (protected)" "Yes"; }
+          echo "=== MINIO SERVICE (allowlisted, validated properties only) ==="
+          command -v systemctl >/dev/null 2>&1 || { unresolved "systemctl unavailable"; exit 0; }
+          PROPS=$(timeout 15 systemctl show minio.service -p ActiveState -p FragmentPath -p ExecStart -p EnvironmentFiles -p User -p WorkingDirectory 2>/dev/null); rc=$?
+          [ $rc -ne 0 ] && { unresolved "systemctl show failed, exit $rc"; exit 0; }
+          sval() { printf '%s\n' "$PROPS" | sed -n "s/^$1=//p" | head -1; }
+          # The raw PROPS variable is NEVER printed. Each value is printed only if it matches a strict pattern.
+          v=$(sval ActiveState);  printf '%s' "$v" | grep -Eq '^[a-z-]+$' && echo "ActiveState: $v" || echo "ActiveState: UNRESOLVED (unexpected format; value withheld)"
+          v=$(sval FragmentPath); valid_path "$v" && echo "FragmentPath: $v" || echo "FragmentPath: UNRESOLVED (empty/unexpected; value withheld)"
+          [ -n "$v" ] && valid_path "$v" || { unresolved "minio.service not found or unit path invalid"; exit 0; }
+          v=$(sval User);         printf '%s' "$v" | grep -Eq '^[a-z_][a-z0-9_-]{0,31}$' && echo "User: $v" || echo "User: (unset or withheld)"
+          v=$(sval WorkingDirectory); valid_path "$v" && echo "WorkingDirectory: $v" || echo "WorkingDirectory: (unset or withheld)"
+          EFS=""
+          for t in $(sval EnvironmentFiles | tr ' ' '\n' | sed 's/^-//' | grep '^/'); do
+            valid_path "$t" && { echo "EnvironmentFile: $t"; EFS="$EFS $t"; }
+          done
+          echo "ExecStart: raw command line intentionally NOT printed (only strict literal storage paths are extracted)"
           echo ""
-          VOLS=""
-          # Authoritative EnvironmentFile(s): extract ONLY MINIO_VOLUMES.
-          for ef in $(echo "$PROPS" | grep '^EnvironmentFiles=' | sed 's/^EnvironmentFiles=//' | tr ' ' '\n' | grep '^-\?/' | sed 's/^-//'); do
-            if $S test -f "$ef" 2>/dev/null; then
-              v=$(timeout 15 $S grep -E '^[[:space:]]*MINIO_VOLUMES=' "$ef" 2>/dev/null | tail -1 | sed -E 's/^[^=]*=//; s/["'"'"']//g' | redact)
-              if [ -n "$v" ]; then echo "MINIO_VOLUMES (from $ef): $v"; VOLS="$v"; fi
-            else
-              echo "EnvironmentFile $ef: not readable/absent (UNRESOLVED for this file)"
-            fi
+          VOLS=""; WITHHELD=0
+          for ef in $EFS; do
+            $S test -f "$ef" 2>/dev/null || { echo "EnvironmentFile $ef: not readable/absent"; continue; }
+            line=$(timeout 15 $S grep -E '^[[:space:]]*MINIO_VOLUMES=' "$ef" 2>/dev/null | tail -1)
+            [ -z "$line" ] && continue
+            val=$(printf '%s' "$line" | sed -E 's/^[^=]*=//; s/["'"'"']//g')
+            for tok in $val; do
+              if valid_path "$tok"; then VOLS="$VOLS $tok"; else WITHHELD=$((WITHHELD+1)); fi
+            done
           done
-          # Fallback: absolute literal path arguments in ExecStart argv (excluding the binary).
-          if [ -z "$VOLS" ]; then
-            VOLS=$(echo "$PROPS" | grep '^ExecStart=' | sed -n 's/.*argv\[\]=\([^;]*\);.*/\1/p' | tr ' ' '\n' | sed 1d | grep '^/' | grep -v '\$' | tr '\n' ' ')
-            [ -n "$VOLS" ] && echo "Storage path from ExecStart argv: $VOLS"
+          SRC="MINIO_VOLUMES"
+          if [ -z "$VOLS" ] && [ $WITHHELD -eq 0 ]; then
+            # Fallback: literal path arguments following `server`, skipping flag values; never printed raw.
+            VOLS=$(printf '%s\n' "$PROPS" | sed -n 's/^ExecStart=.*argv\[\]=\([^;]*\);.*/\1/p' | tr ' ' '\n' | awk '
+              f==0 { if ($0=="server") f=1; next }
+              skip { skip=0; next }
+              /^--/ { if ($0 !~ /=/) skip=1; next }
+              /^-/ { next }
+              /^\/[A-Za-z0-9._\/@+-]*$/ && $0 !~ /\.\.(\/|$)/ { print }')
+            SRC="ExecStart positional argument"
           fi
-          FOUND=0
+          echo "Storage path source: $SRC; local literal path(s): $(echo $VOLS | wc -w); non-conforming token(s) withheld: $WITHHELD"
+          if [ $WITHHELD -gt 0 ]; then unresolved "MINIO_VOLUMES contains non-local/templated/URL tokens (withheld); placement not claimed"; exit 0; fi
+          [ -z "$(echo $VOLS)" ] && { unresolved "no local storage path found (MINIO_VOLUMES missing/unreadable, or path supplied via unreadable environment)"; exit 0; }
           for p in $VOLS; do
-            case "$p" in
-              /*) FOUND=1
-                  echo "--- $p ---"; echo "Backing mount:"; mnt "$p"
-                  tgt=$(mnt_target "$p")
-                  if [ "$tgt" = "/" ]; then place="SSD root filesystem"; else place="secondary mount $tgt"; fi
-                  echo "Placement: $place"
-                  sized "MinIO storage ($place)" "$p" "High" "Object data; S3 clients depend on it" "None (protected)" "Yes" ;;
-            esac
+            echo "--- $p ---"
+            placement "$p"
+            echo "Placement: $(placement_text)"
+            if [ "$PL" = "UNRESOLVED" ]; then
+              row "MinIO object storage ($p)" "not measured" "n/a" "findmnt/df placement check" "UNRESOLVED (placement: $PL_WHY)" "High" "Object data" "None (protected)" "Yes"
+              continue
+            fi
+            sized "MinIO storage ($(placement_text))" "$p" "High" "Object data; S3 clients depend on it" "None (protected)"
           done
-          if [ $FOUND -eq 0 ]; then
-            echo "UNRESOLVED (no local absolute storage path found; MINIO_VOLUMES missing, unreadable, or non-local/templated)"
-            row "MinIO object storage" "unknown" "n/a" "systemctl show + MINIO_VOLUMES key" "UNRESOLVED (path not determinable)" "High" "Object data" "None (protected)" "Yes"
-          fi
 
       - name: "4. Docker root dir, accounting reconciliation and candidate inventory"
         timeout-minutes: 3
@@ -189,12 +249,16 @@ jobs:
           echo "Storage Driver: $(timeout 15 $D info --format '{{.Driver}}' 2>/dev/null)"
           echo "Containers: $(timeout 15 $D info --format '{{.Containers}} (running {{.ContainersRunning}}, stopped {{.ContainersStopped}})' 2>/dev/null)"
           echo "Images: $(timeout 15 $D info --format '{{.Images}}' 2>/dev/null)"
-          echo "Swarm: $(timeout 15 $D info --format '{{.Swarm.LocalNodeState}}' 2>/dev/null)"
+          SWSTATE=$(timeout 15 $D info --format '{{.Swarm.LocalNodeState}}' 2>/dev/null); SWRC=$?
+          echo "Swarm: ${SWSTATE:-UNRESOLVED}"
           echo ""
           echo "=== DOCKER ROOT DIR BACKING MOUNT & PHYSICAL SIZE ==="
-          if [ -n "$ROOT" ]; then
-            mnt "$ROOT"
+          if valid_path "$ROOT"; then
+            placement "$ROOT"; echo "Placement: $(placement_text)"
             for sub in "" /overlay2 /containerd /buildkit /volumes /image; do sized "Docker physical ${ROOT}${sub}" "${ROOT}${sub}" "Medium" "Physical footprint of Docker data" "See Docker rows"; done
+          else
+            echo "UNRESOLVED (Docker Root Dir missing or not a strict path)"
+            row "Docker root dir" "unknown" "unknown" "docker info" "UNRESOLVED (root dir not determinable)" "Medium" "n/a" "n/a" "Yes"
           fi
           echo ""
           echo "=== OTHER RUNTIME PATHS (existence-checked) ==="
@@ -206,13 +270,13 @@ jobs:
           echo "=== DOCKER LOGICAL ACCOUNTING (docker system df) ==="
           timeout 15 $D system df 2>&1
           DF="$STATE_DIR/dockerdf.tsv"
-          timeout 15 $D system df --format '{{.Type}}	{{.TotalCount}}	{{.Size}}	{{.Reclaimable}}' > "$DF" 2>/dev/null
+          timeout 15 $D system df --format '{{.Type}}	{{.TotalCount}}	{{.Size}}	{{.Reclaimable}}' > "$DF" 2>/dev/null; DFRC=$?
           echo ""
           echo "Four non-interchangeable values: (1) logical Docker accounting (above; categories overlap, do NOT sum),"
           echo "(2) physical filesystem usage (du rows above), (3) Docker-reported reclaimable (candidate only),"
           echo "(4) operationally approved for removal (currently NONE)."
           for t in "Images" "Containers" "Local Volumes" "Build Cache"; do
-            line=$(awk -F'\t' -v t="$t" '$1==t' "$DF")
+            line=""; [ $DFRC -eq 0 ] && line=$(awk -F'\t' -v t="$t" '$1==t && NF==4' "$DF")
             if [ -n "$line" ]; then
               sz=$(echo "$line" | cut -f3); rc=$(echo "$line" | cut -f4)
               case "$t" in
@@ -223,7 +287,7 @@ jobs:
               esac
               row "Docker $t (logical)" "$sz logical" "$rc (Docker-reported, candidate only)" "docker system df" "RESOLVED" "$risk" "$dep" "$act" "Yes"
             else
-              row "Docker $t (logical)" "unknown" "unknown" "docker system df" "UNRESOLVED (no output/timeout)" "Medium" "n/a" "n/a" "Yes"
+              row "Docker $t (logical)" "unknown" "unknown" "docker system df" "UNRESOLVED (command failed/timeout/malformed, exit $DFRC)" "Medium" "n/a" "n/a" "Yes"
             fi
           done
           echo ""
@@ -231,25 +295,57 @@ jobs:
           echo "--- running ---"; timeout 15 $D ps --format '{{.ID}} {{.Names}} {{.Image}} {{.Status}}' 2>&1 | head -50
           echo "--- stopped (exited/created) ---"; timeout 15 $D ps -a --filter status=exited --filter status=created --format '{{.ID}} {{.Names}} {{.Image}} {{.Status}}' 2>&1 | head -50
           echo ""
-          echo "=== SWARM SERVICES ==="
-          timeout 15 $D service ls --format '{{.Name}} {{.Image}}' 2>&1 | head -30
+          echo "=== INVENTORY COMPLETENESS (required before any image is called unreferenced) ==="
+          INC=""
+          # (a) all containers (running + stopped). Empty success is valid; failure is not.
+          CIDS=$(timeout 15 $D ps -aq 2>/dev/null); rc=$?
+          [ $rc -ne 0 ] && INC="$INC; container enumeration failed (exit $rc)"
+          if [ $rc -eq 0 ] && [ -n "$CIDS" ]; then
+            printf '%s\n' "$CIDS" | grep -Evq '^[0-9a-f]{12,64}$' && INC="$INC; container ID list malformed"
+          fi
+          NC=$(printf '%s\n' "$CIDS" | grep -c .)
+          REFS="$STATE_DIR/refs.txt"; : > "$REFS"
+          if [ -z "$INC" ] && [ "$NC" -gt 0 ]; then
+            IMGIDS=$(timeout 15 $D inspect --format '{{.Image}}' $CIDS 2>/dev/null); rc=$?
+            if [ $rc -ne 0 ]; then INC="$INC; container inspect failed (exit $rc)"
+            elif [ "$(printf '%s\n' "$IMGIDS" | grep -c .)" -ne "$NC" ]; then INC="$INC; container inspect returned $(printf '%s\n' "$IMGIDS" | grep -c .) of $NC image refs"
+            elif printf '%s\n' "$IMGIDS" | grep -Evq '^sha256:[0-9a-f]{64}$'; then INC="$INC; container image refs malformed"
+            else printf '%s\n' "$IMGIDS" >> "$REFS"; fi
+          fi
+          echo "Containers enumerated: $NC (empty result is valid only when the command succeeded)"
+          # (b) Swarm services: required when Swarm is active; state itself must be known.
+          if [ $SWRC -ne 0 ] || [ -z "$SWSTATE" ]; then INC="$INC; Swarm state unknown"
+          elif [ "$SWSTATE" = "active" ]; then
+            SVC=$(timeout 15 $D service ls --format '{{.Image}}' 2>/dev/null); rc=$?
+            if [ $rc -ne 0 ]; then INC="$INC; swarm service enumeration failed (exit $rc; node may not be a manager)"
+            else
+              printf '%s\n' "$SVC" | grep . | awk '
+                { img=$0; dig=index(img,"@"); if (dig) img=substr(img,1,dig-1)
+                  n=split(img,p,"/"); last=p[n]
+                  if (index(last,":")==0) { if (dig) { print "UNTAGGED"; next } img=img ":latest" }
+                  print img }' > "$STATE_DIR/svcrefs.txt"
+              grep -qx UNTAGGED "$STATE_DIR/svcrefs.txt" && INC="$INC; a service image is pinned by digest only (cannot map to image tags)"
+              grep -vx UNTAGGED "$STATE_DIR/svcrefs.txt" >> "$REFS"
+              echo "Swarm services enumerated: $(printf '%s\n' "$SVC" | grep -c .)"
+            fi
+          elif [ "$SWSTATE" = "inactive" ]; then echo "Swarm inactive: no service references required"
+          else INC="$INC; Swarm state '$SWSTATE' not usable for inventory"; fi
+          # (c) image list must be complete and well-formed.
+          timeout 15 $D images --no-trunc --format '{{.ID}}	{{.Repository}}:{{.Tag}}	{{.Size}}' > "$STATE_DIR/images.tsv" 2>/dev/null; rc=$?
+          if [ $rc -ne 0 ]; then INC="$INC; image enumeration failed (exit $rc)"
+          elif awk -F'\t' 'NF!=3 || $1 !~ /^sha256:[0-9a-f]{64}$/{bad=1} END{exit !bad}' "$STATE_DIR/images.tsv"; then INC="$INC; image list malformed"; fi
           echo ""
           echo "=== IMAGE REFERENCE CLASSIFICATION ==="
-          REFS="$STATE_DIR/refs.txt"; : > "$REFS"
-          CIDS=$(timeout 15 $D ps -aq 2>/dev/null)
-          [ -n "$CIDS" ] && timeout 15 $D inspect --format '{{.Image}}' $CIDS 2>/dev/null >> "$REFS"
-          timeout 15 $D service ls --format '{{.Image}}' 2>/dev/null | sed 's/@.*//' >> "$REFS"
-          timeout 15 $D images --no-trunc --format '{{.ID}}	{{.Repository}}:{{.Tag}}	{{.Size}}' > "$STATE_DIR/images.tsv" 2>/dev/null
-          if [ -s "$STATE_DIR/images.tsv" ]; then
+          if [ -n "$INC" ]; then
+            echo "UNRESOLVED (reference coverage incomplete:${INC#;}). No unreferenced-image candidates are reported."
+            row "Docker unreferenced image tags (Tier B)" "unknown" "unknown" "docker ps -a / inspect / service ls / images" "UNRESOLVED (incomplete inventory:${INC#;})" "Medium" "Cannot exclude rollback or in-use images" "None until inventory is complete" "Yes"
+          else
             awk -F'\t' 'NR==FNR{ref[$1]=1;next} !($1 in ref) && !($2 in ref){print $2"  "$3"  "$1}' "$REFS" "$STATE_DIR/images.tsv" > "$STATE_DIR/unref.txt"
-            TOTAL=$(wc -l < "$STATE_DIR/images.tsv"); UNREF=$(wc -l < "$STATE_DIR/unref.txt")
-            echo "Image tags total: $TOTAL; not referenced by any container/service on this node: $UNREF (Tier B, per-image sizes overlap; no sum given)"
+            TOTAL=$(grep -c . "$STATE_DIR/images.tsv"); UNREF=$(grep -c . "$STATE_DIR/unref.txt")
+            echo "Inventory COMPLETE. Image tags total: $TOTAL; not referenced by any container/service: $UNREF (Tier B; per-image sizes overlap; no sum given)"
             head -40 "$STATE_DIR/unref.txt"
             echo "Tier B reminder: unreferenced != safe to remove; may be rollback targets."
-            row "Docker unreferenced image tags (Tier B)" "$UNREF of $TOTAL tags" "see Docker Images reclaimable" "docker images vs docker ps -a / service ls" "RESOLVED" "Medium" "Possible rollback targets" "Approved age-bounded removal, keep current + previous release" "Yes"
-          else
-            echo "UNRESOLVED (docker images returned nothing)"
-            row "Docker unreferenced image tags (Tier B)" "unknown" "unknown" "docker images" "UNRESOLVED (no output)" "Medium" "n/a" "n/a" "Yes"
+            row "Docker unreferenced image tags (Tier B)" "$UNREF of $TOTAL tags" "see Docker Images reclaimable" "complete inventory: docker ps -a, inspect, service ls, images" "RESOLVED" "Medium" "Possible rollback targets" "Approved age-bounded removal, keep current + previous release" "Yes"
           fi
           echo ""
           echo "=== BUILD CACHE ==="
@@ -266,7 +362,7 @@ jobs:
             echo "Container mount sources (type + source only):"
             timeout 15 $D inspect --format '{{.Name}}{{range .Mounts}} [{{.Type}}] {{.Source}}{{end}}' $CIDS 2>&1 | head -40
           fi
-          row "Docker volumes & bind mounts (Tier C)" "see inventory" "none" "docker volume ls / inspect Mounts" "RESOLVED" "High" "Persistent app state" "None without application review" "Yes"
+          row "Docker volumes & bind mounts (Tier C)" "see inventory" "none" "docker volume ls / inspect Mounts" "RESOLVED (inventory listing only)" "High" "Persistent app state" "None without application review" "Yes"
 
       - name: "5. Bounded root, runner workspace and large-file scans"
         timeout-minutes: 3
@@ -285,11 +381,14 @@ jobs:
           echo ""
           echo "=== LARGE FILES >= 500 MiB (candidate dirs only, depth <= 2; path and size only) ==="
           ROOT=$(timeout 15 docker info --format '{{.DockerRootDir}}' 2>/dev/null)
+          valid_path "$ROOT" || ROOT=""
           for d in /home /var/snap /var/snap/nextcloud /var/log /var/www $ROOT; do
             [ -d "$d" ] || continue
             echo "--- $d ---"
-            timeout 15 $S find "$d" -xdev -maxdepth 2 -type f -size +500M -printf '%s\t%p\n' 2>/dev/null | sort -rn | head -10 | awk -F'\t' '{printf "%.2f GiB\t%s\n",$1/1073741824,$2}'
-            [ "${PIPESTATUS[0]}" = "124" ] && echo "PARTIAL (15s timeout)"
+            timeout 15 $S find "$d" -xdev -maxdepth 2 -type f -size +500M -printf '%s\t%p\n' > "$STATE_DIR/large.out" 2>/dev/null; rc=$?
+            sort -rn "$STATE_DIR/large.out" | head -10 | awk -F'\t' '{printf "%.2f GiB\t%s\n",$1/1073741824,$2}'
+            if [ $rc -eq 0 ]; then echo "RESOLVED with evidence: $d scan complete"
+            else echo "UNRESOLVED/PARTIAL ($d: find exit $rc; 124 = 15s timeout; absence of entries is not evidence of absence)"; fi
           done
           echo "Note: depth <= 2 limits large-file discovery; deeper files are UNRESOLVED by design."
           sized "/var/log" /var/log "Medium" "Active logs; rotation policy only" "Approved retention change, no truncation"
@@ -303,45 +402,70 @@ jobs:
           set +e
           . "${RUNNER_TEMP:-/tmp}/cleanup_readiness_${GITHUB_RUN_ID:-local}/lib.sh"
           echo "=== SNAP REVISIONS ==="
-          if command -v snap >/dev/null 2>&1; then
-            timeout 15 snap list --all 2>&1 > "$STATE_DIR/snaps.txt"
-            head -60 "$STATE_DIR/snaps.txt"
-            echo "--- disabled revisions ---"
-            awk '/disabled/{print $1, $3}' "$STATE_DIR/snaps.txt" > "$STATE_DIR/disabled.txt"
-            cat "$STATE_DIR/disabled.txt"
-            total=0; n=0
-            while read -r name rev; do
-              [ -z "$name" ] && continue
-              n=$((n+1))
-              b=$(stat -c %s "/var/lib/snapd/snaps/${name}_${rev}.snap" 2>/dev/null)
-              [ -n "$b" ] && total=$((total+b))
-            done < "$STATE_DIR/disabled.txt"
-            if [ -s "$STATE_DIR/snaps.txt" ]; then
-              echo "RESOLVED with evidence: $n disabled revision(s), $(awk -v b=$total 'BEGIN{printf "%.2f GiB",b/1073741824}') squashfs footprint (stat of /var/lib/snapd/snaps/*.snap)"
-              row "Disabled snap revisions" "$n revisions, $(awk -v b=$total 'BEGIN{printf "%.2f GiB",b/1073741824}')" "same as usage (if removed)" "snap list --all + stat" "RESOLVED" "Low" "Old revisions only; active revision untouched" "Approved 'snap remove --revision' per disabled revision" "Yes"
-            fi
+          SNAPROW() { row "Disabled snap revisions" "$1" "$2" "snap list --all + stat of snap files" "$3" "Low" "Old revisions only; active revision untouched" "Approved per-revision removal by a human (not by this workflow)" "Yes"; }
+          if ! command -v snap >/dev/null 2>&1; then
+            echo "UNRESOLVED (snap not installed)"; SNAPROW unknown unknown "UNRESOLVED (snap missing)"
           else
-            echo "UNRESOLVED (snap not installed)"
-            row "Disabled snap revisions" "unknown" "unknown" "snap list --all" "UNRESOLVED (snap missing)" "Low" "n/a" "n/a" "Yes"
+            timeout 15 snap list --all > "$STATE_DIR/snaps.txt" 2>/dev/null; rc=$?
+            head -60 "$STATE_DIR/snaps.txt"
+            if [ $rc -ne 0 ]; then
+              echo "UNRESOLVED (snap list --all failed, exit $rc)"; SNAPROW unknown unknown "UNRESOLVED (snap list exit $rc)"
+            elif ! head -1 "$STATE_DIR/snaps.txt" | grep -Eq '^Name[[:space:]]+Version[[:space:]]+Rev'; then
+              echo "UNRESOLVED (snap list output has no recognizable header; malformed or empty)"; SNAPROW unknown unknown "UNRESOLVED (malformed snap list)"
+            else
+              awk 'NR>1 && /disabled/{print $1, $3}' "$STATE_DIR/snaps.txt" > "$STATE_DIR/disabled.txt"
+              echo "--- disabled revisions ---"; cat "$STATE_DIR/disabled.txt"
+              total=0; n=0; bad=0
+              while read -r name rev; do
+                [ -z "$name" ] && continue
+                n=$((n+1))
+                f="/var/lib/snapd/snaps/${name}_${rev}.snap"
+                b=$(stat -c %s "$f" 2>/dev/null); src=$?
+                if [ $src -eq 0 ] && printf '%s' "$b" | grep -Eq '^[0-9]+$'; then total=$((total+b)); echo "  $name r$rev: $(awk -v b=$b 'BEGIN{printf "%.3f GiB",b/1073741824}')"
+                else bad=$((bad+1)); echo "  $name r$rev: UNRESOLVED (snap file not stat-able)"; fi
+              done < "$STATE_DIR/disabled.txt"
+              human=$(awk -v b=$total 'BEGIN{printf "%.2f GiB",b/1073741824}')
+              if [ $bad -gt 0 ]; then
+                echo "UNRESOLVED (partially inspected: $bad of $n disabled revision(s) not measurable; measured lower bound $human)"
+                SNAPROW "$n revisions; lower bound $human ($bad unmeasured)" "unknown" "UNRESOLVED (partial: $bad of $n unmeasured)"
+              else
+                echo "RESOLVED with evidence: $n disabled revision(s), $human squashfs footprint"
+                SNAPROW "$n revisions, $human" "$human if removed (approval required)" "RESOLVED"
+              fi
+            fi
           fi
           echo ""
           echo "=== JOURNAL ==="
-          J=$(timeout 15 journalctl --disk-usage 2>&1)
-          if [ $? -eq 0 ] && [ -n "$J" ]; then
-            echo "RESOLVED with evidence: $J"
+          J=$(timeout 15 journalctl --disk-usage 2>/dev/null); rc=$?
+          if [ $rc -eq 0 ] && printf '%s' "$J" | grep -Eq 'take up [0-9.]+[KMGT]?B? in the file system'; then
+            echo "RESOLVED with evidence (usage): $J"; JST="RESOLVED (usage)"
           else
-            J="unknown"; echo "UNRESOLVED (journalctl --disk-usage failed: $J)"
+            echo "UNRESOLVED (journalctl --disk-usage failed or malformed, exit $rc)"; J="unknown"; JST="UNRESOLVED (usage)"
           fi
-          echo "Effective retention keys (last occurrence wins):"
+          echo "Explicit retention entries in merged journald configuration (NOT verified effective settings):"
           KEYS='SystemMaxUse|SystemKeepFree|SystemMaxFileSize|MaxRetentionSec'
+          EFFNOTE="explicit entries read; effective running settings UNVERIFIED"
           if command -v systemd-analyze >/dev/null 2>&1 && timeout 15 systemd-analyze cat-config systemd/journald.conf > "$STATE_DIR/jconf.txt" 2>/dev/null; then
             awk -v keys="^($KEYS)=" '/^# \//{f=$2} $0 ~ keys {print f": "$0}' "$STATE_DIR/jconf.txt"
-            grep -Eq "^($KEYS)=" "$STATE_DIR/jconf.txt" || echo "No explicit retention keys set (systemd defaults apply)"
+            grep -Eq "^($KEYS)=" "$STATE_DIR/jconf.txt" || echo "No explicit retention keys present (systemd compiled-in defaults would apply; not verified)"
+            # Evidence on whether explicit entries could have been applied: config file mtime vs journald start.
+            JS=$(timeout 15 systemctl show systemd-journald.service -p ActiveEnterTimestamp 2>/dev/null | sed 's/^ActiveEnterTimestamp=//')
+            JSE=$(date -d "$JS" +%s 2>/dev/null)
+            if printf '%s' "$JSE" | grep -Eq '^[0-9]+$'; then
+              NEWER=0
+              for f in $(grep -E '^# /' "$STATE_DIR/jconf.txt" | awk '{print $2}'); do
+                m=$(stat -c %Y "$f" 2>/dev/null); printf '%s' "$m" | grep -Eq '^[0-9]+$' && [ "$m" -gt "$JSE" ] && NEWER=1
+              done
+              if [ $NEWER -eq 1 ]; then EFFNOTE="explicit entries read; config files modified AFTER journald start, so effective settings are NOT confirmed"
+              else EFFNOTE="explicit entries read; config predates journald start (inference only, not directly observed)"; fi
+            fi
           else
-            echo "systemd-analyze unavailable; direct read of conf files:"
-            timeout 15 grep -HE "^($KEYS)=" /etc/systemd/journald.conf /etc/systemd/journald.conf.d/*.conf /run/systemd/journald.conf.d/*.conf 2>/dev/null || echo "No explicit retention keys found (UNRESOLVED if files unreadable)"
+            echo "systemd-analyze unavailable or failed; partial direct read of conf files (vendor/default directories not read):"
+            timeout 15 grep -HE "^($KEYS)=" /etc/systemd/journald.conf /etc/systemd/journald.conf.d/*.conf /run/systemd/journald.conf.d/*.conf 2>/dev/null || echo "No explicit entries found in the files read"
+            EFFNOTE="PARTIAL read only (merged configuration unavailable); effective settings UNRESOLVED"
           fi
-          row "systemd journal" "$J" "depends on approved retention policy" "journalctl --disk-usage + journald.conf(.d)" "$([ "$J" = unknown ] && echo 'UNRESOLVED (journalctl failed)' || echo RESOLVED)" "Low" "Logs for incident forensics" "Approved SystemMaxUse setting (no vacuum without approval)" "Yes"
+          echo "Retention status: $EFFNOTE"
+          row "systemd journal" "$J" "depends on approved retention policy" "journalctl --disk-usage + journald.conf(.d)" "$JST; retention: $EFFNOTE" "Low" "Logs for incident forensics" "Approved SystemMaxUse setting (no vacuum without approval)" "Yes"
 
       - name: "7. Cleanup Readiness Matrix"
         if: always()
@@ -359,6 +483,7 @@ jobs:
             tr -d '|' < "$M" | awk -F'\t' '{printf "| "; for(i=1;i<=9;i++){printf "%s | ",$i}; print ""}'
             echo ""
             echo "- Docker logical figures overlap and must not be summed; Docker-reported reclaimable is a candidate, not authorization."
+            echo "- UNRESOLVED rows mean the probe failed, timed out, was denied, or returned partial/malformed data; they are never zero usage."
             echo "- Production data deleted: NONE. Pruning/vacuum/restart/config change: NONE."
           } | tee -a "${GITHUB_STEP_SUMMARY:-/dev/null}"
           echo ""

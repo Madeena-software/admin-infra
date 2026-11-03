@@ -994,9 +994,16 @@ jobs:
       contents: read
     uses: ./.github/workflows/server-storage-audit.yml
 
+  cleanup-readiness:
+    name: "Production Storage Cleanup Readiness — Read Only"
+    if: github.ref_name == 'task/server-storage-cleanup-readiness'
+    permissions:
+      contents: read
+    uses: ./.github/workflows/server-storage-cleanup-readiness.yml
+
   full-audit:
     name: "Full Server Audit"
-    if: github.ref_name != 'task/server-disk-alert-threshold-80' && github.ref_name != 'task/server-storage-audit'
+    if: github.ref_name != 'task/server-disk-alert-threshold-80' && github.ref_name != 'task/server-storage-audit' && github.ref_name != 'task/server-storage-cleanup-readiness'
     runs-on: [self-hosted, linux, x64, production]
     permissions:
       contents: read

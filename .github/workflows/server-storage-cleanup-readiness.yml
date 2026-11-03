@@ -1,0 +1,369 @@
+name: "Reusable Production Storage Cleanup Readiness — Read Only"
+
+# Governing contract: .agents/tasks/plan-server-storage-cleanup.md
+# STRICTLY READ-ONLY. No prune, delete, vacuum, restart, or config change.
+# Every probe: timeout <= 15s, allowlisted fields only, RESOLVED / UNRESOLVED outcome.
+# `sudo -n` is used only for read-only inspection when already available (never escalated).
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  readiness:
+    name: "Production Storage Cleanup Readiness (Read Only)"
+    runs-on: [self-hosted, linux, x64, production]
+    timeout-minutes: 10
+
+    steps:
+      - name: "1. Environment, helpers and root filesystem baseline"
+        timeout-minutes: 2
+        run: |
+          set +e
+          STATE_DIR="${RUNNER_TEMP:-/tmp}/cleanup_readiness_${GITHUB_RUN_ID:-local}"
+          mkdir -p "$STATE_DIR"
+          : > "$STATE_DIR/matrix.tsv"
+
+          # Shared read-only helpers sourced by later steps.
+          cat > "$STATE_DIR/lib.sh" <<'LIB'
+          STATE_DIR="${RUNNER_TEMP:-/tmp}/cleanup_readiness_${GITHUB_RUN_ID:-local}"
+          S=""
+          if command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then S="sudo -n"; fi
+          # Mask anything credential-like before printing.
+          redact() { sed -E 's/([A-Za-z_]*(PASSWORD|SECRET|TOKEN|ACCESS_KEY|SECRET_KEY|ROOT_USER|PASS)[A-Za-z_]*)[=:][^[:space:];]*/\1=***REDACTED***/Ig; s#//[^/@[:space:]]+@#//***@#g'; }
+          # Size in KiB of a path (empty when timeout/denied/missing). du -x: no filesystem crossing.
+          kib() { timeout 15 $S du -sxk -- "$1" 2>/dev/null | awk 'NR==1{print $1}'; }
+          gib() { awk -v k="$1" 'BEGIN{printf "%.2f GiB", k/1048576}'; }
+          mnt() { timeout 15 findmnt -n -T "$1" -o TARGET,SOURCE,FSTYPE 2>&1 | head -1; timeout 15 df -P -- "$1" 2>&1 | tail -1; }
+          mnt_target() { timeout 15 findmnt -n -T "$1" -o TARGET 2>/dev/null | head -1; }
+          # row CATEGORY USAGE RECLAIMABLE EVIDENCE STATUS RISK DEPENDENCY ACTION APPROVAL
+          row() { printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$@" >> "$STATE_DIR/matrix.tsv"; }
+          # sized CATEGORY PATH RISK DEPENDENCY ACTION APPROVAL : measure and add a matrix row
+          sized() {
+            k=$(kib "$2")
+            if [ -n "$k" ]; then
+              echo "RESOLVED with evidence: $2 = $(gib "$k")"
+              row "$1" "$(gib "$k") physical" "not estimated" "du -sxk $2" "RESOLVED" "$3" "$4" "$5" "Yes"
+            else
+              echo "UNRESOLVED (no du result for $2: missing, permission denied, or >15s timeout)"
+              row "$1" "unknown" "unknown" "du -sxk $2" "UNRESOLVED (missing/denied/timeout)" "$3" "$4" "$5" "Yes"
+            fi
+          }
+          # Top consumers, depth <= 2, bounded. Partial output is reported as such.
+          topdu() {
+            timeout 15 $S du -x --max-depth="$2" -h -- "$1" > "$STATE_DIR/topdu.out" 2>/dev/null
+            rc=$?
+            sort -rh "$STATE_DIR/topdu.out" | head -15
+            [ $rc -eq 0 ] && echo "RESOLVED with evidence: $1 (depth $2)" || echo "UNRESOLVED/PARTIAL ($1 depth $2: du exit $rc; 124 = 15s timeout)"
+          }
+          LIB
+          . "$STATE_DIR/lib.sh"
+
+          echo "=== CLEANUP READINESS IDENTITY ==="
+          echo "Workflow: Reusable Production Storage Cleanup Readiness — Read Only"
+          echo "Run ID: ${GITHUB_RUN_ID:-UNKNOWN}  Attempt: ${GITHUB_RUN_ATTEMPT:-UNKNOWN}"
+          echo "Ref: ${GITHUB_REF:-UNKNOWN}  SHA: ${GITHUB_SHA:-UNKNOWN}"
+          echo "Timestamp: $(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null)"
+          echo "Host: $(uname -srm 2>/dev/null)"
+          if [ -n "$S" ]; then echo "Non-interactive sudo: AVAILABLE (read-only inspection only)"; else echo "Non-interactive sudo: UNAVAILABLE (unprivileged mode; restricted paths will be UNRESOLVED)"; fi
+          echo ""
+          echo "=== ROOT FILESYSTEM ==="
+          timeout 15 df -P / 2>&1
+          echo "Inodes:"; timeout 15 df -Pi / 2>&1
+          echo "Mount:"; timeout 15 findmnt -n / -o TARGET,SOURCE,FSTYPE 2>&1
+          echo "Block devices (allowlisted columns):"; timeout 15 lsblk -o NAME,TYPE,SIZE,FSTYPE,MOUNTPOINTS,ROTA 2>&1 | head -40
+
+      - name: "2. Nextcloud Snap storage (datadirectory only)"
+        timeout-minutes: 2
+        run: |
+          set +e
+          . "${RUNNER_TEMP:-/tmp}/cleanup_readiness_${GITHUB_RUN_ID:-local}/lib.sh"
+          echo "=== NEXTCLOUD SNAP METADATA ==="
+          if command -v snap >/dev/null 2>&1; then
+            for sub in "list nextcloud" "services nextcloud" "connections nextcloud"; do
+              echo "--- snap $sub ---"; timeout 15 snap $sub 2>&1 | head -30
+            done
+          else
+            echo "snap: NOT PRESENT"
+          fi
+          echo ""
+          echo "=== NEXTCLOUD datadirectory ==="
+          CFG=/var/snap/nextcloud/current/nextcloud/config/config.php
+          DD=""
+          if $S test -f "$CFG" 2>/dev/null; then
+            # Only the datadirectory line is read; no other config key is ever printed.
+            DD=$(timeout 15 $S grep -E "^[[:space:]]*['\"]datadirectory['\"][[:space:]]*=>" "$CFG" 2>/dev/null | head -1 | sed -E "s/.*=>[[:space:]]*['\"]([^'\"]*)['\"].*/\1/")
+            case "$DD" in /*) ;; *) DD="" ;; esac
+          fi
+          if [ -z "$DD" ]; then
+            echo "UNRESOLVED (config.php missing, not readable without sudo, or datadirectory not an absolute path)"
+            row "Nextcloud data directory" "unknown" "n/a" "config.php datadirectory key" "UNRESOLVED (config not readable/absent)" "High" "Persistent user data; never touch" "None (protected)" "Yes"
+          else
+            echo "RESOLVED with evidence: datadirectory = $DD"
+            echo "Backing mount:"; mnt "$DD"
+            if [ "$(mnt_target "$DD")" = "/" ]; then
+              echo "Data directory is on the root filesystem; bounded size measurement:"
+              sized "Nextcloud data directory (root fs)" "$DD" "High" "Persistent user data; consider HDD relocation only via dedicated plan" "None (protected); relocation plan only" "Yes"
+            else
+              echo "Data directory is on a secondary mount; user files NOT scanned (exclusion rule)."
+              row "Nextcloud data directory (secondary mount)" "not scanned" "n/a" "findmnt -T $DD" "RESOLVED" "High" "Not on SSD root; protected" "None" "Yes"
+            fi
+          fi
+          echo ""
+          echo "=== NEXTCLOUD SNAP FOOTPRINT (bounded du -sx) ==="
+          sized "Nextcloud snap total (/var/snap/nextcloud)" /var/snap/nextcloud "High" "Contains app, DB and config" "None (protected)"
+          sized "Nextcloud snap common" /var/snap/nextcloud/common "High" "Shared snap data" "None (protected)"
+          sized "Nextcloud snap db" /var/snap/nextcloud/current/mysql/ "High" "Database files" "None (protected)"
+          sized "Nextcloud snap logs" /var/snap/nextcloud/current/logs/ "Medium" "Application logs" "Review retention in dedicated plan"
+          sized "Nextcloud snap config" /var/snap/nextcloud/current/nextcloud/config/ "High" "Configuration" "None (protected)"
+
+      - name: "3. MinIO storage (allowlisted properties, credential redaction)"
+        timeout-minutes: 2
+        run: |
+          set +e
+          . "${RUNNER_TEMP:-/tmp}/cleanup_readiness_${GITHUB_RUN_ID:-local}/lib.sh"
+          echo "=== MINIO SERVICE (allowlisted systemctl properties) ==="
+          if ! command -v systemctl >/dev/null 2>&1; then
+            echo "UNRESOLVED (systemctl unavailable)"
+            row "MinIO object storage" "unknown" "n/a" "systemctl" "UNRESOLVED (systemctl unavailable)" "High" "Object data" "None (protected)" "Yes"
+            exit 0
+          fi
+          PROPS=$(timeout 15 systemctl show minio.service -p ActiveState -p FragmentPath -p ExecStart -p EnvironmentFiles -p User -p WorkingDirectory 2>&1 | redact)
+          echo "$PROPS"
+          if ! echo "$PROPS" | grep -q '^FragmentPath=/'; then
+            echo "UNRESOLVED (minio.service not found or no unit file)"
+            row "MinIO object storage" "unknown" "n/a" "systemctl show minio.service" "UNRESOLVED (unit not found)" "High" "Object data" "None (protected)" "Yes"
+            exit 0
+          fi
+          echo ""
+          VOLS=""
+          # Authoritative EnvironmentFile(s): extract ONLY MINIO_VOLUMES.
+          for ef in $(echo "$PROPS" | grep '^EnvironmentFiles=' | sed 's/^EnvironmentFiles=//' | tr ' ' '\n' | grep '^-\?/' | sed 's/^-//'); do
+            if $S test -f "$ef" 2>/dev/null; then
+              v=$(timeout 15 $S grep -E '^[[:space:]]*MINIO_VOLUMES=' "$ef" 2>/dev/null | tail -1 | sed -E 's/^[^=]*=//; s/["'"'"']//g' | redact)
+              if [ -n "$v" ]; then echo "MINIO_VOLUMES (from $ef): $v"; VOLS="$v"; fi
+            else
+              echo "EnvironmentFile $ef: not readable/absent (UNRESOLVED for this file)"
+            fi
+          done
+          # Fallback: absolute literal path arguments in ExecStart argv (excluding the binary).
+          if [ -z "$VOLS" ]; then
+            VOLS=$(echo "$PROPS" | grep '^ExecStart=' | sed -n 's/.*argv\[\]=\([^;]*\);.*/\1/p' | tr ' ' '\n' | sed 1d | grep '^/' | grep -v '\$' | tr '\n' ' ')
+            [ -n "$VOLS" ] && echo "Storage path from ExecStart argv: $VOLS"
+          fi
+          FOUND=0
+          for p in $VOLS; do
+            case "$p" in
+              /*) FOUND=1
+                  echo "--- $p ---"; echo "Backing mount:"; mnt "$p"
+                  tgt=$(mnt_target "$p")
+                  if [ "$tgt" = "/" ]; then place="SSD root filesystem"; else place="secondary mount $tgt"; fi
+                  echo "Placement: $place"
+                  sized "MinIO storage ($place)" "$p" "High" "Object data; S3 clients depend on it" "None (protected)" "Yes" ;;
+            esac
+          done
+          if [ $FOUND -eq 0 ]; then
+            echo "UNRESOLVED (no local absolute storage path found; MINIO_VOLUMES missing, unreadable, or non-local/templated)"
+            row "MinIO object storage" "unknown" "n/a" "systemctl show + MINIO_VOLUMES key" "UNRESOLVED (path not determinable)" "High" "Object data" "None (protected)" "Yes"
+          fi
+
+      - name: "4. Docker root dir, accounting reconciliation and candidate inventory"
+        timeout-minutes: 3
+        run: |
+          set +e
+          . "${RUNNER_TEMP:-/tmp}/cleanup_readiness_${GITHUB_RUN_ID:-local}/lib.sh"
+          if ! command -v docker >/dev/null 2>&1; then
+            echo "UNRESOLVED (docker not installed)"; row "Docker" "unknown" "unknown" "docker CLI" "UNRESOLVED (docker missing)" "Medium" "n/a" "n/a" "Yes"; exit 0
+          fi
+          D="docker"
+          if ! timeout 15 docker info >/dev/null 2>&1; then
+            if [ -n "$S" ] && timeout 15 $S docker info >/dev/null 2>&1; then D="$S docker"; else
+              echo "UNRESOLVED (docker daemon not accessible)"; row "Docker" "unknown" "unknown" "docker info" "UNRESOLVED (daemon inaccessible)" "Medium" "n/a" "n/a" "Yes"; exit 0
+            fi
+          fi
+          echo "=== DOCKER INFO (allowlisted) ==="
+          ROOT=$(timeout 15 $D info --format '{{.DockerRootDir}}' 2>/dev/null)
+          echo "Docker Root Dir: ${ROOT:-UNRESOLVED}"
+          echo "Storage Driver: $(timeout 15 $D info --format '{{.Driver}}' 2>/dev/null)"
+          echo "Containers: $(timeout 15 $D info --format '{{.Containers}} (running {{.ContainersRunning}}, stopped {{.ContainersStopped}})' 2>/dev/null)"
+          echo "Images: $(timeout 15 $D info --format '{{.Images}}' 2>/dev/null)"
+          echo "Swarm: $(timeout 15 $D info --format '{{.Swarm.LocalNodeState}}' 2>/dev/null)"
+          echo ""
+          echo "=== DOCKER ROOT DIR BACKING MOUNT & PHYSICAL SIZE ==="
+          if [ -n "$ROOT" ]; then
+            mnt "$ROOT"
+            for sub in "" /overlay2 /containerd /buildkit /volumes /image; do sized "Docker physical ${ROOT}${sub}" "${ROOT}${sub}" "Medium" "Physical footprint of Docker data" "See Docker rows"; done
+          fi
+          echo ""
+          echo "=== OTHER RUNTIME PATHS (existence-checked) ==="
+          for p in /var/lib/docker /var/snap/docker/common/var-lib-docker /var/lib/containerd /var/lib/buildkit; do
+            [ "$p" = "$ROOT" ] && continue
+            if $S test -e "$p" 2>/dev/null; then echo "Present: $p"; sized "Runtime path $p" "$p" "Medium" "Possible alternate Docker/containerd backing" "Investigate"; else echo "Absent/not accessible: $p"; fi
+          done
+          echo ""
+          echo "=== DOCKER LOGICAL ACCOUNTING (docker system df) ==="
+          timeout 15 $D system df 2>&1
+          DF="$STATE_DIR/dockerdf.tsv"
+          timeout 15 $D system df --format '{{.Type}}	{{.TotalCount}}	{{.Size}}	{{.Reclaimable}}' > "$DF" 2>/dev/null
+          echo ""
+          echo "Four non-interchangeable values: (1) logical Docker accounting (above; categories overlap, do NOT sum),"
+          echo "(2) physical filesystem usage (du rows above), (3) Docker-reported reclaimable (candidate only),"
+          echo "(4) operationally approved for removal (currently NONE)."
+          for t in "Images" "Containers" "Local Volumes" "Build Cache"; do
+            line=$(awk -F'\t' -v t="$t" '$1==t' "$DF")
+            if [ -n "$line" ]; then
+              sz=$(echo "$line" | cut -f3); rc=$(echo "$line" | cut -f4)
+              case "$t" in
+                "Images") risk="Medium"; dep="Rollback/deploy sensitive: unreferenced images may be rollback targets"; act="Tier B: review unreferenced images, then approved removal"; ;;
+                "Containers") risk="Medium"; dep="Stopped containers need state/dependency review"; act="Tier B: review then approved removal"; ;;
+                "Local Volumes") risk="High"; dep="Persistent application state"; act="Tier C: none without application review"; ;;
+                *) risk="Low"; dep="Slower next build only"; act="Tier A: approved builder prune with size/age bound"; ;;
+              esac
+              row "Docker $t (logical)" "$sz logical" "$rc (Docker-reported, candidate only)" "docker system df" "RESOLVED" "$risk" "$dep" "$act" "Yes"
+            else
+              row "Docker $t (logical)" "unknown" "unknown" "docker system df" "UNRESOLVED (no output/timeout)" "Medium" "n/a" "n/a" "Yes"
+            fi
+          done
+          echo ""
+          echo "=== CONTAINERS ==="
+          echo "--- running ---"; timeout 15 $D ps --format '{{.ID}} {{.Names}} {{.Image}} {{.Status}}' 2>&1 | head -50
+          echo "--- stopped (exited/created) ---"; timeout 15 $D ps -a --filter status=exited --filter status=created --format '{{.ID}} {{.Names}} {{.Image}} {{.Status}}' 2>&1 | head -50
+          echo ""
+          echo "=== SWARM SERVICES ==="
+          timeout 15 $D service ls --format '{{.Name}} {{.Image}}' 2>&1 | head -30
+          echo ""
+          echo "=== IMAGE REFERENCE CLASSIFICATION ==="
+          REFS="$STATE_DIR/refs.txt"; : > "$REFS"
+          CIDS=$(timeout 15 $D ps -aq 2>/dev/null)
+          [ -n "$CIDS" ] && timeout 15 $D inspect --format '{{.Image}}' $CIDS 2>/dev/null >> "$REFS"
+          timeout 15 $D service ls --format '{{.Image}}' 2>/dev/null | sed 's/@.*//' >> "$REFS"
+          timeout 15 $D images --no-trunc --format '{{.ID}}	{{.Repository}}:{{.Tag}}	{{.Size}}' > "$STATE_DIR/images.tsv" 2>/dev/null
+          if [ -s "$STATE_DIR/images.tsv" ]; then
+            awk -F'\t' 'NR==FNR{ref[$1]=1;next} !($1 in ref) && !($2 in ref){print $2"  "$3"  "$1}' "$REFS" "$STATE_DIR/images.tsv" > "$STATE_DIR/unref.txt"
+            TOTAL=$(wc -l < "$STATE_DIR/images.tsv"); UNREF=$(wc -l < "$STATE_DIR/unref.txt")
+            echo "Image tags total: $TOTAL; not referenced by any container/service on this node: $UNREF (Tier B, per-image sizes overlap; no sum given)"
+            head -40 "$STATE_DIR/unref.txt"
+            echo "Tier B reminder: unreferenced != safe to remove; may be rollback targets."
+            row "Docker unreferenced image tags (Tier B)" "$UNREF of $TOTAL tags" "see Docker Images reclaimable" "docker images vs docker ps -a / service ls" "RESOLVED" "Medium" "Possible rollback targets" "Approved age-bounded removal, keep current + previous release" "Yes"
+          else
+            echo "UNRESOLVED (docker images returned nothing)"
+            row "Docker unreferenced image tags (Tier B)" "unknown" "unknown" "docker images" "UNRESOLVED (no output)" "Medium" "n/a" "n/a" "Yes"
+          fi
+          echo ""
+          echo "=== BUILD CACHE ==="
+          if timeout 15 $D buildx version >/dev/null 2>&1; then
+            timeout 15 $D buildx du 2>&1 | tail -4
+          else
+            echo "docker buildx unavailable; using docker system df -v (build cache section):"
+            timeout 15 $D system df -v 2>&1 | sed -n '/Build cache usage/,$p' | head -12
+          fi
+          echo ""
+          echo "=== VOLUMES (Tier C, protected) AND BIND-MOUNT SOURCES ==="
+          timeout 15 $D volume ls --format '{{.Name}} {{.Driver}}' 2>&1 | head -40
+          if [ -n "$CIDS" ]; then
+            echo "Container mount sources (type + source only):"
+            timeout 15 $D inspect --format '{{.Name}}{{range .Mounts}} [{{.Type}}] {{.Source}}{{end}}' $CIDS 2>&1 | head -40
+          fi
+          row "Docker volumes & bind mounts (Tier C)" "see inventory" "none" "docker volume ls / inspect Mounts" "RESOLVED" "High" "Persistent app state" "None without application review" "Yes"
+
+      - name: "5. Bounded root, runner workspace and large-file scans"
+        timeout-minutes: 3
+        run: |
+          set +e
+          . "${RUNNER_TEMP:-/tmp}/cleanup_readiness_${GITHUB_RUN_ID:-local}/lib.sh"
+          echo "=== TARGETED BOUNDED SCANS (du -x, depth <= 2, 15s each) ==="
+          for d in /home /var/snap /var/log /var/www; do echo "--- $d ---"; topdu "$d" 2; done
+          echo ""
+          echo "=== GITHUB RUNNER WORKSPACES ==="
+          for r in $(ls -d /home/*/actions-runner* "$HOME"/actions-runner* 2>/dev/null | sort -u); do
+            for sub in _work _diag; do
+              [ -d "$r/$sub" ] && sized "Runner $(basename "$r")/$sub" "$r/$sub" "Medium" "Runner job workspace; do not remove/alter runner dirs without approval" "Review workspace cleanup policy"
+            done
+          done
+          echo ""
+          echo "=== LARGE FILES >= 500 MiB (candidate dirs only, depth <= 2; path and size only) ==="
+          ROOT=$(timeout 15 docker info --format '{{.DockerRootDir}}' 2>/dev/null)
+          for d in /home /var/snap /var/snap/nextcloud /var/log /var/www $ROOT; do
+            [ -d "$d" ] || continue
+            echo "--- $d ---"
+            timeout 15 $S find "$d" -xdev -maxdepth 2 -type f -size +500M -printf '%s\t%p\n' 2>/dev/null | sort -rn | head -10 | awk -F'\t' '{printf "%.2f GiB\t%s\n",$1/1073741824,$2}'
+            [ "${PIPESTATUS[0]}" = "124" ] && echo "PARTIAL (15s timeout)"
+          done
+          echo "Note: depth <= 2 limits large-file discovery; deeper files are UNRESOLVED by design."
+          sized "/var/log" /var/log "Medium" "Active logs; rotation policy only" "Approved retention change, no truncation"
+          sized "/var/www" /var/www "High" "Active application code" "None (protected)"
+          sized "/var/cache" /var/cache "Low" "Package/app caches" "Approved apt clean (separate approval)"
+          sized "/tmp" /tmp "Low" "Temporary files, may be in use" "Review aged files only with approval"
+
+      - name: "6. Snap retained revisions and journal retention"
+        timeout-minutes: 2
+        run: |
+          set +e
+          . "${RUNNER_TEMP:-/tmp}/cleanup_readiness_${GITHUB_RUN_ID:-local}/lib.sh"
+          echo "=== SNAP REVISIONS ==="
+          if command -v snap >/dev/null 2>&1; then
+            timeout 15 snap list --all 2>&1 > "$STATE_DIR/snaps.txt"
+            head -60 "$STATE_DIR/snaps.txt"
+            echo "--- disabled revisions ---"
+            awk '/disabled/{print $1, $3}' "$STATE_DIR/snaps.txt" > "$STATE_DIR/disabled.txt"
+            cat "$STATE_DIR/disabled.txt"
+            total=0; n=0
+            while read -r name rev; do
+              [ -z "$name" ] && continue
+              n=$((n+1))
+              b=$(stat -c %s "/var/lib/snapd/snaps/${name}_${rev}.snap" 2>/dev/null)
+              [ -n "$b" ] && total=$((total+b))
+            done < "$STATE_DIR/disabled.txt"
+            if [ -s "$STATE_DIR/snaps.txt" ]; then
+              echo "RESOLVED with evidence: $n disabled revision(s), $(awk -v b=$total 'BEGIN{printf "%.2f GiB",b/1073741824}') squashfs footprint (stat of /var/lib/snapd/snaps/*.snap)"
+              row "Disabled snap revisions" "$n revisions, $(awk -v b=$total 'BEGIN{printf "%.2f GiB",b/1073741824}')" "same as usage (if removed)" "snap list --all + stat" "RESOLVED" "Low" "Old revisions only; active revision untouched" "Approved 'snap remove --revision' per disabled revision" "Yes"
+            fi
+          else
+            echo "UNRESOLVED (snap not installed)"
+            row "Disabled snap revisions" "unknown" "unknown" "snap list --all" "UNRESOLVED (snap missing)" "Low" "n/a" "n/a" "Yes"
+          fi
+          echo ""
+          echo "=== JOURNAL ==="
+          J=$(timeout 15 journalctl --disk-usage 2>&1)
+          if [ $? -eq 0 ] && [ -n "$J" ]; then
+            echo "RESOLVED with evidence: $J"
+          else
+            J="unknown"; echo "UNRESOLVED (journalctl --disk-usage failed: $J)"
+          fi
+          echo "Effective retention keys (last occurrence wins):"
+          KEYS='SystemMaxUse|SystemKeepFree|SystemMaxFileSize|MaxRetentionSec'
+          if command -v systemd-analyze >/dev/null 2>&1 && timeout 15 systemd-analyze cat-config systemd/journald.conf > "$STATE_DIR/jconf.txt" 2>/dev/null; then
+            awk -v keys="^($KEYS)=" '/^# \//{f=$2} $0 ~ keys {print f": "$0}' "$STATE_DIR/jconf.txt"
+            grep -Eq "^($KEYS)=" "$STATE_DIR/jconf.txt" || echo "No explicit retention keys set (systemd defaults apply)"
+          else
+            echo "systemd-analyze unavailable; direct read of conf files:"
+            timeout 15 grep -HE "^($KEYS)=" /etc/systemd/journald.conf /etc/systemd/journald.conf.d/*.conf /run/systemd/journald.conf.d/*.conf 2>/dev/null || echo "No explicit retention keys found (UNRESOLVED if files unreadable)"
+          fi
+          row "systemd journal" "$J" "depends on approved retention policy" "journalctl --disk-usage + journald.conf(.d)" "$([ "$J" = unknown ] && echo 'UNRESOLVED (journalctl failed)' || echo RESOLVED)" "Low" "Logs for incident forensics" "Approved SystemMaxUse setting (no vacuum without approval)" "Yes"
+
+      - name: "7. Cleanup Readiness Matrix"
+        if: always()
+        timeout-minutes: 1
+        run: |
+          set +e
+          . "${RUNNER_TEMP:-/tmp}/cleanup_readiness_${GITHUB_RUN_ID:-local}/lib.sh"
+          M="$STATE_DIR/matrix.tsv"
+          HDR="| Category | Observed usage | Est. reclaimable | Evidence source | Status | Risk | Dependency / rollback impact | Proposed future action | Separate approval? |"
+          SEP="|---|---|---|---|---|---|---|---|---|"
+          {
+            echo "## Cleanup Readiness Matrix (read-only; no action taken)"
+            echo ""
+            echo "$HDR"; echo "$SEP"
+            tr -d '|' < "$M" | awk -F'\t' '{printf "| "; for(i=1;i<=9;i++){printf "%s | ",$i}; print ""}'
+            echo ""
+            echo "- Docker logical figures overlap and must not be summed; Docker-reported reclaimable is a candidate, not authorization."
+            echo "- Production data deleted: NONE. Pruning/vacuum/restart/config change: NONE."
+          } | tee -a "${GITHUB_STEP_SUMMARY:-/dev/null}"
+          echo ""
+          echo "=== SAFETY SUMMARY ==="
+          echo "Files/volumes/snaps deleted: NONE"
+          echo "Docker prune: NONE; journal vacuum: NONE; services restarted: NONE"
+          echo "Config/mount/LVM modified: NONE"
+          echo "Ephemeral state left in RUNNER_TEMP for the runner to reclaim (nothing deleted by this workflow)."

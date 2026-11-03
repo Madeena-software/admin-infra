@@ -198,18 +198,18 @@ jobs:
             PL="UNRESOLVED"; PL_TGT=""; PL_SRC=""; PL_WHY=""; PL_MED="unresolved"
             valid_path "$1" || { PL_WHY="invalid path"; return 1; }
             $S test -e "$1" 2>/dev/null || { PL_WHY="path missing or not accessible"; return 1; }
-            fm=$(timeout 15 findmnt -n -T "$1" -o TARGET,SOURCE,FSTYPE 2>/dev/null); rc=$?
+            fm=$(timeout 15 $S findmnt -n -T "$1" -o TARGET,SOURCE,FSTYPE 2>/dev/null); rc=$?
             [ $rc -ne 0 ] && { PL_WHY="findmnt failed (exit $rc)"; return 1; }
             PL_TGT=$(printf '%s\n' "$fm" | awk 'NR==1{print $1}'); PL_SRC=$(printf '%s\n' "$fm" | awk 'NR==1{print $2}')
             { [ -n "$PL_TGT" ] && [ -n "$PL_SRC" ] && valid_path "$PL_TGT"; } || { PL_WHY="findmnt output malformed"; PL="UNRESOLVED"; return 1; }
-            dfo=$(timeout 15 df -P -- "$1" 2>/dev/null); rc=$?
+            dfo=$(timeout 15 $S df -P -- "$1" 2>/dev/null); rc=$?
             [ $rc -ne 0 ] && { PL_WHY="df failed (exit $rc)"; return 1; }
             dfl=$(printf '%s\n' "$dfo" | awk 'NR==2')
             printf '%s\n' "$dfl" | awk '$2 ~ /^[0-9]+$/ && $3 ~ /^[0-9]+$/ && $6 ~ /^\//{ok=1} END{exit !ok}' || { PL_WHY="df output malformed"; return 1; }
             [ "$(printf '%s\n' "$dfl" | awk '{print $6}')" = "$PL_TGT" ] || { PL_WHY="findmnt and df disagree on mount point"; return 1; }
             if [ "$PL_TGT" = "/" ]; then PL="ROOT"; else PL="SECONDARY"; fi
             case "$PL_SRC" in
-              /dev/*) r=$(timeout 15 lsblk -no ROTA "$PL_SRC" 2>/dev/null | head -1 | tr -d ' ')
+              /dev/*) r=$(timeout 15 $S lsblk -no ROTA "$PL_SRC" 2>/dev/null | head -1 | tr -d ' ')
                       case "$r" in 0) PL_MED="non-rotational (ROTA=0)";; 1) PL_MED="rotational (ROTA=1)";; *) PL_MED="unresolved (lsblk ROTA not determinable)";; esac ;;
               *) PL_MED="unresolved (source is not a block device path)" ;;
             esac

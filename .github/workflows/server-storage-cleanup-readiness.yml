@@ -319,14 +319,25 @@ jobs:
             SVC=$(timeout 15 $D service ls --format '{{.Image}}' 2>/dev/null); rc=$?
             if [ $rc -ne 0 ]; then INC="$INC; swarm service enumeration failed (exit $rc; node may not be a manager)"
             else
-              printf '%s\n' "$SVC" | grep . | awk '
-                { img=$0; dig=index(img,"@"); if (dig) img=substr(img,1,dig-1)
-                  n=split(img,p,"/"); last=p[n]
-                  if (index(last,":")==0) { if (dig) { print "UNTAGGED"; next } img=img ":latest" }
-                  print img }' > "$STATE_DIR/svcrefs.txt"
-              grep -qx UNTAGGED "$STATE_DIR/svcrefs.txt" && INC="$INC; a service image is pinned by digest only (cannot map to image tags)"
-              grep -vx UNTAGGED "$STATE_DIR/svcrefs.txt" >> "$REFS"
-              echo "Swarm services enumerated: $(printf '%s\n' "$SVC" | grep -c .)"
+              NSVC=$(printf '%s\n' "$SVC" | grep -c .)
+              echo "Swarm services enumerated: $NSVC"
+              while IFS= read -r simg; do
+                [ -z "$simg" ] && continue
+                # Resolve service image to local image ID via inspect
+                sim_id=$(timeout 15 $D image inspect --format '{{.Id}}' "$simg" 2>/dev/null)
+                if printf '%s' "$sim_id" | grep -Eq '^sha256:[0-9a-f]{64}$'; then
+                  printf '%s\n' "$sim_id" >> "$REFS"
+                  # If tag is present (repo:tag@sha256:... or repo:tag), preserve the tag as well
+                  stag=$(printf '%s\n' "$simg" | sed 's/@.*//')
+                  slast=$(printf '%s\n' "$stag" | awk -F'/' '{print $NF}')
+                  case "$slast" in
+                    *:*) printf '%s\n' "$stag" >> "$REFS" ;;
+                    *)   printf '%s\n' "$stag:latest" "$stag" >> "$REFS" ;;
+                  esac
+                else
+                  INC="$INC; swarm service image '$simg' association cannot be established reliably"
+                fi
+              done <<< "$SVC"
             fi
           elif [ "$SWSTATE" = "inactive" ]; then echo "Swarm inactive: no service references required"
           else INC="$INC; Swarm state '$SWSTATE' not usable for inventory"; fi
@@ -348,21 +359,129 @@ jobs:
             row "Docker unreferenced image tags (Tier B)" "$UNREF of $TOTAL tags" "see Docker Images reclaimable" "complete inventory: docker ps -a, inspect, service ls, images" "RESOLVED" "Medium" "Possible rollback targets" "Approved age-bounded removal, keep current + previous release" "Yes"
           fi
           echo ""
-          echo "=== BUILD CACHE ==="
+          echo "=== BUILD CACHE (detailed inspection) ==="
+          BC_SRC=""
+          BC_WHY=""
+          BC_STATUS="UNRESOLVED"
+          # Detailed inspection probe: try docker buildx du first
           if timeout 15 $D buildx version >/dev/null 2>&1; then
-            timeout 15 $D buildx du 2>&1 | tail -4
+            BC_RAW=$(timeout 15 $D buildx du 2>&1); BC_RC=$?
+            if [ $BC_RC -eq 0 ] && [ -n "$BC_RAW" ]; then
+              BC_SRC="docker buildx du"
+              BC_STATUS="RESOLVED"
+              echo "Build cache details ($BC_SRC):"
+              printf '%s\n' "$BC_RAW" | tail -10
+              echo "RESOLVED with evidence: detailed build cache inspected via $BC_SRC"
+            elif [ $BC_RC -eq 124 ]; then
+              BC_WHY="docker buildx du timeout >15s"
+            else
+              BC_WHY="docker buildx du failed (exit $BC_RC)"
+            fi
           else
-            echo "docker buildx unavailable; using docker system df -v (build cache section):"
-            timeout 15 $D system df -v 2>&1 | sed -n '/Build cache usage/,$p' | head -12
+            BC_WHY="docker buildx unavailable"
+          fi
+
+          # Fallback to docker system df -v (build cache section) if buildx du did not succeed
+          if [ "$BC_STATUS" != "RESOLVED" ]; then
+            echo "Attempting fallback detailed build cache inspection via docker system df -v..."
+            DF_V=$(timeout 15 $D system df -v 2>&1); DFV_RC=$?
+            if [ $DFV_RC -eq 0 ] && printf '%s\n' "$DF_V" | grep -q 'Build cache usage:'; then
+              BC_SRC="docker system df -v"
+              BC_STATUS="RESOLVED"
+              echo "Build cache details ($BC_SRC):"
+              printf '%s\n' "$DF_V" | sed -n '/Build cache usage/,$p' | head -15
+              echo "RESOLVED with evidence: detailed build cache inspected via $BC_SRC"
+            elif [ $DFV_RC -eq 124 ]; then
+              BC_WHY="${BC_WHY}; docker system df -v timeout >15s"
+            else
+              BC_WHY="${BC_WHY}; docker system df -v failed (exit $DFV_RC)"
+            fi
+          fi
+
+          if [ "$BC_STATUS" = "RESOLVED" ]; then
+            row "Docker build cache (detailed)" "detailed breakdown inspected (Tier A)" "see logical reclaimable" "$BC_SRC" "RESOLVED" "Low" "Slower next build only" "Tier A: approved builder prune with size/age bound" "Yes"
+          else
+            echo "UNRESOLVED ($BC_WHY)"
+            row "Docker build cache (detailed)" "unknown" "unknown" "docker buildx du / system df -v" "UNRESOLVED ($BC_WHY)" "Low" "Slower next build only" "Tier A: approved builder prune with size/age bound" "Yes"
           fi
           echo ""
           echo "=== VOLUMES (Tier C, protected) AND BIND-MOUNT SOURCES ==="
-          timeout 15 $D volume ls --format '{{.Name}} {{.Driver}}' 2>&1 | head -40
-          if [ -n "$CIDS" ]; then
-            echo "Container mount sources (type + source only):"
-            timeout 15 $D inspect --format '{{.Name}}{{range .Mounts}} [{{.Type}}] {{.Source}}{{end}}' $CIDS 2>&1 | head -40
+          V_INC=""
+          VOLS_OUT=$(timeout 15 $D volume ls --format '{{.Name}}	{{.Driver}}' 2>/dev/null); VOLS_RC=$?
+          if [ $VOLS_RC -eq 124 ]; then
+            V_INC="docker volume ls timeout >15s"
+          elif [ $VOLS_RC -ne 0 ]; then
+            V_INC="docker volume ls failed (exit $VOLS_RC)"
+          else
+            if [ -n "$VOLS_OUT" ]; then
+              if printf '%s\n' "$VOLS_OUT" | awk -F'\t' 'NF!=2 || $1=="" || $2=="" {bad=1} END{exit !bad}'; then
+                V_INC="docker volume ls output malformed"
+              fi
+            fi
           fi
-          row "Docker volumes & bind mounts (Tier C)" "see inventory" "none" "docker volume ls / inspect Mounts" "RESOLVED (inventory listing only)" "High" "Persistent app state" "None without application review" "Yes"
+
+          N_VOL=0
+          if [ -z "$V_INC" ]; then
+            if [ -n "$VOLS_OUT" ]; then
+              N_VOL=$(printf '%s\n' "$VOLS_OUT" | grep -c .)
+              echo "Volumes enumerated ($N_VOL):"
+              printf '%s\n' "$VOLS_OUT" | head -40
+            else
+              echo "Volumes enumerated: 0 (empty volume inventory)"
+            fi
+          else
+            echo "Volume enumeration: UNRESOLVED ($V_INC)"
+          fi
+
+          echo ""
+          M_INC=""
+          N_MNT=0
+          # Check container enumeration prerequisites for mount inspection
+          if [ -n "$INC" ] && printf '%s' "$INC" | grep -qi 'container'; then
+            M_INC="container enumeration was incomplete; mount sources could not be inspected"
+          elif [ "$NC" -eq 0 ]; then
+            echo "Container mount sources: 0 (0 active or stopped containers)"
+          else
+            MNTS_OUT=$(timeout 15 $D inspect --format '{{.Name}}{{range .Mounts}} [{{.Type}}] {{.Source}}{{end}}' $CIDS 2>/dev/null); MNTS_RC=$?
+            if [ $MNTS_RC -eq 124 ]; then
+              M_INC="container inspect mounts timeout >15s"
+            elif [ $MNTS_RC -ne 0 ]; then
+              M_INC="container inspect mounts failed (exit $MNTS_RC)"
+            else
+              N_INSP=$(printf '%s\n' "$MNTS_OUT" | grep -c .)
+              if [ "$N_INSP" -ne "$NC" ]; then
+                M_INC="container inspect mounts returned $N_INSP of $NC container records"
+              else
+                N_MNT=$(printf '%s\n' "$MNTS_OUT" | grep -o '\[[a-z]*\]' | wc -l)
+                echo "Container mount sources ($N_MNT mount(s) across $NC container(s)):"
+                printf '%s\n' "$MNTS_OUT" | head -40
+              fi
+            fi
+          fi
+
+          if [ -n "$M_INC" ]; then
+            echo "Container mount inspection: UNRESOLVED ($M_INC)"
+          fi
+
+          echo ""
+          if [ -n "$V_INC" ] || [ -n "$M_INC" ]; then
+            VM_FAIL="${V_INC}${V_INC:+; }${M_INC}"
+            echo "UNRESOLVED (volumes/mounts inventory incomplete: $VM_FAIL)"
+            row "Docker volumes & bind mounts (Tier C)" "unknown" "none" "docker volume ls / inspect Mounts" "UNRESOLVED ($VM_FAIL)" "High" "Persistent app state" "None without application review" "Yes"
+          else
+            if [ "$N_VOL" -eq 0 ] && [ "$N_MNT" -eq 0 ]; then
+              VM_USAGE="0 volumes, 0 container mounts ($NC containers)"
+              VM_STATUS="RESOLVED (empty inventory: 0 volumes, 0 mounts)"
+            elif [ "$N_VOL" -eq 0 ]; then
+              VM_USAGE="0 volumes, $N_MNT mount(s) across $NC container(s)"
+              VM_STATUS="RESOLVED (0 local volumes; $N_MNT container mount(s) inventoried)"
+            else
+              VM_USAGE="$N_VOL volume(s), $N_MNT mount(s) across $NC container(s)"
+              VM_STATUS="RESOLVED ($N_VOL volume(s), $N_MNT mount(s) inventoried)"
+            fi
+            echo "RESOLVED with evidence: $VM_USAGE"
+            row "Docker volumes & bind mounts (Tier C)" "$VM_USAGE" "none" "docker volume ls / inspect Mounts" "$VM_STATUS" "High" "Persistent app state" "None without application review" "Yes"
+          fi
 
       - name: "5. Bounded root, runner workspace and large-file scans"
         timeout-minutes: 3

@@ -1,0 +1,1097 @@
+name: "Reusable Production Storage Audit — Read Only"
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    name: "Production Storage Topology & Utilization Audit"
+    runs-on: [self-hosted, linux, x64, production]
+    timeout-minutes: 5
+
+    steps:
+      - name: "1. Diagnostic Environment & Safe Tool Availability Probing"
+        run: |
+          echo "=== STORAGE AUDIT IDENTITY ==="
+          echo "Workflow: Reusable Production Storage Audit — Read Only"
+          echo "Run ID: ${GITHUB_RUN_ID:-UNKNOWN}"
+          echo "Run Attempt: ${GITHUB_RUN_ATTEMPT:-UNKNOWN}"
+          echo "Ref: ${GITHUB_REF:-UNKNOWN}"
+          echo "SHA: ${GITHUB_SHA:-UNKNOWN}"
+          echo "Timestamp: $(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || echo 'UNKNOWN')"
+          echo ""
+
+          echo "=== PRIVILEGE CHECK ==="
+          if sudo -n true 2>/dev/null; then
+            echo "Non-interactive sudo: AVAILABLE"
+          else
+            echo "Non-interactive sudo: UNAVAILABLE (unprivileged inspection mode)"
+          fi
+          echo ""
+
+          echo "=== TOOL AVAILABILITY ==="
+          tools="lsblk findmnt df du find sort awk sed timeout systemctl docker journalctl pvs vgs lvs"
+          for t in $tools; do
+            if command -v "$t" >/dev/null 2>&1; then
+              printf "%-14s : AVAILABLE (%s)\n" "$t" "$(command -v "$t")"
+            else
+              printf "%-14s : NOT PRESENT / UNAVAILABLE\n" "$t"
+            fi
+          done
+          echo ""
+
+          # Initialize ephemeral audit state directory under RUNNER_TEMP
+          STATE_DIR="${RUNNER_TEMP:-/tmp}/storage_audit_state_${GITHUB_RUN_ID:-local}"
+          mkdir -p "$STATE_DIR"
+          echo "Ephemeral audit state initialized at: $STATE_DIR"
+          echo ""
+
+      - name: "2. Block-Device Topology & Physical Medium Mapping"
+        run: |
+          echo "=== BLOCK DEVICES ==="
+          if command -v lsblk >/dev/null 2>&1; then
+            echo "Running lsblk with explicit allowlisted columns (no serial/WWN)..."
+            # Explicit allowlisted output fields only
+            set +e
+            lsblk_out=$(lsblk -o NAME,TYPE,SIZE,FSTYPE,MOUNTPOINTS,MODEL,ROTA 2>&1)
+            rc=$?
+            set -e
+            if [ $rc -eq 0 ]; then
+              echo "$lsblk_out"
+              echo ""
+              echo "Block Device Analysis:"
+              echo "- ROTA=0 indicates non-rotational device"
+              echo "- ROTA=1 indicates rotational device"
+              echo "- Physical medium (SSD/HDD) must only be concluded when parent topology and rotational indicator reliably establish it; otherwise UNRESOLVED."
+            else
+              echo "lsblk execution failed (exit code: $rc): $lsblk_out"
+              echo "Block device topology: UNRESOLVED (lsblk failed with exit code $rc)"
+            fi
+          else
+            echo "lsblk: NOT PRESENT / UNAVAILABLE"
+            echo "Block device topology: UNRESOLVED (lsblk unavailable)"
+          fi
+          echo ""
+
+      - name: "3. Root Filesystem & Additional Storage Mount Mapping"
+        run: |
+          echo "=== ROOT FILESYSTEM ==="
+          if command -v df >/dev/null 2>&1; then
+            echo "Root filesystem capacity (df -P /):"
+            set +e
+            df_root=$(df -P / 2>&1)
+            rc=$?
+            set -e
+            if [ $rc -eq 0 ]; then
+              echo "$df_root"
+            else
+              echo "ERROR: df -P / failed (exit code: $rc): $df_root"
+            fi
+          else
+            echo "df: NOT PRESENT / UNAVAILABLE"
+          fi
+
+          if command -v findmnt >/dev/null 2>&1; then
+            echo ""
+            echo "Root filesystem mount details (findmnt /):"
+            set +e
+            fm_root=$(findmnt / 2>&1)
+            rc=$?
+            set -e
+            if [ $rc -eq 0 ]; then
+              echo "$fm_root"
+            else
+              echo "ERROR: findmnt / failed (exit code: $rc): $fm_root"
+            fi
+          fi
+          echo ""
+
+          echo "=== ADDITIONAL STORAGE ==="
+          target_mount="/media/nextcloud-data"
+          echo "Inspecting additional storage mount: $target_mount"
+          if [ -e "$target_mount" ]; then
+            echo "Path exists: YES"
+          else
+            echo "Path exists: NO / INACCESSIBLE"
+          fi
+
+          if command -v findmnt >/dev/null 2>&1; then
+            echo "Mount check (findmnt $target_mount):"
+            set +e
+            fm_target=$(findmnt "$target_mount" 2>&1)
+            rc=$?
+            set -e
+            if [ $rc -eq 0 ]; then
+              echo "$fm_target"
+            else
+              echo "Mount point: NOT MOUNTED / NOT FOUND IN MOUNT TABLE"
+            fi
+          fi
+
+          if command -v df >/dev/null 2>&1; then
+            echo ""
+            echo "Filesystem capacity (df -P $target_mount):"
+            set +e
+            df_target=$(df -P "$target_mount" 2>&1)
+            rc=$?
+            set -e
+            if [ $rc -eq 0 ]; then
+              echo "$df_target"
+            else
+              echo "df -P $target_mount: UNAVAILABLE or not mounted (exit code: $rc)"
+            fi
+          fi
+          echo "Note: Recursive scan of $target_mount is strictly prohibited and skipped."
+          echo ""
+
+      - name: "4. LVM Topology Mapping"
+        run: |
+          echo "=== LVM TOPOLOGY ==="
+          _sudo() {
+            if sudo -n true 2>/dev/null; then
+              sudo -n "$@" 2>/dev/null
+            else
+              "$@" 2>/dev/null
+            fi
+          }
+
+          if command -v pvs >/dev/null 2>&1 && command -v vgs >/dev/null 2>&1 && command -v lvs >/dev/null 2>&1; then
+            echo "Physical Volumes (pvs -o pv_name,vg_name,pv_size,pv_free):"
+            set +e
+            pvs_out=$(_sudo pvs -o pv_name,vg_name,pv_size,pv_free 2>&1)
+            rc=$?
+            set -e
+            if [ $rc -eq 0 ]; then
+              echo "$pvs_out"
+            else
+              echo "pvs: UNRESOLVED (command failed with exit code $rc or permission denied)"
+            fi
+            echo ""
+
+            echo "Volume Groups (vgs -o vg_name,vg_size,vg_free,lv_count,pv_count):"
+            set +e
+            vgs_out=$(_sudo vgs -o vg_name,vg_size,vg_free,lv_count,pv_count 2>&1)
+            rc=$?
+            set -e
+            if [ $rc -eq 0 ]; then
+              echo "$vgs_out"
+            else
+              echo "vgs: UNRESOLVED (command failed with exit code $rc or permission denied)"
+            fi
+            echo ""
+
+            echo "Logical Volumes (lvs -o lv_name,vg_name,lv_size,lv_path):"
+            set +e
+            lvs_out=$(_sudo lvs -o lv_name,vg_name,lv_size,lv_path 2>&1)
+            rc=$?
+            set -e
+            if [ $rc -eq 0 ]; then
+              echo "$lvs_out"
+            else
+              echo "lvs: UNRESOLVED (command failed with exit code $rc or permission denied)"
+            fi
+          else
+            echo "LVM user tools (pvs/vgs/lvs): NOT PRESENT / UNAVAILABLE"
+            echo "LVM hierarchy: UNRESOLVED (LVM tools unavailable)"
+          fi
+          echo ""
+
+      - name: "5. Safe DATA_PARTITIONS Allowlisted Extraction"
+        run: |
+          echo "=== DATA_PARTITIONS ==="
+          env_file="/var/www/madeena-server-monitor/.env"
+          _sudo() {
+            if sudo -n true 2>/dev/null; then
+              sudo -n "$@" 2>/dev/null
+            else
+              "$@" 2>/dev/null
+            fi
+          }
+
+          if [ ! -f "$env_file" ] && ! _sudo test -f "$env_file"; then
+            echo "DATA_PARTITIONS: UNRESOLVED (configuration file $env_file not found or inaccessible)"
+          else
+            # Extract ONLY the active DATA_PARTITIONS value without dumping file or secrets
+            set +e
+            dp_val=$(_sudo awk -F= '
+              !/^[[:space:]]*(#|$)/ && NF >= 2 {
+                k = $1; sub(/^[[:space:]]+/, "", k); sub(/[[:space:]]+$/, "", k);
+                v = substr($0, index($0, "=") + 1); sub(/^[[:space:]]+/, "", v); sub(/[[:space:]]+$/, "", v);
+                gsub(/^["'\''"]|["'\''"]$/, "", v);
+                if (k == "DATA_PARTITIONS") {
+                  print v;
+                  exit;
+                }
+              }
+            ' "$env_file" 2>/dev/null)
+            rc=$?
+            set -e
+
+            if [ $rc -ne 0 ] || [ -z "$dp_val" ]; then
+              echo "DATA_PARTITIONS: NOT DEFINED or EMPTY in $env_file (or inaccessible)"
+            else
+              echo "Configured DATA_PARTITIONS raw value: $dp_val"
+              echo ""
+              echo "Inspecting configured mount targets:"
+              # Split comma-separated paths safely
+              IFS=','
+              for p in $dp_val; do
+                p_clean=$(echo "$p" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+                [ -z "$p_clean" ] && continue
+                echo "--- Target: $p_clean ---"
+                # Validate absolute path format
+                case "$p_clean" in
+                  /*)
+                    if [ -e "$p_clean" ]; then
+                      echo "  Path exists: YES"
+                      if command -v findmnt >/dev/null 2>&1; then
+                        echo "  Mount mapping:"
+                        findmnt -T "$p_clean" 2>&1 | sed 's/^/    /' || echo "    findmnt failed"
+                      fi
+                      if command -v df >/dev/null 2>&1; then
+                        echo "  Filesystem usage:"
+                        df -P "$p_clean" 2>&1 | sed 's/^/    /' || echo "    df failed"
+                      fi
+                    else
+                      echo "  Path exists: NO / INACCESSIBLE"
+                      if command -v findmnt >/dev/null 2>&1; then
+                        findmnt -T "$p_clean" 2>&1 | sed 's/^/    /' || echo "    findmnt failed"
+                      fi
+                    fi
+                    ;;
+                  *)
+                    echo "  Path validation: ERROR (not an absolute path syntax: $p_clean)"
+                    ;;
+                esac
+              done
+              unset IFS
+            fi
+          fi
+          echo ""
+
+      - name: "6. Nextcloud & MinIO Storage Placement and Co-Location Discovery"
+        run: |
+          echo "=== NEXTCLOUD STORAGE ==="
+          _sudo() {
+            if sudo -n true 2>/dev/null; then
+              sudo -n "$@" 2>/dev/null
+            else
+              "$@" 2>/dev/null
+            fi
+          }
+
+          STATE_DIR="${RUNNER_TEMP:-/tmp}/storage_audit_state_${GITHUB_RUN_ID:-local}"
+          mkdir -p "$STATE_DIR"
+
+          nc_resolved_path=""
+          nc_resolved_reason=""
+
+          # Helper: resolve host path from mount Type and Source
+          resolve_mount_host_path() {
+            local m_type="$1"
+            local m_source="$2"
+            if [ "$m_type" = "bind" ]; then
+              case "$m_source" in
+                /*)
+                  if [ -d "$m_source" ] || [ -e "$m_source" ]; then
+                    echo "$m_source"
+                    return 0
+                  else
+                    echo "UNRESOLVED:bind path not found on host ($m_source)"
+                    return 1
+                  fi
+                  ;;
+                *)
+                  echo "UNRESOLVED:bind source not absolute path ($m_source)"
+                  return 1
+                  ;;
+              esac
+            elif [ "$m_type" = "volume" ]; then
+              if [ -z "$m_source" ]; then
+                echo "UNRESOLVED:empty volume name"
+                return 1
+              fi
+              set +e
+              v_mp=$(docker volume inspect --format '{{.Mountpoint}}' "$m_source" 2>/dev/null)
+              v_rc=$?
+              set -e
+              if [ $v_rc -eq 0 ] && [ -n "$v_mp" ]; then
+                case "$v_mp" in
+                  /*)
+                    if [ -d "$v_mp" ] || [ -e "$v_mp" ]; then
+                      echo "$v_mp"
+                      return 0
+                    else
+                      echo "UNRESOLVED:volume mountpoint does not exist on host ($v_mp)"
+                      return 1
+                    fi
+                    ;;
+                  *)
+                    echo "UNRESOLVED:volume mountpoint not absolute ($v_mp)"
+                    return 1
+                    ;;
+                esac
+              else
+                echo "UNRESOLVED:named volume '$m_source' host mountpoint unavailable on this node (rc=$v_rc)"
+                return 1
+              fi
+            else
+              echo "UNRESOLVED:unsupported or non-host mount type ($m_type)"
+              return 1
+            fi
+          }
+
+          if command -v docker >/dev/null 2>&1; then
+            # 1. Inspect direct Docker containers (authoritative local host tasks)
+            echo "Checking direct Docker containers matching Nextcloud on local host..."
+            set +e
+            nc_containers=$(docker ps --filter "name=nextcloud" --format "{{.ID}} {{.Names}}" 2>&1)
+            d_rc=$?
+            set -e
+
+            if [ $d_rc -ne 0 ]; then
+              echo "Docker daemon access failure during 'docker ps' (exit code: $d_rc): $nc_containers"
+              nc_resolved_reason="Docker daemon access failed (exit code $d_rc)"
+            elif [ -z "$nc_containers" ]; then
+              echo "Docker containers: Zero running containers matching 'nextcloud'"
+            else
+              echo "Found running Nextcloud container(s):"
+              echo "$nc_containers"
+              for c_id in $(echo "$nc_containers" | awk '{print $1}'); do
+                echo "Inspecting storage mounts for container $c_id (read-only mount metadata only):"
+                set +e
+                c_mounts=$(docker inspect --format '{{range .Mounts}}{{.Type}}|{{.Source}}|{{.Destination}}{{printf "\n"}}{{end}}' "$c_id" 2>&1)
+                insp_rc=$?
+                set -e
+                if [ $insp_rc -eq 0 ]; then
+                  echo "$c_mounts" | while IFS='|' read -r mtype msrc mdest; do
+                    [ -z "$mtype" ] && continue
+                    echo "  Mount: Type=$mtype | Source=$msrc | Destination=$mdest"
+                  done
+
+                  # Check for data destination candidate
+                  while IFS='|' read -r mtype msrc mdest; do
+                    [ -z "$mtype" ] && continue
+                    if [ "$mdest" = "/var/www/html/data" ] || [ "$mdest" = "/data" ]; then
+                      res_out=$(resolve_mount_host_path "$mtype" "$msrc")
+                      case "$res_out" in
+                        UNRESOLVED:*)
+                          echo "  Candidate data mount ($mdest): ${res_out#UNRESOLVED:}"
+                          ;;
+                        /*)
+                          echo "  Successfully resolved container data mount ($mdest) to host path: $res_out"
+                          nc_resolved_path="$res_out"
+                          break 2
+                          ;;
+                      esac
+                    fi
+                  done <<< "$c_mounts"
+                else
+                  echo "  docker inspect failed for $c_id (exit code $insp_rc): $c_mounts"
+                fi
+              done
+            fi
+
+            # 2. Check Swarm services with node locality verification
+            if [ -z "$nc_resolved_path" ]; then
+              echo "Checking Docker Swarm services matching Nextcloud with node-locality verification..."
+              set +e
+              local_node_id=$(docker info --format '{{.Swarm.NodeID}}' 2>/dev/null)
+              nc_services=$(docker service ls --filter "name=nextcloud" --format "{{.ID}} {{.Name}}" 2>&1)
+              s_rc=$?
+              set -e
+
+              if [ $s_rc -ne 0 ]; then
+                echo "Docker service ls failed (exit code $s_rc; node may not be Swarm manager): $nc_services"
+                [ -z "$nc_resolved_reason" ] && nc_resolved_reason="Swarm service discovery unavailable on this node (exit code $s_rc)"
+              elif [ -z "$nc_services" ]; then
+                echo "Docker Swarm services: Zero services matching 'nextcloud'"
+              else
+                echo "Found Nextcloud Swarm service(s):"
+                echo "$nc_services"
+                for s_id in $(echo "$nc_services" | awk '{print $1}'); do
+                  # Verify whether a running task for this service is placed on this local node
+                  task_on_local_node="false"
+                  if [ -n "$local_node_id" ]; then
+                    set +e
+                    local_tasks=$(docker service ps "$s_id" --filter "node=$local_node_id" --filter "desired-state=running" --format "{{.ID}} {{.Node}} {{.CurrentState}}" 2>/dev/null)
+                    set -e
+                    if [ -n "$local_tasks" ]; then
+                      echo "  Confirmed active task for service $s_id on local node ($local_node_id):"
+                      echo "  $local_tasks"
+                      task_on_local_node="true"
+                    else
+                      echo "  Service $s_id has no running tasks placed on local node ($local_node_id)."
+                    fi
+                  else
+                    echo "  Could not determine local Swarm NodeID; service task locality unverified."
+                  fi
+
+                  if [ "$task_on_local_node" = "true" ]; then
+                    echo "Inspecting mounts for locally placed service $s_id:"
+                    set +e
+                    s_mounts=$(docker service inspect --format '{{range .Spec.TaskTemplate.ContainerSpec.Mounts}}{{.Type}}|{{.Source}}|{{.Target}}{{printf "\n"}}{{end}}' "$s_id" 2>&1)
+                    sinsp_rc=$?
+                    set -e
+                    if [ $sinsp_rc -eq 0 ]; then
+                      echo "$s_mounts" | while IFS='|' read -r mtype msrc mdest; do
+                        [ -z "$mtype" ] && continue
+                        echo "  Service Mount: Type=$mtype | Source=$msrc | Target=$mdest"
+                      done
+
+                      while IFS='|' read -r mtype msrc mdest; do
+                        [ -z "$mtype" ] && continue
+                        if [ "$mdest" = "/var/www/html/data" ] || [ "$mdest" = "/data" ]; then
+                          res_out=$(resolve_mount_host_path "$mtype" "$msrc")
+                          case "$res_out" in
+                            UNRESOLVED:*)
+                              echo "  Candidate service data mount ($mdest): ${res_out#UNRESOLVED:}"
+                              ;;
+                            /*)
+                              echo "  Successfully resolved service data mount ($mdest) to host path: $res_out"
+                              nc_resolved_path="$res_out"
+                              break 2
+                              ;;
+                          esac
+                        fi
+                      done <<< "$s_mounts"
+                    else
+                      echo "  docker service inspect failed for $s_id (exit code $sinsp_rc): $s_mounts"
+                    fi
+                  else
+                    echo "  Skipping storage resolution from service spec $s_id: effective task placement on this host not established."
+                    [ -z "$nc_resolved_reason" ] && nc_resolved_reason="Nextcloud service mount configured, but effective task placement on this host was not established"
+                  fi
+                done
+              fi
+            fi
+          else
+            echo "Docker: NOT PRESENT / UNAVAILABLE"
+            nc_resolved_reason="Docker command unavailable"
+          fi
+
+          # 3. Host-side Nextcloud config fallback using portable POSIX awk extraction
+          if [ -z "$nc_resolved_path" ]; then
+            echo "Checking common host Nextcloud configuration paths..."
+            candidate_cfgs="/var/www/nextcloud/config/config.php /var/www/html/config/config.php /media/nextcloud-data/config/config.php"
+            for cfg in $candidate_cfgs; do
+              if [ -f "$cfg" ] || _sudo test -f "$cfg"; then
+                echo "Found config file: $cfg"
+                # Portable POSIX awk extraction: extract only the datadirectory value without dumping other keys
+                extracted_dir=$(_sudo awk '
+                  /datadirectory/ {
+                    line = $0
+                    idx = index(line, "=>")
+                    if (idx > 0) {
+                      rest = substr(line, idx + 2)
+                      # Find first quote (single or double)
+                      q1 = match(rest, /['\'']/);
+                      q2 = match(rest, /"/);
+                      q_char = ""
+                      q_pos = 0
+                      if (q1 > 0 && (q2 == 0 || q1 < q2)) {
+                        q_char = "'\''"
+                        q_pos = q1
+                      } else if (q2 > 0) {
+                        q_char = "\""
+                        q_pos = q2
+                      }
+                      if (q_pos > 0) {
+                        val_part = substr(rest, q_pos + 1)
+                        end_pos = index(val_part, q_char)
+                        if (end_pos > 0) {
+                          print substr(val_part, 1, end_pos - 1)
+                          exit
+                        }
+                      }
+                    }
+                  }
+                ' "$cfg" 2>/dev/null)
+                if [ -n "$extracted_dir" ]; then
+                  case "$extracted_dir" in
+                    /*)
+                      if [ -d "$extracted_dir" ] || [ -e "$extracted_dir" ]; then
+                        echo "Extracted valid datadirectory from $cfg: $extracted_dir"
+                        nc_resolved_path="$extracted_dir"
+                        break
+                      else
+                        echo "Extracted datadirectory from $cfg does not exist on host: $extracted_dir"
+                      fi
+                      ;;
+                    *)
+                      echo "Extracted datadirectory from $cfg is not absolute path: $extracted_dir"
+                      ;;
+                  esac
+                fi
+              fi
+            done
+          fi
+
+          if [ -n "$nc_resolved_path" ]; then
+            echo "Resolved Nextcloud effective data path: $nc_resolved_path"
+            echo "$nc_resolved_path" > "$STATE_DIR/nextcloud_path"
+            if command -v findmnt >/dev/null 2>&1; then
+              echo "Nextcloud filesystem mapping:"
+              findmnt -T "$nc_resolved_path" 2>&1 || echo "findmnt failed"
+              nc_fs=$(findmnt -T "$nc_resolved_path" -n -o SOURCE 2>/dev/null)
+              [ -n "$nc_fs" ] && echo "$nc_fs" > "$STATE_DIR/nextcloud_fs"
+            fi
+          else
+            echo "Nextcloud storage: UNRESOLVED (${nc_resolved_reason:-no matching local runtime mount, no safely accessible host configuration, and no authoritative local storage path established})"
+          fi
+          echo ""
+
+          echo "=== MINIO STORAGE ==="
+          minio_resolved_path=""
+          minio_resolved_reason=""
+
+          if command -v docker >/dev/null 2>&1; then
+            # 1. Inspect direct Docker containers (authoritative local host tasks)
+            echo "Checking direct Docker containers matching MinIO on local host..."
+            set +e
+            minio_containers=$(docker ps --filter "name=minio" --format "{{.ID}} {{.Names}}" 2>&1)
+            m_rc=$?
+            set -e
+
+            if [ $m_rc -ne 0 ]; then
+              echo "Docker daemon access failure during 'docker ps' (exit code: $m_rc): $minio_containers"
+              minio_resolved_reason="Docker daemon access failed (exit code $m_rc)"
+            elif [ -z "$minio_containers" ]; then
+              echo "Docker containers: Zero running containers matching 'minio'"
+            else
+              echo "Found running MinIO container(s):"
+              echo "$minio_containers"
+              for c_id in $(echo "$minio_containers" | awk '{print $1}'); do
+                echo "Inspecting storage mounts for container $c_id (read-only mount metadata only):"
+                set +e
+                c_mounts=$(docker inspect --format '{{range .Mounts}}{{.Type}}|{{.Source}}|{{.Destination}}{{printf "\n"}}{{end}}' "$c_id" 2>&1)
+                insp_rc=$?
+                set -e
+                if [ $insp_rc -eq 0 ]; then
+                  echo "$c_mounts" | while IFS='|' read -r mtype msrc mdest; do
+                    [ -z "$mtype" ] && continue
+                    echo "  Mount: Type=$mtype | Source=$msrc | Destination=$mdest"
+                  done
+
+                  while IFS='|' read -r mtype msrc mdest; do
+                    [ -z "$mtype" ] && continue
+                    if [ "$mdest" = "/data" ] || [ "$mdest" = "/export" ]; then
+                      res_out=$(resolve_mount_host_path "$mtype" "$msrc")
+                      case "$res_out" in
+                        UNRESOLVED:*)
+                          echo "  Candidate MinIO data mount ($mdest): ${res_out#UNRESOLVED:}"
+                          ;;
+                        /*)
+                          echo "  Successfully resolved MinIO container data mount ($mdest) to host path: $res_out"
+                          minio_resolved_path="$res_out"
+                          break 2
+                          ;;
+                      esac
+                    fi
+                  done <<< "$c_mounts"
+                else
+                  echo "  docker inspect failed for $c_id (exit code $insp_rc): $c_mounts"
+                fi
+              done
+            fi
+
+            # 2. Check Swarm services with node locality verification
+            if [ -z "$minio_resolved_path" ]; then
+              echo "Checking Docker Swarm services matching MinIO with node-locality verification..."
+              set +e
+              local_node_id=$(docker info --format '{{.Swarm.NodeID}}' 2>/dev/null)
+              minio_services=$(docker service ls --filter "name=minio" --format "{{.ID}} {{.Name}}" 2>&1)
+              ms_rc=$?
+              set -e
+
+              if [ $ms_rc -ne 0 ]; then
+                echo "Docker service ls failed (exit code $ms_rc; node may not be Swarm manager): $minio_services"
+                [ -z "$minio_resolved_reason" ] && minio_resolved_reason="Swarm service discovery unavailable on this node (exit code $ms_rc)"
+              elif [ -z "$minio_services" ]; then
+                echo "Docker Swarm services: Zero services matching 'minio'"
+              else
+                echo "Found MinIO Swarm service(s):"
+                echo "$minio_services"
+                for s_id in $(echo "$minio_services" | awk '{print $1}'); do
+                  task_on_local_node="false"
+                  if [ -n "$local_node_id" ]; then
+                    set +e
+                    local_tasks=$(docker service ps "$s_id" --filter "node=$local_node_id" --filter "desired-state=running" --format "{{.ID}} {{.Node}} {{.CurrentState}}" 2>/dev/null)
+                    set -e
+                    if [ -n "$local_tasks" ]; then
+                      echo "  Confirmed active task for service $s_id on local node ($local_node_id):"
+                      echo "  $local_tasks"
+                      task_on_local_node="true"
+                    else
+                      echo "  Service $s_id has no running tasks placed on local node ($local_node_id)."
+                    fi
+                  else
+                    echo "  Could not determine local Swarm NodeID; service task locality unverified."
+                  fi
+
+                  if [ "$task_on_local_node" = "true" ]; then
+                    echo "Inspecting mounts for locally placed service $s_id:"
+                    set +e
+                    s_mounts=$(docker service inspect --format '{{range .Spec.TaskTemplate.ContainerSpec.Mounts}}{{.Type}}|{{.Source}}|{{.Target}}{{printf "\n"}}{{end}}' "$s_id" 2>&1)
+                    sinsp_rc=$?
+                    set -e
+                    if [ $sinsp_rc -eq 0 ]; then
+                      echo "$s_mounts" | while IFS='|' read -r mtype msrc mdest; do
+                        [ -z "$mtype" ] && continue
+                        echo "  Service Mount: Type=$mtype | Source=$msrc | Target=$mdest"
+                      done
+
+                      while IFS='|' read -r mtype msrc mdest; do
+                        [ -z "$mtype" ] && continue
+                        if [ "$mdest" = "/data" ] || [ "$mdest" = "/export" ]; then
+                          res_out=$(resolve_mount_host_path "$mtype" "$msrc")
+                          case "$res_out" in
+                            UNRESOLVED:*)
+                              echo "  Candidate MinIO service data mount ($mdest): ${res_out#UNRESOLVED:}"
+                              ;;
+                            /*)
+                              echo "  Successfully resolved MinIO service data mount ($mdest) to host path: $res_out"
+                              minio_resolved_path="$res_out"
+                              break 2
+                              ;;
+                          esac
+                        fi
+                      done <<< "$s_mounts"
+                    else
+                      echo "  docker service inspect failed for $s_id (exit code $sinsp_rc): $s_mounts"
+                    fi
+                  else
+                    echo "  Skipping storage resolution from service spec $s_id: effective task placement on this host not established."
+                    [ -z "$minio_resolved_reason" ] && minio_resolved_reason="MinIO service mount configured, but effective task placement on this host was not established"
+                  fi
+                done
+              fi
+            fi
+          else
+            echo "Docker: NOT PRESENT / UNAVAILABLE"
+            minio_resolved_reason="Docker command unavailable"
+          fi
+
+          # 3. Host-side native / systemd service fallback without dumping environment or secrets
+          if [ -z "$minio_resolved_path" ] && command -v systemctl >/dev/null 2>&1; then
+            echo "Checking systemd service for MinIO..."
+            minio_unit=$(systemctl list-unit-files minio*.service --no-legend 2>/dev/null | awk '{print $1; exit}')
+            if [ -n "$minio_unit" ]; then
+              echo "Found MinIO systemd unit: $minio_unit"
+              raw_exec=$(systemctl show "$minio_unit" -p ExecStart --value 2>/dev/null)
+              # Extract candidate existing directory paths from ExecStart safely without printing credentials
+              for tok in $raw_exec; do
+                case "$tok" in
+                  /*)
+                    if [ -d "$tok" ] && [ ! -x "$tok" ]; then
+                      echo "Candidate MinIO storage directory from ExecStart: $tok"
+                      minio_resolved_path="$tok"
+                      break
+                    fi
+                    ;;
+                esac
+              done
+            else
+              echo "Systemd: No minio*.service unit found"
+            fi
+          fi
+
+          if [ -n "$minio_resolved_path" ]; then
+            echo "Resolved MinIO effective data path: $minio_resolved_path"
+            echo "$minio_resolved_path" > "$STATE_DIR/minio_path"
+            if command -v findmnt >/dev/null 2>&1; then
+              echo "MinIO filesystem mapping:"
+              findmnt -T "$minio_resolved_path" 2>&1 || echo "findmnt failed"
+              m_fs=$(findmnt -T "$minio_resolved_path" -n -o SOURCE 2>/dev/null)
+              [ -n "$m_fs" ] && echo "$m_fs" > "$STATE_DIR/minio_fs"
+            fi
+          else
+            echo "MinIO storage: UNRESOLVED (${minio_resolved_reason:-no matching local runtime mount, no safely accessible host configuration, and no authoritative local storage path established})"
+          fi
+          echo ""
+
+          echo "=== NEXTCLOUD / MINIO CO-LOCATION ==="
+          if [ -z "$nc_resolved_path" ] || [ -z "$minio_resolved_path" ]; then
+            echo "Result: UNRESOLVED (Nextcloud or MinIO effective storage path could not be resolved from active runtime evidence)"
+          else
+            echo "Comparing filesystem backing for:"
+            echo "- Nextcloud path: $nc_resolved_path"
+            echo "- MinIO path:     $minio_resolved_path"
+
+            if command -v findmnt >/dev/null 2>&1; then
+              nc_fs=$(cat "$STATE_DIR/nextcloud_fs" 2>/dev/null)
+              [ -z "$nc_fs" ] && nc_fs=$(findmnt -T "$nc_resolved_path" -n -o SOURCE 2>/dev/null)
+              minio_fs=$(cat "$STATE_DIR/minio_fs" 2>/dev/null)
+              [ -z "$minio_fs" ] && minio_fs=$(findmnt -T "$minio_resolved_path" -n -o SOURCE 2>/dev/null)
+
+              echo "Nextcloud backing source: ${nc_fs:-UNKNOWN}"
+              echo "MinIO backing source:     ${minio_fs:-UNKNOWN}"
+
+              if [ -n "$nc_fs" ] && [ -n "$minio_fs" ]; then
+                if [ "$nc_fs" = "$minio_fs" ]; then
+                  echo "Result: SAME FILESYSTEM (both paths reside on backing device $nc_fs)"
+                else
+                  echo "Result: DIFFERENT FILESYSTEMS (Nextcloud: $nc_fs vs MinIO: $minio_fs)"
+                fi
+              else
+                echo "Result: UNRESOLVED (unable to determine valid backing filesystem source device via findmnt)"
+              fi
+            else
+              echo "Result: UNRESOLVED (findmnt command unavailable for comparison)"
+            fi
+          fi
+          echo ""
+
+      - name: "7. Root Filesystem Directory Consumption & Large-File Inventory"
+        run: |
+          echo "=== ROOT DIRECTORY USAGE ==="
+          _sudo() {
+            if sudo -n true 2>/dev/null; then
+              sudo -n "$@" 2>/dev/null
+            else
+              "$@" 2>/dev/null
+            fi
+          }
+
+          STATE_DIR="${RUNNER_TEMP:-/tmp}/storage_audit_state_${GITHUB_RUN_ID:-local}"
+          mkdir -p "$STATE_DIR"
+
+          echo "Top-level root directory consumption (timeout 60s du -x --max-depth=1 /):"
+          if command -v timeout >/dev/null 2>&1 && command -v du >/dev/null 2>&1; then
+            set +e
+            du_out=$(_sudo timeout 60s du -x -h --max-depth=1 / 2>&1)
+            rc=$?
+            set -e
+
+            case $rc in
+              0)
+                echo "Status: RESOLVED"
+                echo "$du_out" | sort -h -r 2>/dev/null || echo "$du_out"
+                ;;
+              124)
+                echo "Status: TIMEOUT (bounded 60s elapsed; UNRESOLVED)"
+                ;;
+              125)
+                echo "Status: UNRESOLVED (timeout utility failed, exit code: 125)"
+                ;;
+              126)
+                echo "Status: UNRESOLVED (du command cannot execute, exit code: 126)"
+                ;;
+              127)
+                echo "Status: UNRESOLVED (du command not found, exit code: 127)"
+                ;;
+              *)
+                echo "Status: UNRESOLVED (du failed with exit code: $rc): $du_out"
+                ;;
+            esac
+          else
+            echo "timeout or du: NOT PRESENT / UNAVAILABLE"
+          fi
+          echo ""
+
+          echo "High-level consumer categories on root filesystem:"
+          categories="/var/lib/docker /var/log /var/lib /var/www /home /opt /var/cache /tmp"
+          for cat_dir in $categories; do
+            if [ -d "$cat_dir" ] || _sudo test -d "$cat_dir"; then
+              if command -v timeout >/dev/null 2>&1 && command -v du >/dev/null 2>&1; then
+                set +e
+                c_out=$(_sudo timeout 30s du -sh -x "$cat_dir" 2>&1)
+                c_rc=$?
+                set -e
+                case $c_rc in
+                  0)
+                    c_size=$(echo "$c_out" | awk '{print $1}')
+                    printf "  %-18s : %-12s [RESOLVED]\n" "$cat_dir" "$c_size"
+                    echo "$c_size" > "$STATE_DIR/cat_$(echo "$cat_dir" | tr '/' '_')"
+                    ;;
+                  124)
+                    printf "  %-18s : %-12s [TIMEOUT]\n" "$cat_dir" "N/A"
+                    ;;
+                  125|126|127)
+                    printf "  %-18s : %-12s [COMMAND FAILED (rc=%d)]\n" "$cat_dir" "N/A" "$c_rc"
+                    ;;
+                  *)
+                    printf "  %-18s : %-12s [INACCESSIBLE / FAILED (rc=%d)]\n" "$cat_dir" "N/A" "$c_rc"
+                    ;;
+                esac
+              else
+                printf "  %-18s : (du unavailable)\n" "$cat_dir"
+              fi
+            else
+              printf "  %-18s : [NOT PRESENT]\n" "$cat_dir"
+            fi
+          done
+          echo ""
+
+          echo "=== LARGE ROOT FILES ==="
+          echo "Searching for files >= 1 GiB on root filesystem strictly (timeout 60s find / -xdev -type f -size +1G):"
+          if command -v timeout >/dev/null 2>&1 && command -v find >/dev/null 2>&1; then
+            # Tab-delimited formatting: %s\t%p ensures full path with whitespace is preserved
+            set +e
+            find_out=$(_sudo timeout 60s find / -xdev -type f -size +1G -printf '%s\t%p\n' 2>&1)
+            rc=$?
+            set -e
+
+            case $rc in
+              0)
+                if [ -z "$find_out" ]; then
+                  echo "Status: RESOLVED (Zero files >= 1 GiB found on root filesystem)"
+                  touch "$STATE_DIR/large_files_checked_empty"
+                else
+                  echo "Status: RESOLVED"
+                  echo "Top large files on root filesystem (sorted by size descending, up to 50):"
+                  echo "$find_out" > "$STATE_DIR/large_files_raw"
+                  echo "$find_out" | sort -t$'\t' -k1,1nr | head -50 | while IFS=$'\t' read -r bytes path; do
+                    [ -z "$bytes" ] && continue
+                    if [ "$bytes" -ge 1099511627776 ] 2>/dev/null; then
+                      sz=$(awk -v b="$bytes" 'BEGIN { printf "%.2f TiB", b/1099511627776 }')
+                    elif [ "$bytes" -ge 1073741824 ] 2>/dev/null; then
+                      sz=$(awk -v b="$bytes" 'BEGIN { printf "%.2f GiB", b/1073741824 }')
+                    else
+                      sz=$(awk -v b="$bytes" 'BEGIN { printf "%.2f MiB", b/1048576 }')
+                    fi
+                    printf "  %-12s %s (%s bytes)\n" "$sz" "$path" "$bytes"
+                  done
+                fi
+                ;;
+              124)
+                echo "Status: TIMEOUT (bounded 60s elapsed; UNRESOLVED)"
+                ;;
+              125|126|127)
+                echo "Status: UNRESOLVED (timeout or find utility error, rc=$rc)"
+                ;;
+              *)
+                echo "Status: UNRESOLVED (find failed with exit code $rc): $find_out"
+                ;;
+            esac
+          else
+            echo "timeout or find: NOT PRESENT / UNAVAILABLE"
+          fi
+          echo ""
+
+      - name: "8. Docker & Systemd Journal Aggregate Storage Metrics"
+        run: |
+          echo "=== DOCKER DISK USAGE ==="
+          STATE_DIR="${RUNNER_TEMP:-/tmp}/storage_audit_state_${GITHUB_RUN_ID:-local}"
+          mkdir -p "$STATE_DIR"
+
+          if command -v docker >/dev/null 2>&1; then
+            # Standard table view output for human-readable review
+            echo "Aggregate Docker usage table (docker system df):"
+            if command -v timeout >/dev/null 2>&1; then
+              set +e
+              docker_df_table=$(timeout 30s docker system df 2>&1)
+              rc=$?
+              set -e
+
+              case $rc in
+                0)
+                  echo "Status: RESOLVED"
+                  echo "$docker_df_table"
+                  ;;
+                124)
+                  echo "Status: TIMEOUT (bounded 30s elapsed; UNRESOLVED)"
+                  ;;
+                125|126|127)
+                  echo "Status: UNRESOLVED (timeout or docker utility failure, rc=$rc)"
+                  ;;
+                *)
+                  echo "Status: UNRESOLVED (docker system df failed with exit code $rc): $docker_df_table"
+                  ;;
+              esac
+            else
+              set +e
+              docker_df_table=$(docker system df 2>&1)
+              rc=$?
+              set -e
+              if [ $rc -eq 0 ]; then
+                echo "Status: RESOLVED"
+                echo "$docker_df_table"
+              else
+                echo "Status: UNRESOLVED (docker system df failed with exit code $rc): $docker_df_table"
+              fi
+            fi
+
+            # Machine-readable format output to evaluate reclaimable metrics deterministically
+            if [ ${rc:-1} -eq 0 ]; then
+              set +e
+              docker_df_json=$(timeout 15s docker system df --format '{{.Type}}|{{.TotalCount}}|{{.ActiveCount}}|{{.Size}}|{{.Reclaimable}}' 2>/dev/null)
+              fmt_rc=$?
+              set -e
+              if [ $fmt_rc -eq 0 ] && [ -n "$docker_df_json" ]; then
+                echo "$docker_df_json" > "$STATE_DIR/docker_df_formatted"
+              fi
+            fi
+            echo "Note: Docker RECLAIMABLE metrics indicate candidate space for later review; no prune executed."
+          else
+            echo "Docker: NOT PRESENT / UNAVAILABLE"
+          fi
+          echo ""
+
+          echo "=== JOURNAL USAGE ==="
+          if command -v journalctl >/dev/null 2>&1; then
+            if command -v timeout >/dev/null 2>&1; then
+              set +e
+              j_out=$(timeout 15s journalctl --disk-usage 2>&1)
+              rc=$?
+              set -e
+
+              case $rc in
+                0)
+                  echo "Status: RESOLVED"
+                  echo "$j_out"
+                  echo "$j_out" > "$STATE_DIR/journal_usage_out"
+                  ;;
+                124)
+                  echo "Status: TIMEOUT (bounded 15s elapsed; UNRESOLVED)"
+                  ;;
+                125|126|127)
+                  echo "Status: UNRESOLVED (timeout or journalctl utility failure, rc=$rc)"
+                  ;;
+                *)
+                  echo "Status: UNRESOLVED (journalctl --disk-usage failed with exit code $rc): $j_out"
+                  ;;
+              esac
+            else
+              set +e
+              j_out=$(journalctl --disk-usage 2>&1)
+              rc=$?
+              set -e
+              if [ $rc -eq 0 ]; then
+                echo "Status: RESOLVED"
+                echo "$j_out"
+                echo "$j_out" > "$STATE_DIR/journal_usage_out"
+              else
+                echo "Status: UNRESOLVED (journalctl failed with exit code $rc): $j_out"
+              fi
+            fi
+          else
+            echo "journalctl: NOT PRESENT / UNAVAILABLE"
+          fi
+          echo ""
+
+      - name: "9. Cleanup Candidate Classification & Audit Safety Summary"
+        run: |
+          echo "=== CLEANUP CANDIDATE CLASSIFICATION ==="
+          STATE_DIR="${RUNNER_TEMP:-/tmp}/storage_audit_state_${GITHUB_RUN_ID:-local}"
+
+          echo "--- 1. OBSERVED EVIDENCE-BASED FINDINGS ---"
+          observed_candidates=0
+
+          # Evaluate Docker reclaimable rows deterministically (ignoring headers, parsing rows)
+          if [ -f "$STATE_DIR/docker_df_formatted" ]; then
+            # Format rows: Type|TotalCount|ActiveCount|Size|Reclaimable
+            # Extract rows where Reclaimable is non-zero (not 0B and not 0%)
+            docker_cand=$(awk -F'|' '
+              NF >= 5 {
+                type = $1
+                reclaim = $5
+                sub(/^[[:space:]]+/, "", reclaim); sub(/[[:space:]]+$/, "", reclaim);
+                # Check if reclaimable indicates actual non-zero space
+                if (reclaim != "" && reclaim !~ /^0B/ && reclaim !~ /^0\s*B/ && reclaim !~ /^0%/) {
+                  printf "  - %s: %s (Total: %s)\n", type, reclaim, $4
+                  found++
+                }
+              }
+              END {
+                if (found > 0) exit 0; else exit 1;
+              }
+            ' "$STATE_DIR/docker_df_formatted")
+            if [ $? -eq 0 ] && [ -n "$docker_cand" ]; then
+              echo "• Docker Reclaimable Footprint (observed non-zero reclaimable resources via docker system df):"
+              echo "$docker_cand"
+              observed_candidates=$((observed_candidates + 1))
+            else
+              echo "• Docker Reclaimable Footprint:"
+              echo "    NONE OBSERVED (all categories reported 0B / 0% reclaimable, or no reclaimable artifacts)"
+            fi
+          elif command -v docker >/dev/null 2>&1; then
+            echo "• Docker Reclaimable Footprint:"
+            echo "    UNRESOLVED (unable to parse reclaimable metric safely from formatted query)"
+          else
+            echo "• Docker Reclaimable Footprint:"
+            echo "    NOT PRESENT / UNAVAILABLE (Docker not installed or inaccessible)"
+          fi
+
+          # Check Journal observation
+          if [ -f "$STATE_DIR/journal_usage_out" ]; then
+            j_line=$(cat "$STATE_DIR/journal_usage_out" 2>/dev/null)
+            if [ -n "$j_line" ]; then
+              echo "• Systemd Journal Measured Footprint (observed via journalctl --disk-usage):"
+              echo "    $j_line (diagnostic measurement only; subject to retention policy, do not vacuum directly)"
+              observed_candidates=$((observed_candidates + 1))
+            fi
+          fi
+
+          # Check Large root files observation
+          if [ -f "$STATE_DIR/large_files_raw" ] && [ -s "$STATE_DIR/large_files_raw" ]; then
+            l_count=$(wc -l < "$STATE_DIR/large_files_raw")
+            echo "• Large Files on Root (>= 1 GiB): $l_count observed file(s) (requires application-specific review before any action)"
+            observed_candidates=$((observed_candidates + 1))
+          fi
+
+          # Check measured cache footprints
+          if [ -f "$STATE_DIR/cat__var_cache" ]; then
+            v_cache=$(cat "$STATE_DIR/cat__var_cache")
+            echo "• /var/cache measured footprint: $v_cache (diagnostic size; does not imply immediate reclaimability)"
+          fi
+          if [ -f "$STATE_DIR/cat__tmp" ]; then
+            v_tmp=$(cat "$STATE_DIR/cat__tmp")
+            echo "• /tmp measured footprint: $v_tmp (diagnostic size; does not imply immediate reclaimability)"
+          fi
+
+          if [ $observed_candidates -eq 0 ]; then
+            echo ""
+            echo "POTENTIALLY RECLAIMABLE:"
+            echo "No evidence-backed reclaimable resource established by this audit."
+          fi
+          echo ""
+
+          echo "--- 2. GENERAL POLICY / CLASSIFICATION FRAMEWORK ---"
+          echo "A. POTENTIALLY RECLAIMABLE (Subject to dedicated operational review):"
+          echo "   - Docker build cache and unreferenced dangling images (if explicitly reported reclaimable)"
+          echo "   - Archived/rotated system log files past mandatory retention"
+          echo "   - Verified ephemeral cache files in /var/cache or /tmp"
+          echo ""
+          echo "B. REQUIRES APPLICATION-SPECIFIC REVIEW:"
+          echo "   - Unreferenced Docker volumes (may contain state from temporarily stopped services)"
+          echo "   - Application-specific log files (/var/log, /var/www/*)"
+          echo "   - Large files identified in /home or /opt"
+          echo "   - Staging directories or legacy backup tarballs on root filesystem"
+          echo ""
+          echo "C. MUST NOT TOUCH WITHOUT DEDICATED PLAN:"
+          # Print resolved application paths if established
+          if [ -f "$STATE_DIR/nextcloud_path" ]; then
+            echo "   - Nextcloud effective data files [ESTABLISHED]: $(cat "$STATE_DIR/nextcloud_path")"
+          else
+            echo "   - Nextcloud effective data files and storage"
+          fi
+          if [ -f "$STATE_DIR/minio_path" ]; then
+            echo "   - MinIO object storage [ESTABLISHED]: $(cat "$STATE_DIR/minio_path")"
+          else
+            echo "   - MinIO object storage data"
+          fi
+          echo "   - Active database directories (/var/lib/mysql, /var/lib/postgresql, etc.)"
+          echo "   - Active application codebases (/var/www/*)"
+          echo "   - Core operating system binaries and libraries (/var/lib, /usr, /lib)"
+          echo "   - Additional storage mount /media/nextcloud-data"
+          echo ""
+
+          echo "=== AUDIT SAFETY SUMMARY ==="
+          echo "Production/application data files deleted: NONE"
+          echo "Production configuration modified: NONE"
+          echo "Services restarted: NONE"
+          echo "Containers/services modified: NONE"
+          echo "Storage/LVM/filesystem configuration modified: NONE"
+          echo "Cleanup performed on production data: NONE"
+          echo "Audit-created ephemeral runner state: CREATED AND CLEANED"
+          echo "Audit execution completed strictly within read-only diagnostics boundary."
+
+          # Clean up ephemeral audit state directory safely
+          if [ -d "$STATE_DIR" ]; then
+            find "$STATE_DIR" -type f -delete 2>/dev/null
+            rmdir "$STATE_DIR" 2>/dev/null
+          fi

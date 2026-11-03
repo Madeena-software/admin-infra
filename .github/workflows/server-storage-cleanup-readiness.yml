@@ -1,0 +1,1308 @@
+name: "Reusable Production Storage Cleanup Readiness — Read Only"
+
+# Governing contract: .agents/tasks/plan-server-storage-cleanup.md
+# STRICTLY READ-ONLY. No prune, delete, vacuum, restart, or config change.
+# Every probe: timeout <= 15s, allowlisted/validated fields only, RESOLVED / UNRESOLVED outcome.
+# Fail-closed: a command failure, timeout, permission denial, malformed or partial output is
+# UNRESOLVED, never a zero value, a confirmed placement, or a cleanup candidate.
+# `sudo -n` is used only for read-only inspection when already available (never escalated).
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  readiness:
+    name: "Production Storage Cleanup Readiness (Read Only)"
+    runs-on: [self-hosted, linux, x64, production]
+    timeout-minutes: 10
+
+    steps:
+      - name: "1. Environment, helpers and root filesystem baseline"
+        timeout-minutes: 2
+        run: |
+          set +e
+          STATE_DIR="${RUNNER_TEMP:-/tmp}/cleanup_readiness_${GITHUB_RUN_ID:-local}"
+          mkdir -p "$STATE_DIR"
+          : > "$STATE_DIR/matrix.tsv"
+          : > "$STATE_DIR/reconciliation.tsv"
+          : > "$STATE_DIR/seen_identities.txt"
+
+          # Shared read-only helpers sourced by later steps.
+          cat > "$STATE_DIR/lib.sh" <<'LIB'
+          STATE_DIR="${RUNNER_TEMP:-/tmp}/cleanup_readiness_${GITHUB_RUN_ID:-local}"
+          S=""
+          if command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then S="sudo -n"; fi
+          # Strict literal absolute path: only [A-Za-z0-9._/@+-], no "..", bounded length.
+          valid_path() {
+            [ "${#1}" -le 512 ] || return 1
+            printf '%s' "$1" | grep -Eq '^/[A-Za-z0-9._/@+-]*$' || return 1
+            printf '%s' "$1" | grep -Eq '(^|/)\.\.(/|$)' && return 1
+            return 0
+          }
+          gib() { awk -v k="$1" 'BEGIN{printf "%.2f GiB", k/1048576}'; }
+          # row CATEGORY USAGE RECLAIMABLE EVIDENCE STATUS RISK DEPENDENCY ACTION APPROVAL
+          row() { printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$@" >> "$STATE_DIR/matrix.tsv"; }
+          # du_k PATH : sets K (KiB) on success, else K="" and KWHY. Requires exit 0, no timeout,
+          # numeric output. du -x never crosses filesystems. Partial/denied scans are not trusted.
+          du_k() {
+            K=""; KWHY=""
+            valid_path "$1" || { KWHY="invalid path"; return 1; }
+            $S test -e "$1" 2>/dev/null || { KWHY="missing or not accessible"; return 1; }
+            out=$(timeout 15 $S du -sxk -- "$1" 2>/dev/null); rc=$?
+            [ $rc -eq 124 ] && { KWHY="timeout >15s"; return 1; }
+            [ $rc -ne 0 ] && { KWHY="du exit $rc (partial/denied; value not trusted)"; return 1; }
+            v=$(printf '%s\n' "$out" | awk 'NR==1{print $1}')
+            printf '%s' "$v" | grep -Eq '^[0-9]+$' || { KWHY="non-numeric du output"; return 1; }
+            K="$v"; return 0
+          }
+          # get_devino PATH : returns "st_dev:st_ino" or "none"
+          get_devino() {
+            _di=""
+            if [ -n "$1" ] && $S test -e "$1" 2>/dev/null; then
+              _di=$(timeout 15 $S stat -L -c '%d:%i' -- "$1" 2>/dev/null)
+            fi
+            if printf '%s' "$_di" | grep -Eq '^[0-9]+:[0-9]+$'; then
+              printf '%s' "$_di"
+            else
+              printf 'none'
+            fi
+          }
+          # get_realpath PATH : returns canonical realpath or literal path or none
+          get_realpath() {
+            _rp=""
+            if [ -n "$1" ] && $S test -e "$1" 2>/dev/null; then
+              _rp=$(timeout 15 $S realpath -- "$1" 2>/dev/null)
+            fi
+            if valid_path "$_rp"; then
+              printf '%s' "$_rp"
+            elif valid_path "$1"; then
+              printf '%s' "$1"
+            else
+              printf 'none'
+            fi
+          }
+          # record_identity PATH DEVINO REALPATH
+          record_identity() {
+            _p="$1"; _di="$2"; _rp="$3"
+            [ -n "$_di" ] && [ "$_di" != "none" ] && echo "devino:$_di" >> "$STATE_DIR/seen_identities.txt"
+            [ -n "$_rp" ] && [ "$_rp" != "none" ] && echo "path:$_rp" >> "$STATE_DIR/seen_identities.txt"
+            [ -n "$_p" ] && [ "$_p" != "none" ] && echo "path:$_p" >> "$STATE_DIR/seen_identities.txt"
+          }
+          # is_seen_identity PATH DEVINO REALPATH
+          is_seen_identity() {
+            _p="$1"; _di="$2"; _rp="$3"
+            [ -s "$STATE_DIR/seen_identities.txt" ] || return 1
+            if [ -n "$_di" ] && [ "$_di" != "none" ] && grep -Fqx "devino:$_di" "$STATE_DIR/seen_identities.txt" 2>/dev/null; then
+              return 0
+            fi
+            if [ -n "$_rp" ] && [ "$_rp" != "none" ] && grep -Fqx "path:$_rp" "$STATE_DIR/seen_identities.txt" 2>/dev/null; then
+              return 0
+            fi
+            if [ -n "$_p" ] && [ "$_p" != "none" ] && grep -Fqx "path:$_p" "$STATE_DIR/seen_identities.txt" 2>/dev/null; then
+              return 0
+            fi
+            return 1
+          }
+          # row_root KIND PARENT NAME PATH DEV_INO REAL_PATH USAGE_KIB STATUS NOTES
+          row_root() { printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$@" >> "$STATE_DIR/reconciliation.tsv"; }
+          # sized CATEGORY PATH RISK DEPENDENCY ACTION : measure and add a matrix row
+          sized() {
+            if $S test -e "$2" 2>/dev/null; then
+              if du_k "$2"; then
+                echo "RESOLVED with evidence: $2 = $(gib "$K")"
+                row "$1" "$(gib "$K") physical" "not estimated" "du -sxk $2" "RESOLVED" "$3" "$4" "$5" "Yes"
+              else
+                echo "UNRESOLVED ($2: $KWHY)"
+                row "$1" "unknown" "unknown" "du -sxk $2" "UNRESOLVED ($KWHY)" "$3" "$4" "$5" "Yes"
+              fi
+            else
+              if [ -n "$S" ]; then
+                echo "Absent: $2"
+                row "$1" "0 GiB" "none" "test -e $2" "RESOLVED (absent)" "$3" "$4" "$5" "Yes"
+              else
+                echo "UNRESOLVED ($2: not accessible without sudo)"
+                row "$1" "unknown" "unknown" "test -e $2" "UNRESOLVED (not accessible without sudo)" "$3" "$4" "$5" "Yes"
+              fi
+            fi
+          }
+          # sized_level NAME PATH KIND PARENT RISK DEPENDENCY ACTION
+          sized_level() {
+            _name="$1"; _path="$2"; _kind="$3"; _parent="$4"; _risk="$5"; _dep="$6"; _act="$7"
+            _di=$(get_devino "$_path")
+            _rp=$(get_realpath "$_path")
+
+            if [ "$_kind" = "LEVEL1" ]; then
+              if $S test -e "$_path" 2>/dev/null; then
+                placement "$_path"
+                if [ "$PL" = "SECONDARY" ]; then
+                  echo "$_path is on a separate filesystem mount: $PL_TGT on $PL_SRC ($PL_MED); excluded from root SSD accounting."
+                  if du_k "$_path"; then
+                    row_root "SECONDARY" "$PL_TGT" "$_name" "$_path" "$_di" "$_rp" "$K" "RESOLVED (separate mount: $PL_TGT)" "$_risk; $_dep"
+                    row "$_name (separate mount: $PL_TGT)" "$(gib "$K") physical" "not on root fs" "du -sxk $_path" "RESOLVED" "$_risk" "$_dep" "$_act" "Yes"
+                  else
+                    row_root "SECONDARY" "$PL_TGT" "$_name" "$_path" "$_di" "$_rp" "unknown" "UNRESOLVED ($KWHY)" "$_risk; $_dep"
+                    row "$_name (separate mount: $PL_TGT)" "unknown" "unknown" "du -sxk $_path" "UNRESOLVED ($KWHY)" "$_risk" "$_dep" "$_act" "Yes"
+                  fi
+                  return 0
+                elif [ "$PL" = "UNRESOLVED" ]; then
+                  echo "UNRESOLVED placement for $_path ($PL_WHY)"
+                  row_root "LEVEL1" "$_parent" "$_name" "$_path" "$_di" "$_rp" "unknown" "UNRESOLVED (placement: $PL_WHY)" "$_risk; $_dep"
+                  row "$_name" "unknown" "unknown" "findmnt/df placement check" "UNRESOLVED (placement: $PL_WHY)" "$_risk" "$_dep" "$_act" "Yes"
+                  return 0
+                fi
+                record_identity "$_path" "$_di" "$_rp"
+              else
+                if [ -n "$S" ]; then
+                  echo "Absent: $_path"
+                  row_root "LEVEL1" "$_parent" "$_name" "$_path" "$_di" "$_rp" "0" "RESOLVED (absent)" "path not present"
+                  row "$_name" "0 GiB" "none" "test -e" "RESOLVED (absent)" "$_risk" "$_dep" "$_act" "Yes"
+                else
+                  echo "UNRESOLVED ($_path: not accessible without sudo)"
+                  row_root "LEVEL1" "$_parent" "$_name" "$_path" "$_di" "$_rp" "unknown" "UNRESOLVED (not accessible without sudo)" "$_risk; $_dep"
+                  row "$_name" "unknown" "unknown" "test -e" "UNRESOLVED (not accessible without sudo)" "$_risk" "$_dep" "$_act" "Yes"
+                fi
+                return 0
+              fi
+            fi
+
+            # Path is on ROOT (or _kind != "LEVEL1")
+            if $S test -e "$_path" 2>/dev/null; then
+              if du_k "$_path"; then
+                echo "RESOLVED with evidence: $_path = $(gib "$K")"
+                row_root "$_kind" "$_parent" "$_name" "$_path" "$_di" "$_rp" "$K" "RESOLVED" "$_risk; $_dep"
+                row "$_name" "$(gib "$K") physical" "not estimated" "du -sxk $_path" "RESOLVED" "$_risk" "$_dep" "$_act" "Yes"
+              else
+                echo "UNRESOLVED ($_path: $KWHY)"
+                row_root "$_kind" "$_parent" "$_name" "$_path" "$_di" "$_rp" "unknown" "UNRESOLVED ($KWHY)" "$_risk; $_dep"
+                row "$_name" "unknown" "unknown" "du -sxk $_path" "UNRESOLVED ($KWHY)" "$_risk" "$_dep" "$_act" "Yes"
+              fi
+            else
+              if [ -n "$S" ]; then
+                echo "Absent: $_path"
+                row_root "$_kind" "$_parent" "$_name" "$_path" "$_di" "$_rp" "0" "RESOLVED (absent)" "path not present"
+                row "$_name" "0 GiB" "none" "test -e" "RESOLVED (absent)" "$_risk" "$_dep" "$_act" "Yes"
+              else
+                echo "UNRESOLVED ($_path: not accessible without sudo)"
+                row_root "$_kind" "$_parent" "$_name" "$_path" "$_di" "$_rp" "unknown" "UNRESOLVED (not accessible without sudo)" "$_risk; $_dep"
+                row "$_name" "unknown" "unknown" "test -e" "UNRESOLVED (not accessible without sudo)" "$_risk" "$_dep" "$_act" "Yes"
+              fi
+            fi
+          }
+          # placement PATH : fail-closed filesystem placement.
+          # Sets PL = ROOT | SECONDARY | UNRESOLVED, plus PL_TGT, PL_SRC, PL_WHY, PL_MED.
+          # SECONDARY is reported only when findmnt AND df both succeed, parse, and agree.
+          placement() {
+            PL="UNRESOLVED"; PL_TGT=""; PL_SRC=""; PL_WHY=""; PL_MED="unresolved"
+            valid_path "$1" || { PL_WHY="invalid path"; return 1; }
+            $S test -e "$1" 2>/dev/null || { PL_WHY="path missing or not accessible"; return 1; }
+            fm=$(timeout 15 $S findmnt -n -T "$1" -o TARGET,SOURCE,FSTYPE 2>/dev/null); rc=$?
+            [ $rc -ne 0 ] && { PL_WHY="findmnt failed (exit $rc)"; return 1; }
+            PL_TGT=$(printf '%s\n' "$fm" | awk 'NR==1{print $1}'); PL_SRC=$(printf '%s\n' "$fm" | awk 'NR==1{print $2}')
+            { [ -n "$PL_TGT" ] && [ -n "$PL_SRC" ] && valid_path "$PL_TGT"; } || { PL_WHY="findmnt output malformed"; PL="UNRESOLVED"; return 1; }
+            dfo=$(timeout 15 $S df -P -- "$1" 2>/dev/null); rc=$?
+            [ $rc -ne 0 ] && { PL_WHY="df failed (exit $rc)"; return 1; }
+            dfl=$(printf '%s\n' "$dfo" | awk 'NR==2')
+            printf '%s\n' "$dfl" | awk '$2 ~ /^[0-9]+$/ && $3 ~ /^[0-9]+$/ && $6 ~ /^\//{ok=1} END{exit !ok}' || { PL_WHY="df output malformed"; return 1; }
+            [ "$(printf '%s\n' "$dfl" | awk '{print $6}')" = "$PL_TGT" ] || { PL_WHY="findmnt and df disagree on mount point"; return 1; }
+            if [ "$PL_TGT" = "/" ]; then PL="ROOT"; else PL="SECONDARY"; fi
+            case "$PL_SRC" in
+              /dev/*) r=$(timeout 15 $S lsblk -no ROTA "$PL_SRC" 2>/dev/null | head -1 | tr -d ' ')
+                      case "$r" in 0) PL_MED="non-rotational (ROTA=0)";; 1) PL_MED="rotational (ROTA=1)";; *) PL_MED="unresolved (lsblk ROTA not determinable)";; esac ;;
+              *) PL_MED="unresolved (source is not a block device path)" ;;
+            esac
+            return 0
+          }
+          # placement_text : human summary of the last placement() call
+          placement_text() {
+            if [ "$PL" = "UNRESOLVED" ]; then echo "UNRESOLVED placement ($PL_WHY)"
+            elif [ "$PL" = "ROOT" ]; then echo "root filesystem / on $PL_SRC, $PL_MED"
+            else echo "secondary mount $PL_TGT on $PL_SRC, $PL_MED"; fi
+          }
+          # Top consumers, depth <= 2, bounded. Non-zero exit (timeout/denied) is reported as partial.
+          topdu() {
+            timeout 15 $S du -x --max-depth="$2" -h -- "$1" > "$STATE_DIR/topdu.out" 2>/dev/null
+            rc=$?
+            sort -rh "$STATE_DIR/topdu.out" | head -15
+            if [ $rc -eq 0 ]; then echo "RESOLVED with evidence: $1 (depth $2)"
+            else echo "UNRESOLVED/PARTIAL ($1 depth $2: du exit $rc; 124 = 15s timeout; listing not authoritative)"; fi
+          }
+          LIB
+          . "$STATE_DIR/lib.sh"
+
+          echo "=== CLEANUP READINESS IDENTITY ==="
+          echo "Workflow: Reusable Production Storage Cleanup Readiness — Read Only"
+          echo "Run ID: ${GITHUB_RUN_ID:-UNKNOWN}  Attempt: ${GITHUB_RUN_ATTEMPT:-UNKNOWN}"
+          echo "Ref: ${GITHUB_REF:-UNKNOWN}  SHA: ${GITHUB_SHA:-UNKNOWN}"
+          echo "Timestamp: $(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null)"
+          echo "Host: $(uname -srm 2>/dev/null)"
+          if [ -n "$S" ]; then echo "Non-interactive sudo: AVAILABLE (read-only inspection only)"; else echo "Non-interactive sudo: UNAVAILABLE (unprivileged mode; restricted paths will be UNRESOLVED)"; fi
+          echo ""
+          echo "=== ROOT FILESYSTEM ==="
+          DF_ROOT=$(timeout 15 df -P / 2>/dev/null); DF_RC=$?
+          echo "$DF_ROOT"
+          BASE_PARSE=$(printf '%s\n' "$DF_ROOT" | awk '
+            BEGIN { ok = 0; rows = 0; header = 0 }
+            NR == 1 {
+              if ($1 ~ /^Filesystem/ && NF >= 6) { header = 1 }
+            }
+            NR == 2 {
+              if (header && NF == 6 && $2 ~ /^[0-9]+$/ && $3 ~ /^[0-9]+$/ && $4 ~ /^[0-9]+$/ && $5 ~ /^[0-9]+%$/ && $6 == "/") {
+                ok = 1
+                tot = $2; usd = $3; avl = $4; cap = $5
+              }
+            }
+            { rows = NR }
+            END {
+              if (ok && rows == 2) {
+                print tot, usd, avl, cap
+                exit 0
+              }
+              exit 1
+            }
+          '); PARSE_RC=$?
+
+          if [ $DF_RC -eq 0 ] && [ $PARSE_RC -eq 0 ] && [ -n "$BASE_PARSE" ]; then
+            ROOT_TOTAL_KIB=$(printf '%s\n' "$BASE_PARSE" | awk '{print $1}')
+            ROOT_USED_KIB=$(printf '%s\n' "$BASE_PARSE" | awk '{print $2}')
+            ROOT_AVAIL_KIB=$(printf '%s\n' "$BASE_PARSE" | awk '{print $3}')
+            ROOT_USE_PCT=$(printf '%s\n' "$BASE_PARSE" | awk '{print $4}')
+            echo "ROOT_BASELINE $ROOT_TOTAL_KIB $ROOT_USED_KIB $ROOT_AVAIL_KIB $ROOT_USE_PCT" > "$STATE_DIR/root_baseline.txt"
+            echo "RESOLVED with evidence: root baseline total=${ROOT_TOTAL_KIB}k used=${ROOT_USED_KIB}k avail=${ROOT_AVAIL_KIB}k use%=${ROOT_USE_PCT}"
+          else
+            echo "ROOT_BASELINE unknown unknown unknown unknown" > "$STATE_DIR/root_baseline.txt"
+            echo "UNRESOLVED: df -P / failed, timed out, or output malformed (exit $DF_RC, parse $PARSE_RC)"
+          fi
+          echo "Inodes:"; timeout 15 df -Pi / 2>&1
+          echo "Mount:"; timeout 15 findmnt -n / -o TARGET,SOURCE,FSTYPE 2>&1
+          echo "Block devices (allowlisted columns):"; timeout 15 lsblk -o NAME,TYPE,SIZE,FSTYPE,MOUNTPOINTS,ROTA 2>&1 | head -40
+
+      - name: "2. Nextcloud Snap storage (datadirectory only)"
+        timeout-minutes: 2
+        run: |
+          set +e
+          . "${RUNNER_TEMP:-/tmp}/cleanup_readiness_${GITHUB_RUN_ID:-local}/lib.sh"
+          echo "=== NEXTCLOUD SNAP METADATA ==="
+          if command -v snap >/dev/null 2>&1; then
+            for sub in "list nextcloud" "services nextcloud" "connections nextcloud"; do
+              echo "--- snap $sub ---"; timeout 15 snap $sub 2>&1 | head -30
+            done
+          else
+            echo "snap: NOT PRESENT"
+          fi
+          echo ""
+          echo "=== NEXTCLOUD datadirectory ==="
+          CFG=/var/snap/nextcloud/current/nextcloud/config/config.php
+          DD=""
+          if $S test -f "$CFG" 2>/dev/null; then
+            # Only the datadirectory line is read; the value is printed only if it is a strict literal path.
+            DD=$(timeout 15 $S grep -E "^[[:space:]]*['\"]datadirectory['\"][[:space:]]*=>" "$CFG" 2>/dev/null | head -1 | sed -E "s/.*=>[[:space:]]*['\"]([^'\"]*)['\"].*/\1/")
+            valid_path "$DD" || DD=""
+          fi
+          if [ -z "$DD" ]; then
+            echo "UNRESOLVED (config.php missing, not readable without sudo, or datadirectory not a strict absolute path)"
+            row "Nextcloud data directory" "unknown" "n/a" "config.php datadirectory key" "UNRESOLVED (config not readable/absent/invalid)" "High" "Persistent user data; never touch" "None (protected)" "Yes"
+          else
+            echo "RESOLVED with evidence: datadirectory = $DD"
+            placement "$DD"
+            echo "Placement: $(placement_text)"
+            case "$PL" in
+              ROOT)
+                echo "Data directory is on the root filesystem; bounded size measurement:"
+                sized "Nextcloud data directory (root fs; $PL_MED)" "$DD" "High" "Persistent user data; relocation only via dedicated plan" "None (protected); relocation plan only" ;;
+              SECONDARY)
+                echo "Data directory is on a verified secondary mount; user files NOT scanned (exclusion rule)."
+                row "Nextcloud data directory (verified secondary mount $PL_TGT)" "not scanned" "n/a" "findmnt -T + df -P agree; medium: $PL_MED" "RESOLVED" "High" "Not on root filesystem; protected" "None" "Yes" ;;
+              *)
+                echo "UNRESOLVED: placement not reliably established, so no scan and no secondary-mount claim."
+                row "Nextcloud data directory" "not scanned" "n/a" "findmnt/df placement check" "UNRESOLVED (placement: $PL_WHY)" "High" "Placement unknown; protected" "None" "Yes" ;;
+            esac
+          fi
+          echo ""
+          echo "=== NEXTCLOUD SNAP FOOTPRINT (bounded du -sx) ==="
+          sized_level "Nextcloud snap total (/var/snap/nextcloud)" /var/snap/nextcloud "CHILD" "/var/snap" "High" "Contains app, DB and config" "None (protected)"
+          sized_level "Nextcloud snap common" /var/snap/nextcloud/common "CHILD" "Nextcloud snap total (/var/snap/nextcloud)" "High" "Shared snap data" "None (protected)"
+          sized_level "Nextcloud snap db" /var/snap/nextcloud/current/mysql/ "CHILD" "Nextcloud snap total (/var/snap/nextcloud)" "High" "Database files" "None (protected)"
+          sized_level "Nextcloud snap logs" /var/snap/nextcloud/current/logs/ "CHILD" "Nextcloud snap total (/var/snap/nextcloud)" "Medium" "Application logs" "Review retention in dedicated plan"
+          sized_level "Nextcloud snap config" /var/snap/nextcloud/current/nextcloud/config/ "CHILD" "Nextcloud snap total (/var/snap/nextcloud)" "High" "Configuration" "None (protected)"
+
+      - name: "3. MinIO storage (strict allowlist; no raw ExecStart or env values)"
+        timeout-minutes: 2
+        run: |
+          set +e
+          set -f
+          . "${RUNNER_TEMP:-/tmp}/cleanup_readiness_${GITHUB_RUN_ID:-local}/lib.sh"
+          unresolved() { echo "UNRESOLVED ($1)"; row "MinIO object storage" "unknown" "n/a" "systemctl show minio.service + MINIO_VOLUMES key" "UNRESOLVED ($1)" "High" "Object data" "None (protected)" "Yes"; }
+          echo "=== MINIO SERVICE (allowlisted, validated properties only) ==="
+          command -v systemctl >/dev/null 2>&1 || { unresolved "systemctl unavailable"; exit 0; }
+          PROPS=$(timeout 15 systemctl show minio.service -p ActiveState -p FragmentPath -p ExecStart -p EnvironmentFiles -p User -p WorkingDirectory 2>/dev/null); rc=$?
+          [ $rc -ne 0 ] && { unresolved "systemctl show failed, exit $rc"; exit 0; }
+          sval() { printf '%s\n' "$PROPS" | sed -n "s/^$1=//p" | head -1; }
+          # The raw PROPS variable is NEVER printed. Each value is printed only if it matches a strict pattern.
+          v=$(sval ActiveState);  printf '%s' "$v" | grep -Eq '^[a-z-]+$' && echo "ActiveState: $v" || echo "ActiveState: UNRESOLVED (unexpected format; value withheld)"
+          v=$(sval FragmentPath); valid_path "$v" && echo "FragmentPath: $v" || echo "FragmentPath: UNRESOLVED (empty/unexpected; value withheld)"
+          [ -n "$v" ] && valid_path "$v" || { unresolved "minio.service not found or unit path invalid"; exit 0; }
+          v=$(sval User);         printf '%s' "$v" | grep -Eq '^[a-z_][a-z0-9_-]{0,31}$' && echo "User: $v" || echo "User: (unset or withheld)"
+          v=$(sval WorkingDirectory); valid_path "$v" && echo "WorkingDirectory: $v" || echo "WorkingDirectory: (unset or withheld)"
+          EFS=""
+          for t in $(sval EnvironmentFiles | tr ' ' '\n' | sed 's/^-//' | grep '^/'); do
+            valid_path "$t" && { echo "EnvironmentFile: $t"; EFS="$EFS $t"; }
+          done
+          echo "ExecStart: raw command line intentionally NOT printed (only strict literal storage paths are extracted)"
+          echo ""
+          VOLS=""; WITHHELD=0
+          for ef in $EFS; do
+            $S test -f "$ef" 2>/dev/null || { echo "EnvironmentFile $ef: not readable/absent"; continue; }
+            line=$(timeout 15 $S grep -E '^[[:space:]]*MINIO_VOLUMES=' "$ef" 2>/dev/null | tail -1)
+            [ -z "$line" ] && continue
+            val=$(printf '%s' "$line" | sed -E 's/^[^=]*=//; s/["'"'"']//g')
+            for tok in $val; do
+              if valid_path "$tok"; then VOLS="$VOLS $tok"; else WITHHELD=$((WITHHELD+1)); fi
+            done
+          done
+          SRC="MINIO_VOLUMES"
+          if [ -z "$VOLS" ] && [ $WITHHELD -eq 0 ]; then
+            # Fallback: literal path arguments following `server`, skipping flag values; never printed raw.
+            VOLS=$(printf '%s\n' "$PROPS" | sed -n 's/^ExecStart=.*argv\[\]=\([^;]*\);.*/\1/p' | tr ' ' '\n' | awk '
+              f==0 { if ($0=="server") f=1; next }
+              skip { skip=0; next }
+              /^--/ { if ($0 !~ /=/) skip=1; next }
+              /^-/ { next }
+              /^\/[A-Za-z0-9._\/@+-]*$/ && $0 !~ /\.\.(\/|$)/ { print }')
+            SRC="ExecStart positional argument"
+          fi
+          echo "Storage path source: $SRC; local literal path(s): $(echo $VOLS | wc -w); non-conforming token(s) withheld: $WITHHELD"
+          if [ $WITHHELD -gt 0 ]; then unresolved "MINIO_VOLUMES contains non-local/templated/URL tokens (withheld); placement not claimed"; exit 0; fi
+          [ -z "$(echo $VOLS)" ] && { unresolved "no local storage path found (MINIO_VOLUMES missing/unreadable, or path supplied via unreadable environment)"; exit 0; }
+          for p in $VOLS; do
+            echo "--- $p ---"
+            placement "$p"
+            echo "Placement: $(placement_text)"
+            if [ "$PL" = "UNRESOLVED" ]; then
+              row "MinIO object storage ($p)" "not measured" "n/a" "findmnt/df placement check" "UNRESOLVED (placement: $PL_WHY)" "High" "Object data" "None (protected)" "Yes"
+              continue
+            fi
+            sized "MinIO storage ($(placement_text))" "$p" "High" "Object data; S3 clients depend on it" "None (protected)"
+          done
+
+      - name: "4. Docker root dir, accounting reconciliation and candidate inventory"
+        timeout-minutes: 3
+        run: |
+          set +e
+          . "${RUNNER_TEMP:-/tmp}/cleanup_readiness_${GITHUB_RUN_ID:-local}/lib.sh"
+          if ! command -v docker >/dev/null 2>&1; then
+            echo "UNRESOLVED (docker not installed)"; row "Docker" "unknown" "unknown" "docker CLI" "UNRESOLVED (docker missing)" "Medium" "n/a" "n/a" "Yes"; exit 0
+          fi
+          D="docker"
+          if ! timeout 15 docker info >/dev/null 2>&1; then
+            if [ -n "$S" ] && timeout 15 $S docker info >/dev/null 2>&1; then D="$S docker"; else
+              echo "UNRESOLVED (docker daemon not accessible)"; row "Docker" "unknown" "unknown" "docker info" "UNRESOLVED (daemon inaccessible)" "Medium" "n/a" "n/a" "Yes"; exit 0
+            fi
+          fi
+          echo "=== DOCKER INFO (allowlisted) ==="
+          ROOT=$(timeout 15 $D info --format '{{.DockerRootDir}}' 2>/dev/null)
+          echo "Docker Root Dir: ${ROOT:-UNRESOLVED}"
+          echo "Storage Driver: $(timeout 15 $D info --format '{{.Driver}}' 2>/dev/null)"
+          echo "Containers: $(timeout 15 $D info --format '{{.Containers}} (running {{.ContainersRunning}}, stopped {{.ContainersStopped}})' 2>/dev/null)"
+          echo "Images: $(timeout 15 $D info --format '{{.Images}}' 2>/dev/null)"
+          SWSTATE=$(timeout 15 $D info --format '{{.Swarm.LocalNodeState}}' 2>/dev/null); SWRC=$?
+          echo "Swarm: ${SWSTATE:-UNRESOLVED}"
+          echo ""
+          echo "=== DOCKER ROOT DIR BACKING MOUNT & PHYSICAL SIZE ==="
+          if valid_path "$ROOT"; then
+            placement "$ROOT"; echo "Placement: $(placement_text)"
+            sized_level "Docker Root ($ROOT)" "$ROOT" "LEVEL1" "/" "Medium" "Physical footprint of Docker root" "See Docker rows"
+            sized_level "Docker volumes ($ROOT/volumes)" "$ROOT/volumes" "CHILD" "Docker Root ($ROOT)" "High" "Database & persistent volumes" "None without review"
+            sized_level "Docker buildkit ($ROOT/buildkit)" "$ROOT/buildkit" "CHILD" "Docker Root ($ROOT)" "Low" "Legacy buildkit cache" "Tier A prune"
+            sized_level "Docker image metadata ($ROOT/image)" "$ROOT/image" "CHILD" "Docker Root ($ROOT)" "Medium" "Image metadata" "Tier B review"
+            for sub in /overlay2 /containerd; do
+              if $S test -d "${ROOT}${sub}" 2>/dev/null; then
+                sized_level "Docker ${sub} (${ROOT}${sub})" "${ROOT}${sub}" "CHILD" "Docker Root ($ROOT)" "Medium" "Docker storage subsystem" "See Docker rows"
+              else
+                echo "Absent: ${ROOT}${sub}"
+              fi
+            done
+          else
+            echo "UNRESOLVED (Docker Root Dir missing or not a strict path)"
+            row_root "LEVEL1" "/" "Docker Root (/var/lib/docker)" "/var/lib/docker" "none" "/var/lib/docker" "unknown" "UNRESOLVED (root dir not determinable)" "Docker root dir missing or invalid"
+            row "Docker root dir" "unknown" "unknown" "docker info" "UNRESOLVED (root dir not determinable)" "Medium" "n/a" "n/a" "Yes"
+          fi
+          echo ""
+          echo "=== CONTAINERD RUNTIME & SUBTREE DISCOVERY ==="
+          if $S test -d "/var/lib/containerd" 2>/dev/null; then
+            echo "Present: /var/lib/containerd"
+            echo "--- containerd immediate entries (metadata-first, depth 1) ---"
+            timeout 15 $S find /var/lib/containerd -mindepth 1 -maxdepth 1 -printf '%f\t%y\n' > "$STATE_DIR/containerd_entries.tsv" 2>/dev/null; C_FIND_RC=$?
+
+            if [ $C_FIND_RC -ne 0 ]; then
+              if [ $C_FIND_RC -eq 124 ]; then C_FAIL="timeout >15s"; else C_FAIL="find exit $C_FIND_RC"; fi
+              echo "Containerd immediate enumeration: UNRESOLVED ($C_FAIL)"
+              row_root "LEVEL1" "/var/lib/containerd" "containerd (unmeasured entries)" "/var/lib/containerd" "none" "/var/lib/containerd" "unknown" "UNRESOLVED ($C_FAIL)" "Immediate subdirectory enumeration incomplete"
+              row "containerd inventory" "unknown" "unknown" "find /var/lib/containerd" "UNRESOLVED ($C_FAIL)" "Medium" "containerd inventory incomplete" "None" "Yes"
+            else
+              cat "$STATE_DIR/containerd_entries.tsv" 2>/dev/null | head -30
+            fi
+
+            # 1. Overlayfs snapshotter (container layers)
+            sized_level "containerd/io.containerd.snapshotter.v1.overlayfs" "/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs" "LEVEL1" "/var/lib/containerd" "Medium" "Container image & layer snapshots" "See Docker image rows"
+
+            # 2. Content store (CAS content blobs)
+            sized_level "containerd/io.containerd.content.v1.content" "/var/lib/containerd/io.containerd.content.v1.content" "LEVEL1" "/var/lib/containerd" "Medium" "Image content blobs" "See Docker image rows"
+
+            # 3. Metadata store directory (Level 1 component) and meta.db apparent/allocated breakdown (Child)
+            BOLT_DIR="/var/lib/containerd/io.containerd.metadata.v1.bolt"
+            sized_level "containerd/io.containerd.metadata.v1.bolt" "$BOLT_DIR" "LEVEL1" "/var/lib/containerd" "High" "Active metadata database directory" "None (protected)"
+
+            BOLT_FILE="$BOLT_DIR/meta.db"
+            b_di=$(get_devino "$BOLT_FILE")
+            b_rp=$(get_realpath "$BOLT_FILE")
+            if $S test -f "$BOLT_FILE" 2>/dev/null; then
+              du_k "$BOLT_FILE"
+              b_alloc="$K"; b_why="$KWHY"
+              b_app=$(timeout 15 $S stat -c '%s' "$BOLT_FILE" 2>/dev/null); b_rc=$?
+              if [ -n "$b_alloc" ] && [ $b_rc -eq 0 ] && printf '%s' "$b_app" | grep -Eq '^[0-9]+$'; then
+                b_alloc_h=$(gib "$b_alloc")
+                b_app_h=$(awk -v b="$b_app" 'BEGIN{printf "%.2f MiB", b/(1024*1024)}')
+                echo "RESOLVED with evidence: $BOLT_FILE = $b_alloc_h physical allocated ($b_app_h apparent size)"
+                row_root "CHILD" "containerd/io.containerd.metadata.v1.bolt" "Containerd metadata DB (meta.db)" "$BOLT_FILE" "$b_di" "$b_rp" "$b_alloc" "RESOLVED" "$b_alloc_h physical allocated ($b_app_h apparent size)"
+                row "Containerd metadata DB (meta.db)" "$b_alloc_h physical allocated ($b_app_h apparent)" "none" "du -sxk + stat -c %s meta.db" "RESOLVED" "High" "Active metadata database (nested under containerd metadata)" "None (protected)" "Yes"
+              else
+                echo "UNRESOLVED ($BOLT_FILE: ${b_why:-stat exit $b_rc})"
+                row_root "CHILD" "containerd/io.containerd.metadata.v1.bolt" "Containerd metadata DB (meta.db)" "$BOLT_FILE" "$b_di" "$b_rp" "unknown" "UNRESOLVED (${b_why:-stat failed})" "allocated size unknown"
+                row "Containerd metadata DB (meta.db)" "unknown" "none" "du -sxk + stat -c %s meta.db" "UNRESOLVED (${b_why:-stat failed})" "High" "Active metadata database" "None (protected)" "Yes"
+              fi
+            else
+              if [ -n "$S" ]; then
+                echo "Absent: $BOLT_FILE"
+                row_root "CHILD" "containerd/io.containerd.metadata.v1.bolt" "Containerd metadata DB (meta.db)" "$BOLT_FILE" "$b_di" "$b_rp" "0" "RESOLVED (absent)" "file not present"
+                row "Containerd metadata DB (meta.db)" "0 GiB" "none" "test -f" "RESOLVED (absent)" "Low" "n/a" "None" "Yes"
+              else
+                echo "UNRESOLVED ($BOLT_FILE: not accessible without sudo)"
+                row_root "CHILD" "containerd/io.containerd.metadata.v1.bolt" "Containerd metadata DB (meta.db)" "$BOLT_FILE" "$b_di" "$b_rp" "unknown" "UNRESOLVED (not accessible without sudo)" "permission denied or absent"
+                row "Containerd metadata DB (meta.db)" "unknown" "none" "test -f" "UNRESOLVED (not accessible without sudo)" "High" "Active metadata database" "None (protected)" "Yes"
+              fi
+            fi
+
+            # 4. Runtime task state
+            sized_level "containerd/io.containerd.runtime.v2.task" "/var/lib/containerd/io.containerd.runtime.v2.task" "LEVEL1" "/var/lib/containerd" "Medium" "Container runtime tasks" "None (active)"
+
+            # 5. Other discovered containerd subdirectories from immediate enumeration (only if enumeration succeeded)
+            if [ $C_FIND_RC -eq 0 ] && [ -s "$STATE_DIR/containerd_entries.tsv" ]; then
+              while IFS=$'\t' read -r c_entry c_type; do
+                [ -z "$c_entry" ] && continue
+                case "$c_entry" in
+                  io.containerd.snapshotter.v1.overlayfs|io.containerd.content.v1.content|io.containerd.metadata.v1.bolt|io.containerd.runtime.v2.task)
+                    continue ;;
+                esac
+                subpath="/var/lib/containerd/$c_entry"
+                sized_level "containerd/$c_entry" "$subpath" "LEVEL1" "/var/lib/containerd" "Low" "Containerd internal storage" "None"
+              done < "$STATE_DIR/containerd_entries.tsv"
+            fi
+          elif [ -n "$S" ] && ! $S test -e "/var/lib/containerd" 2>/dev/null; then
+            echo "/var/lib/containerd: NOT PRESENT"
+            row_root "LEVEL1" "/" "/var/lib/containerd" "/var/lib/containerd" "none" "/var/lib/containerd" "0" "RESOLVED (absent)" "directory not present"
+            row "containerd storage" "0 GiB" "none" "test -e" "RESOLVED (absent)" "Low" "n/a" "None" "Yes"
+          else
+            echo "/var/lib/containerd: UNRESOLVED (not accessible)"
+            row_root "LEVEL1" "/" "/var/lib/containerd" "/var/lib/containerd" "none" "/var/lib/containerd" "unknown" "UNRESOLVED (not accessible)" "Directory not accessible"
+            row "containerd storage" "unknown" "unknown" "test -d" "UNRESOLVED (not accessible)" "Medium" "n/a" "None" "Yes"
+          fi
+          echo ""
+          echo "=== OTHER RUNTIME PATHS (existence-checked) ==="
+          for p in /var/snap/docker/common/var-lib-docker /var/lib/buildkit; do
+            if $S test -e "$p" 2>/dev/null; then echo "Present: $p"; sized "Runtime path $p" "$p" "Medium" "Alternate runtime backing" "Investigate"; else echo "Absent/not accessible: $p"; fi
+          done
+          echo ""
+          echo "=== DOCKER LOGICAL ACCOUNTING (docker system df) ==="
+          timeout 15 $D system df 2>&1
+          DF="$STATE_DIR/dockerdf.tsv"
+          timeout 15 $D system df --format '{{.Type}}	{{.TotalCount}}	{{.Size}}	{{.Reclaimable}}' > "$DF" 2>/dev/null; DFRC=$?
+          echo ""
+          echo "Four non-interchangeable values: (1) logical Docker accounting (above; categories overlap, do NOT sum),"
+          echo "(2) physical filesystem usage (du rows above), (3) Docker-reported reclaimable (candidate only),"
+          echo "(4) operationally approved for removal (currently NONE)."
+          for t in "Images" "Containers" "Local Volumes" "Build Cache"; do
+            line=""; [ $DFRC -eq 0 ] && line=$(awk -F'\t' -v t="$t" '$1==t && NF==4' "$DF")
+            if [ -n "$line" ]; then
+              sz=$(echo "$line" | cut -f3); rc=$(echo "$line" | cut -f4)
+              case "$t" in
+                "Images") risk="Medium"; dep="Rollback/deploy sensitive: unreferenced images may be rollback targets"; act="Tier B: review unreferenced images, then approved removal"; ;;
+                "Containers") risk="Medium"; dep="Stopped containers need state/dependency review"; act="Tier B: review then approved removal"; ;;
+                "Local Volumes") risk="High"; dep="Persistent application state"; act="Tier C: none without application review"; ;;
+                *) risk="Low"; dep="Slower next build only"; act="Tier A: approved builder prune with size/age bound"; ;;
+              esac
+              row "Docker $t (logical)" "$sz logical" "$rc (Docker-reported, candidate only)" "docker system df" "RESOLVED" "$risk" "$dep" "$act" "Yes"
+            else
+              row "Docker $t (logical)" "unknown" "unknown" "docker system df" "UNRESOLVED (command failed/timeout/malformed, exit $DFRC)" "Medium" "n/a" "n/a" "Yes"
+            fi
+          done
+          echo ""
+          echo "=== CONTAINERS ==="
+          echo "--- running ---"; timeout 15 $D ps --format '{{.ID}} {{.Names}} {{.Image}} {{.Status}}' 2>&1 | head -50
+          echo "--- stopped (exited/created) ---"; timeout 15 $D ps -a --filter status=exited --filter status=created --format '{{.ID}} {{.Names}} {{.Image}} {{.Status}}' 2>&1 | head -50
+          echo ""
+          echo "=== INVENTORY COMPLETENESS (required before any image is called unreferenced) ==="
+          INC=""
+          # (a) all containers (running + stopped). Empty success is valid; failure is not.
+          CIDS=$(timeout 15 $D ps -aq 2>/dev/null); rc=$?
+          [ $rc -ne 0 ] && INC="$INC; container enumeration failed (exit $rc)"
+          if [ $rc -eq 0 ] && [ -n "$CIDS" ]; then
+            printf '%s\n' "$CIDS" | grep -Evq '^[0-9a-f]{12,64}$' && INC="$INC; container ID list malformed"
+          fi
+          NC=$(printf '%s\n' "$CIDS" | grep -c .)
+          REFS="$STATE_DIR/refs.txt"; : > "$REFS"
+          if [ -z "$INC" ] && [ "$NC" -gt 0 ]; then
+            IMGIDS=$(timeout 15 $D inspect --format '{{.Image}}' $CIDS 2>/dev/null); rc=$?
+            if [ $rc -ne 0 ]; then INC="$INC; container inspect failed (exit $rc)"
+            elif [ "$(printf '%s\n' "$IMGIDS" | grep -c .)" -ne "$NC" ]; then INC="$INC; container inspect returned $(printf '%s\n' "$IMGIDS" | grep -c .) of $NC image refs"
+            elif printf '%s\n' "$IMGIDS" | grep -Evq '^sha256:[0-9a-f]{64}$'; then INC="$INC; container image refs malformed"
+            else printf '%s\n' "$IMGIDS" >> "$REFS"; fi
+          fi
+          echo "Containers enumerated: $NC (empty result is valid only when the command succeeded)"
+          # (b) Swarm services: required when Swarm is active; state itself must be known.
+          if [ $SWRC -ne 0 ] || [ -z "$SWSTATE" ]; then INC="$INC; Swarm state unknown"
+          elif [ "$SWSTATE" = "active" ]; then
+            SVC=$(timeout 15 $D service ls --format '{{.Image}}' 2>/dev/null); rc=$?
+            if [ $rc -ne 0 ]; then INC="$INC; swarm service enumeration failed (exit $rc; node may not be a manager)"
+            else
+              NSVC=$(printf '%s\n' "$SVC" | grep -c .)
+              echo "Swarm services enumerated: $NSVC"
+              while IFS= read -r simg; do
+                [ -z "$simg" ] && continue
+                # Resolve service image to local image ID via inspect
+                sim_id=$(timeout 15 $D image inspect --format '{{.Id}}' "$simg" 2>/dev/null)
+                if printf '%s' "$sim_id" | grep -Eq '^sha256:[0-9a-f]{64}$'; then
+                  printf '%s\n' "$sim_id" >> "$REFS"
+                  # If tag is present (repo:tag@sha256:... or repo:tag), preserve the tag as well
+                  stag=$(printf '%s\n' "$simg" | sed 's/@.*//')
+                  slast=$(printf '%s\n' "$stag" | awk -F'/' '{print $NF}')
+                  case "$slast" in
+                    *:*) printf '%s\n' "$stag" >> "$REFS" ;;
+                    *)   printf '%s\n' "$stag:latest" "$stag" >> "$REFS" ;;
+                  esac
+                else
+                  INC="$INC; swarm service image '$simg' association cannot be established reliably"
+                fi
+              done <<< "$SVC"
+            fi
+          elif [ "$SWSTATE" = "inactive" ]; then echo "Swarm inactive: no service references required"
+          else INC="$INC; Swarm state '$SWSTATE' not usable for inventory"; fi
+          # (c) image list must be complete and well-formed.
+          timeout 15 $D images --no-trunc --format '{{.ID}}	{{.Repository}}:{{.Tag}}	{{.Size}}' > "$STATE_DIR/images.tsv" 2>/dev/null; rc=$?
+          if [ $rc -ne 0 ]; then INC="$INC; image enumeration failed (exit $rc)"
+          elif awk -F'\t' 'NF!=3 || $1 !~ /^sha256:[0-9a-f]{64}$/{bad=1} END{exit !bad}' "$STATE_DIR/images.tsv"; then INC="$INC; image list malformed"; fi
+          echo ""
+          echo "=== IMAGE REFERENCE CLASSIFICATION ==="
+          if [ -n "$INC" ]; then
+            echo "UNRESOLVED (reference coverage incomplete:${INC#;}). No unreferenced-image candidates are reported."
+            row "Docker unreferenced image tags (Tier B)" "unknown" "unknown" "docker ps -a / inspect / service ls / images" "UNRESOLVED (incomplete inventory:${INC#;})" "Medium" "Cannot exclude rollback or in-use images" "None until inventory is complete" "Yes"
+          else
+            awk -F'\t' 'NR==FNR{ref[$1]=1;next} !($1 in ref) && !($2 in ref){print $2"  "$3"  "$1}' "$REFS" "$STATE_DIR/images.tsv" > "$STATE_DIR/unref.txt"
+            TOTAL=$(grep -c . "$STATE_DIR/images.tsv"); UNREF=$(grep -c . "$STATE_DIR/unref.txt")
+            echo "Inventory COMPLETE. Image tags total: $TOTAL; not referenced by any container/service: $UNREF (Tier B; per-image sizes overlap; no sum given)"
+            head -40 "$STATE_DIR/unref.txt"
+            echo "Tier B reminder: unreferenced != safe to remove; may be rollback targets."
+            row "Docker unreferenced image tags (Tier B)" "$UNREF of $TOTAL tags" "see Docker Images reclaimable" "complete inventory: docker ps -a, inspect, service ls, images" "RESOLVED" "Medium" "Possible rollback targets" "Approved age-bounded removal, keep current + previous release" "Yes"
+          fi
+          echo ""
+          echo "=== BUILD CACHE (detailed inspection) ==="
+          BC_SRC=""
+          BC_WHY=""
+          BC_STATUS="UNRESOLVED"
+          # Detailed inspection probe: try docker buildx du first
+          if timeout 15 $D buildx version >/dev/null 2>&1; then
+            BC_RAW=$(timeout 15 $D buildx du 2>&1); BC_RC=$?
+            if [ $BC_RC -eq 0 ] && [ -n "$BC_RAW" ]; then
+              BC_SRC="docker buildx du"
+              BC_STATUS="RESOLVED"
+              echo "Build cache details ($BC_SRC):"
+              printf '%s\n' "$BC_RAW" | tail -10
+              echo "RESOLVED with evidence: detailed build cache inspected via $BC_SRC"
+            elif [ $BC_RC -eq 124 ]; then
+              BC_WHY="docker buildx du timeout >15s"
+            else
+              BC_WHY="docker buildx du failed (exit $BC_RC)"
+            fi
+          else
+            BC_WHY="docker buildx unavailable"
+          fi
+
+          # Fallback to docker system df -v (build cache section) if buildx du did not succeed
+          if [ "$BC_STATUS" != "RESOLVED" ]; then
+            echo "Attempting fallback detailed build cache inspection via docker system df -v..."
+            DF_V=$(timeout 15 $D system df -v 2>&1); DFV_RC=$?
+            if [ $DFV_RC -eq 0 ] && printf '%s\n' "$DF_V" | grep -q 'Build cache usage:'; then
+              BC_SRC="docker system df -v"
+              BC_STATUS="RESOLVED"
+              echo "Build cache details ($BC_SRC):"
+              printf '%s\n' "$DF_V" | sed -n '/Build cache usage/,$p' | head -15
+              echo "RESOLVED with evidence: detailed build cache inspected via $BC_SRC"
+            elif [ $DFV_RC -eq 124 ]; then
+              BC_WHY="${BC_WHY}; docker system df -v timeout >15s"
+            else
+              BC_WHY="${BC_WHY}; docker system df -v failed (exit $DFV_RC)"
+            fi
+          fi
+
+          if [ "$BC_STATUS" = "RESOLVED" ]; then
+            row "Docker build cache (detailed)" "detailed breakdown inspected (Tier A)" "see logical reclaimable" "$BC_SRC" "RESOLVED" "Low" "Slower next build only" "Tier A: approved builder prune with size/age bound" "Yes"
+          else
+            echo "UNRESOLVED ($BC_WHY)"
+            row "Docker build cache (detailed)" "unknown" "unknown" "docker buildx du / system df -v" "UNRESOLVED ($BC_WHY)" "Low" "Slower next build only" "Tier A: approved builder prune with size/age bound" "Yes"
+          fi
+          echo ""
+          echo "=== VOLUMES (Tier C, protected) AND BIND-MOUNT SOURCES ==="
+          V_INC=""
+          VOLS_OUT=$(timeout 15 $D volume ls --format '{{.Name}}	{{.Driver}}' 2>/dev/null); VOLS_RC=$?
+          if [ $VOLS_RC -eq 124 ]; then
+            V_INC="docker volume ls timeout >15s"
+          elif [ $VOLS_RC -ne 0 ]; then
+            V_INC="docker volume ls failed (exit $VOLS_RC)"
+          else
+            if [ -n "$VOLS_OUT" ]; then
+              if printf '%s\n' "$VOLS_OUT" | awk -F'\t' 'NF!=2 || $1=="" || $2=="" {bad=1} END{exit !bad}'; then
+                V_INC="docker volume ls output malformed"
+              fi
+            fi
+          fi
+
+          N_VOL=0
+          if [ -z "$V_INC" ]; then
+            if [ -n "$VOLS_OUT" ]; then
+              N_VOL=$(printf '%s\n' "$VOLS_OUT" | grep -c .)
+              echo "Volumes enumerated ($N_VOL):"
+              printf '%s\n' "$VOLS_OUT" | head -40
+            else
+              echo "Volumes enumerated: 0 (empty volume inventory)"
+            fi
+          else
+            echo "Volume enumeration: UNRESOLVED ($V_INC)"
+          fi
+
+          echo ""
+          M_INC=""
+          N_MNT=0
+          # Check container enumeration prerequisites for mount inspection
+          if [ -n "$INC" ] && printf '%s' "$INC" | grep -qi 'container'; then
+            M_INC="container enumeration was incomplete; mount sources could not be inspected"
+          elif [ "$NC" -eq 0 ]; then
+            echo "Container mount sources: 0 (0 active or stopped containers)"
+          else
+            # Save expected container IDs to state file for structured validation
+            printf '%s\n' "$CIDS" > "$STATE_DIR/cids.txt"
+            MNTS_RAW=$(timeout 15 $D inspect --format '{{.Id}}	{{.Name}}{{range .Mounts}}	{{.Type}}|{{.Source}}{{end}}' $CIDS 2>/dev/null); MNTS_RC=$?
+            if [ $MNTS_RC -eq 124 ]; then
+              M_INC="container inspect mounts timeout >15s"
+            elif [ $MNTS_RC -ne 0 ]; then
+              M_INC="container inspect mounts failed (exit $MNTS_RC)"
+            elif [ -z "$MNTS_RAW" ]; then
+              M_INC="container inspect mounts returned empty output for $NC expected containers"
+            else
+              printf '%s\n' "$MNTS_RAW" > "$STATE_DIR/inspect_mounts.tsv"
+              VAL_OUT=$(awk -F'\t' '
+                BEGIN { total_mounts = 0; valid_containers = 0; expected_count = 0; err = 0 }
+                NR == FNR {
+                  if ((length($0) == 12 || length($0) == 64) && $0 ~ /^[0-9a-f]+$/) {
+                    expected[$0] = 1; expected_count++
+                  } else if ($0 != "") {
+                    print "INVALID_EXPECTED_CID"; err = 1; exit 1
+                  }
+                  next
+                }
+                {
+                  if (NF < 2) {
+                    print "MALFORMED_RECORD_STRUCTURE"; err = 1; exit 1
+                  }
+                  cid = $1; cname = $2
+
+                  # 1. Validate container ID format and explicitly supported representations (12 or 64 hex chars)
+                  if (!((length(cid) == 12 || length(cid) == 64) && cid ~ /^[0-9a-f]+$/)) {
+                    print "INVALID_CONTAINER_ID"; err = 1; exit 1
+                  }
+
+                  # 2. Match against expected container inventory (exact or length-validated prefix)
+                  matched_cid = ""
+                  if (cid in expected) {
+                    matched_cid = cid
+                  } else {
+                    for (e in expected) {
+                      if ((length(cid) == 64 && length(e) == 12 && substr(cid, 1, 12) == e) || \
+                          (length(cid) == 12 && length(e) == 64 && substr(e, 1, 12) == cid)) {
+                        if (matched_cid != "") {
+                          print "AMBIGUOUS_CONTAINER_ID"; err = 1; exit 1
+                        }
+                        matched_cid = e
+                      }
+                    }
+                  }
+
+                  if (matched_cid == "") {
+                    print "UNEXPECTED_CONTAINER_ID"; err = 1; exit 1
+                  }
+                  cid = matched_cid
+
+                  if (seen[cid]++) {
+                    print "DUPLICATE_RECORD"; err = 1; exit 1
+                  }
+                  if (cname !~ /^\/[A-Za-z0-9_.-]+$/) {
+                    print "MALFORMED_CONTAINER_NAME"; err = 1; exit 1
+                  }
+                  # If NF > 2, every mount field must be non-empty and well-formed
+                  for (i = 3; i <= NF; i++) {
+                    if ($i == "") {
+                      print "EMPTY_MOUNT_FIELD"; err = 1; exit 1
+                    }
+                    sep = index($i, "|")
+                    if (sep <= 1) {
+                      print "MALFORMED_MOUNT_RECORD"; err = 1; exit 1
+                    }
+                    mtype = substr($i, 1, sep - 1)
+                    msrc = substr($i, sep + 1)
+
+                    # Documented Docker mount types allowlist
+                    if (mtype !~ /^(bind|volume|tmpfs|npipe|cluster)$/) {
+                      print "INVALID_MOUNT_TYPE"; err = 1; exit 1
+                    }
+
+                    # Type-specific source validation
+                    if (mtype == "bind") {
+                      if (msrc !~ /^\/[A-Za-z0-9._\/@+-]+$/ || index(msrc, "..") > 0) {
+                        print "INVALID_MOUNT_SOURCE"; err = 1; exit 1
+                      }
+                    } else if (mtype == "volume") {
+                      if (msrc == "" || index(msrc, "..") > 0 || (msrc !~ /^\/[A-Za-z0-9._\/@+-]+$/ && msrc !~ /^[A-Za-z0-9_.-]+$/)) {
+                        print "INVALID_MOUNT_SOURCE"; err = 1; exit 1
+                      }
+                    } else if (mtype == "tmpfs") {
+                      if (msrc != "" && msrc !~ /^[A-Za-z0-9._\/@+-]+$/) {
+                        print "INVALID_MOUNT_SOURCE"; err = 1; exit 1
+                      }
+                    } else if (mtype == "npipe") {
+                      if (msrc == "" || msrc !~ /^[A-Za-z0-9._\/@+-]+$/) {
+                        print "INVALID_MOUNT_SOURCE"; err = 1; exit 1
+                      }
+                    } else if (mtype == "cluster") {
+                      if (msrc == "" || msrc !~ /^[A-Za-z0-9_.-]+$/) {
+                        print "INVALID_MOUNT_SOURCE"; err = 1; exit 1
+                      }
+                    }
+                    total_mounts++
+                  }
+                  valid_containers++
+                }
+                END {
+                  if (err) exit err
+                  if (NR == FNR && expected_count > 0) {
+                    print "EMPTY_INSPECT_OUTPUT"; exit 1
+                  }
+                  if (valid_containers != expected_count) {
+                    print "COUNT_MISMATCH"; exit 1
+                  }
+                  print "VALID:" total_mounts
+                }
+              ' "$STATE_DIR/cids.txt" "$STATE_DIR/inspect_mounts.tsv" 2>&1); VAL_RC=$?
+
+              if [ $VAL_RC -ne 0 ] || ! printf '%s' "$VAL_OUT" | grep -q '^VALID:[0-9]\+$'; then
+                SAN_CODE=$(printf '%s\n' "$VAL_OUT" | grep -o '^[A-Z_]\+' | head -1)
+                M_INC="container mounts validation failed: ${SAN_CODE:-UNRESOLVED_VALIDATION_ERROR}"
+              else
+                N_MNT=$(printf '%s' "$VAL_OUT" | sed 's/^VALID://')
+                echo "Container mount sources ($N_MNT mount(s) across $NC container(s)): [VALIDATED]"
+                awk -F'\t' '{ printf "  %s (%s): ", $2, substr($1,1,12); if (NF>2) { for(i=3;i<=NF;i++) printf "[%s] ", $i; print "" } else { print "0 mounts" } }' "$STATE_DIR/inspect_mounts.tsv" | head -40
+              fi
+            fi
+          fi
+
+          if [ -n "$M_INC" ]; then
+            echo "Container mount inspection: UNRESOLVED ($M_INC)"
+          fi
+
+          echo ""
+          if [ -n "$V_INC" ] || [ -n "$M_INC" ]; then
+            VM_FAIL="${V_INC}${V_INC:+; }${M_INC}"
+            echo "UNRESOLVED (volumes/mounts inventory incomplete: $VM_FAIL)"
+            row "Docker volumes & bind mounts (Tier C)" "unknown" "none" "docker volume ls / inspect Mounts" "UNRESOLVED ($VM_FAIL)" "High" "Persistent app state" "None without application review" "Yes"
+          else
+            if [ "$N_VOL" -eq 0 ] && [ "$N_MNT" -eq 0 ]; then
+              VM_USAGE="0 volumes, 0 container mounts ($NC containers)"
+              VM_STATUS="RESOLVED (empty inventory: 0 volumes, 0 mounts)"
+            elif [ "$N_VOL" -eq 0 ]; then
+              VM_USAGE="0 volumes, $N_MNT mount(s) across $NC container(s)"
+              VM_STATUS="RESOLVED (0 local volumes; $N_MNT container mount(s) inventoried)"
+            else
+              VM_USAGE="$N_VOL volume(s), $N_MNT mount(s) across $NC container(s)"
+              VM_STATUS="RESOLVED ($N_VOL volume(s), $N_MNT mount(s) inventoried)"
+            fi
+            echo "RESOLVED with evidence: $VM_USAGE"
+            row "Docker volumes & bind mounts (Tier C)" "$VM_USAGE" "none" "docker volume ls / inspect Mounts" "$VM_STATUS" "High" "Persistent app state" "None without application review" "Yes"
+          fi
+
+      - name: "5. Bounded root, runner workspace and large-file scans"
+        timeout-minutes: 4
+        run: |
+          set +e
+          . "${RUNNER_TEMP:-/tmp}/cleanup_readiness_${GITHUB_RUN_ID:-local}/lib.sh"
+          echo "=== TARGETED BOUNDED SCANS (du -x, depth <= 2, 15s each) ==="
+          for d in /home /var/snap /var/log /var/www /usr; do echo "--- $d ---"; topdu "$d" 2; done
+          echo ""
+          echo "=== LEVEL 1 ROOT COMPONENT MEASUREMENTS ==="
+          sized_level "/home" /home "LEVEL1" "/" "High" "User homes and runner workspaces" "Review workspace policy"
+          sized_level "/var/snap" /var/snap "LEVEL1" "/" "High" "Snap applications and data" "None (protected)"
+          sized_level "/var/log" /var/log "LEVEL1" "/" "Medium" "System and service logs" "Approved retention policy"
+          sized_level "systemd journal (/var/log/journal)" /var/log/journal "CHILD" "/var/log" "Low" "Archived and active journal files (nested under /var/log)" "Approved retention setting"
+          sized_level "/var/www" /var/www "LEVEL1" "/" "High" "Web application trees" "None (protected)"
+          sized_level "PBU50 uploads (/var/www/pbu50/uploads)" /var/www/pbu50/uploads "CHILD" "/var/www" "Medium" "Uploads directory (nested under /var/www)" "Review upload policy"
+          sized_level "MPIPS runtime (/var/www/mpips-runtime)" /var/www/mpips-runtime "CHILD" "/var/www" "High" "MPIPS runtime and calibration (nested under /var/www)" "None (protected)"
+          sized_level "/var/cache" /var/cache "LEVEL1" "/" "Low" "Package and apt caches" "Approved apt clean"
+          sized_level "/usr" /usr "LEVEL1" "/" "Low" "Operating system binaries and libraries" "None (OS)"
+          sized_level "/opt" /opt "LEVEL1" "/" "Low" "Optional system software" "None"
+          sized_level "/etc" /etc "LEVEL1" "/" "Low" "System configuration" "None"
+          sized_level "/root" /root "LEVEL1" "/" "Low" "Root user home" "None"
+          sized_level "/tmp" /tmp "LEVEL1" "/" "Low" "Temporary files" "Review aged files"
+          echo ""
+          echo "=== /var/lib OTHER ENTRIES (individually tracked, bounded) ==="
+          if $S test -d "/var/lib" 2>/dev/null; then
+            timeout 15 $S find /var/lib -mindepth 1 -maxdepth 1 -printf '%p\t%y\n' > "$STATE_DIR/vlib_raw.tsv" 2>/dev/null; VLIB_FIND_RC=$?
+            if [ $VLIB_FIND_RC -ne 0 ]; then
+              if [ $VLIB_FIND_RC -eq 124 ]; then VLIB_FAIL="timeout >15s"; else VLIB_FAIL="find exit $VLIB_FIND_RC"; fi
+              echo "UNRESOLVED (/var/lib enumeration failed: $VLIB_FAIL)"
+              row_root "LEVEL1" "/" "/var/lib (system & other)" "/var/lib" "none" "/var/lib" "unknown" "UNRESOLVED ($VLIB_FAIL)" "Enumeration failed"
+              row "/var/lib (system & other)" "unknown" "unknown" "find /var/lib" "UNRESOLVED ($VLIB_FAIL)" "Medium" "System and application state outside docker/containerd" "None" "Yes"
+            else
+              VLIB_OTHER_KIB=0
+              VLIB_OTHER_UNRESOLVED=0
+              VLIB_TOTAL_COUNT=0
+              ROOT_FS_DEV=$(timeout 15 $S stat -c %d / 2>/dev/null)
+              if ! printf '%s' "$ROOT_FS_DEV" | grep -Eq '^[0-9]+$'; then
+                ROOT_FS_DEV=""
+              fi
+
+              while IFS=$'\t' read -r v_entry v_type; do
+                [ -z "$v_entry" ] && continue
+                case "$v_entry" in
+                  /var/lib/docker|/var/lib/containerd) continue ;;
+                esac
+                VLIB_TOTAL_COUNT=$((VLIB_TOTAL_COUNT + 1))
+                bname=$(basename "$v_entry")
+                if ! valid_path "$v_entry"; then
+                  echo "UNRESOLVED ($v_entry: invalid path format)"
+                  VLIB_OTHER_UNRESOLVED=$((VLIB_OTHER_UNRESOLVED + 1))
+                  case "$bname" in
+                    simama|madeena_cp|mhcs_core|madeena-iam)
+                      row_root "CHILD" "/var/lib (system & other)" "App storage: /var/lib/$bname" "$v_entry" "none" "$v_entry" "unknown" "UNRESOLVED (invalid path)" "Application persistent state (nested under /var/lib)"
+                      row "App storage: /var/lib/$bname" "unknown" "unknown" "valid_path" "UNRESOLVED (invalid path)" "High" "Application state" "None (protected)" "Yes"
+                      ;;
+                  esac
+                  continue
+                fi
+
+                v_di=$(get_devino "$v_entry")
+                v_rp=$(get_realpath "$v_entry")
+                v_dev=$(timeout 15 $S stat -L -c %d -- "$v_entry" 2>/dev/null)
+
+                # 1. Verify filesystem identity and mount relationship
+                placement "$v_entry"
+                if [ "$PL" = "UNRESOLVED" ]; then
+                  echo "UNRESOLVED placement for $v_entry ($PL_WHY)"
+                  VLIB_OTHER_UNRESOLVED=$((VLIB_OTHER_UNRESOLVED + 1))
+                  continue
+                fi
+
+                if [ -z "$ROOT_FS_DEV" ] || ! printf '%s' "$v_dev" | grep -Eq '^[0-9]+$'; then
+                  echo "UNRESOLVED ($v_entry: cannot determine filesystem device ID)"
+                  VLIB_OTHER_UNRESOLVED=$((VLIB_OTHER_UNRESOLVED + 1))
+                  continue
+                fi
+
+                if [ "$PL" = "SECONDARY" ] || [ "$v_dev" != "$ROOT_FS_DEV" ]; then
+                  echo "$v_entry is on a separate filesystem mount (${PL_TGT:-$v_entry}); excluded from root SSD total."
+                  if du_k "$v_entry"; then
+                    row_root "SECONDARY" "${PL_TGT:-$v_entry}" "/var/lib/$bname" "$v_entry" "$v_di" "$v_rp" "$K" "RESOLVED (separate mount: ${PL_TGT:-$v_entry})" "Separate mount under /var/lib; excluded from root sum"
+                    row "/var/lib/$bname (separate mount)" "$(gib "$K") physical" "not on root fs" "du -sxk $v_entry" "RESOLVED" "Medium" "Separate filesystem mount; excluded from root sum" "None" "Yes"
+                  else
+                    row_root "SECONDARY" "${PL_TGT:-$v_entry}" "/var/lib/$bname" "$v_entry" "$v_di" "$v_rp" "unknown" "UNRESOLVED ($KWHY)" "Separate mount under /var/lib; excluded from root sum"
+                    row "/var/lib/$bname (separate mount)" "unknown" "unknown" "du -sxk $v_entry" "UNRESOLVED ($KWHY)" "Medium" "Separate filesystem mount; excluded from root sum" "None" "Yes"
+                  fi
+                  continue
+                fi
+
+                # 2. Detect symlinks / aliases
+                if $S test -L "$v_entry" 2>/dev/null; then
+                  echo "$v_entry is a symbolic link to $v_rp; excluded from root sum to prevent double-counting."
+                  row_root "CHILD" "/var/lib (system & other)" "/var/lib/$bname (symlink)" "$v_entry" "$v_di" "$v_rp" "0" "RESOLVED (symlink)" "Symlink to $v_rp; excluded from physical sum"
+                  row "/var/lib/$bname (symlink)" "0 GiB" "none" "test -L + realpath" "RESOLVED (symlink)" "Low" "Symlink to $v_rp" "None" "Yes"
+                  continue
+                fi
+
+                # 3. Detect bind-mounted or aliased paths duplicating already measured root storage
+                if is_seen_identity "$v_entry" "$v_di" "$v_rp"; then
+                  echo "$v_entry shares filesystem identity with an already measured component ($v_di, $v_rp); excluded to prevent double-counting."
+                  row_root "CHILD" "/var/lib (system & other)" "/var/lib/$bname (alias/bind-mount)" "$v_entry" "$v_di" "$v_rp" "0" "RESOLVED (alias)" "Bind-mount or alias of already measured path; excluded from sum"
+                  row "/var/lib/$bname (alias/bind-mount)" "0 GiB physical" "none" "identity match" "RESOLVED (alias)" "Medium" "Bind mount or alias; excluded from sum" "None" "Yes"
+                  continue
+                fi
+
+                # 4. Measure genuine disjoint root-backed entry
+                if du_k "$v_entry"; then
+                  echo "RESOLVED with evidence: $v_entry = $(gib "$K")"
+                  VLIB_OTHER_KIB=$((VLIB_OTHER_KIB + K))
+                  record_identity "$v_entry" "$v_di" "$v_rp"
+                  case "$bname" in
+                    simama|madeena_cp|mhcs_core|madeena-iam)
+                      row_root "CHILD" "/var/lib (system & other)" "App storage: /var/lib/$bname" "$v_entry" "$v_di" "$v_rp" "$K" "RESOLVED" "Application persistent state (nested under /var/lib)"
+                      row "App storage: /var/lib/$bname" "$(gib "$K") physical" "not estimated" "du -sxk $v_entry" "RESOLVED" "High" "Application state; nested under /var/lib" "None (protected)" "Yes"
+                      ;;
+                  esac
+                else
+                  echo "UNRESOLVED ($v_entry: $KWHY)"
+                  VLIB_OTHER_UNRESOLVED=$((VLIB_OTHER_UNRESOLVED + 1))
+                  case "$bname" in
+                    simama|madeena_cp|mhcs_core|madeena-iam)
+                      row_root "CHILD" "/var/lib (system & other)" "App storage: /var/lib/$bname" "$v_entry" "$v_di" "$v_rp" "unknown" "UNRESOLVED ($KWHY)" "Application persistent state (nested under /var/lib)"
+                      row "App storage: /var/lib/$bname" "unknown" "unknown" "du -sxk $v_entry" "UNRESOLVED ($KWHY)" "High" "Application state" "None (protected)" "Yes"
+                      ;;
+                  esac
+                fi
+              done < "$STATE_DIR/vlib_raw.tsv"
+
+              vlib_di=$(get_devino /var/lib)
+              vlib_rp=$(get_realpath /var/lib)
+              if [ $VLIB_OTHER_UNRESOLVED -eq 0 ]; then
+                vlib_h=$(gib "$VLIB_OTHER_KIB")
+                echo "RESOLVED with evidence: /var/lib (system & other) = $vlib_h across $VLIB_TOTAL_COUNT entry(ies)"
+                row_root "LEVEL1" "/" "/var/lib (system & other)" "/var/lib" "$vlib_di" "$vlib_rp" "$VLIB_OTHER_KIB" "RESOLVED" "Disjoint /var/lib entries ($VLIB_TOTAL_COUNT entries, excluding docker & containerd)"
+                row "/var/lib (system & other)" "$vlib_h physical" "not estimated" "sum of $VLIB_TOTAL_COUNT individual du -sxk entries" "RESOLVED" "Medium" "System and application state outside docker/containerd" "None" "Yes"
+              else
+                echo "UNRESOLVED (/var/lib system & other: $VLIB_OTHER_UNRESOLVED of $VLIB_TOTAL_COUNT entry(ies) unmeasured)"
+                row_root "LEVEL1" "/" "/var/lib (system & other)" "/var/lib" "$vlib_di" "$vlib_rp" "unknown" "UNRESOLVED ($VLIB_OTHER_UNRESOLVED unmeasured)" "Disjoint /var/lib entries (excluding docker & containerd)"
+                row "/var/lib (system & other)" "unknown" "unknown" "sum of individual du -sxk entries" "UNRESOLVED ($VLIB_OTHER_UNRESOLVED unmeasured)" "Medium" "System and application state outside docker/containerd" "None" "Yes"
+              fi
+            fi
+          elif [ -n "$S" ] && ! $S test -e "/var/lib" 2>/dev/null; then
+            echo "/var/lib: NOT PRESENT"
+            row_root "LEVEL1" "/" "/var/lib (system & other)" "/var/lib" "none" "/var/lib" "0" "RESOLVED (absent)" "directory not present"
+            row "/var/lib (system & other)" "0 GiB" "none" "test -e" "RESOLVED (absent)" "Medium" "n/a" "None" "Yes"
+          else
+            echo "/var/lib: UNRESOLVED (not accessible)"
+            row_root "LEVEL1" "/" "/var/lib (system & other)" "/var/lib" "none" "/var/lib" "unknown" "UNRESOLVED (not accessible)" "Directory not accessible"
+            row "/var/lib (system & other)" "unknown" "unknown" "test -d" "UNRESOLVED (not accessible)" "Medium" "n/a" "None" "Yes"
+          fi
+          echo ""
+          echo "=== GITHUB RUNNER WORKSPACES & BIND MOUNT PROTECTION MAPPING ==="
+          for r in $(ls -d /home/*/actions-runner* "$HOME"/actions-runner* 2>/dev/null | sort -u); do
+            r_name=$(basename "$r")
+            for sub in _work _diag; do
+              if [ -d "$r/$sub" ]; then
+                sized_level "Runner $r_name/$sub" "$r/$sub" "CHILD" "/home" "Medium" "Runner job workspace (nested under /home)" "Review workspace cleanup policy"
+              fi
+            done
+          done
+          echo ""
+          # Dedicated probe for opendicom_sirius_database mount paths in devops-5/_work
+          OD_BASE="/home/madeena/actions-runner-madeena-devops-5/_work/opendicom-sirius-ris/opendicom-sirius-ris/database"
+          if $S test -d "$OD_BASE" 2>/dev/null; then
+            echo "--- OpenDICOM Sirius Database Mount Audit (PROTECTED live DB container 325dfa4f3e78) ---"
+            for od_sub in data dumps backups cron/crontab_file; do
+              od_p="$OD_BASE/$od_sub"
+              if $S test -e "$od_p" 2>/dev/null; then
+                du_k "$od_p"
+                od_di=$(get_devino "$od_p")
+                od_rp=$(get_realpath "$od_p")
+                if [ -n "$K" ]; then
+                  echo "RESOLVED with evidence: $od_p = $(gib "$K")"
+                  row_root "CHILD" "/home" "OpenDICOM DB mount ($od_sub)" "$od_p" "$od_di" "$od_rp" "$K" "RESOLVED" "Live container 325dfa4f3e78 bind mount; STRICTLY PROTECTED"
+                  row "OpenDICOM DB: $od_sub" "$(gib "$K") physical" "none" "du -sxk (metadata only)" "RESOLVED" "CRITICAL" "Active production DB; running container 325dfa4f3e78 binds this path" "PROTECTED (Zero Cleanup)" "Yes"
+                else
+                  echo "UNRESOLVED ($od_p: $KWHY)"
+                  row_root "CHILD" "/home" "OpenDICOM DB mount ($od_sub)" "$od_p" "$od_di" "$od_rp" "unknown" "UNRESOLVED ($KWHY)" "Live container mount; STRICTLY PROTECTED"
+                  row "OpenDICOM DB: $od_sub" "unknown" "none" "du -sxk (metadata only)" "UNRESOLVED ($KWHY)" "CRITICAL" "Active production DB; running container 325dfa4f3e78 binds this path" "PROTECTED (Zero Cleanup)" "Yes"
+                fi
+              else
+                echo "Not present: $od_p"
+              fi
+            done
+          fi
+          echo ""
+          echo "=== USER CACHES UNDER /home ==="
+          sized_level "User cache (/home/madeena/.cache)" "/home/madeena/.cache" "CHILD" "/home" "Medium" "User tool caches (nested under /home)" "Review policy"
+          sized_level "VS Code Server (/home/madeena/.vscode-server)" "/home/madeena/.vscode-server" "CHILD" "/home" "Medium" "Remote IDE extensions (nested under /home)" "Review policy"
+          echo ""
+          echo "=== LARGE FILES >= 500 MiB (candidate dirs only, depth <= 2; path and size only) ==="
+          ROOT=$(timeout 15 docker info --format '{{.DockerRootDir}}' 2>/dev/null)
+          valid_path "$ROOT" || ROOT=""
+          for d in /home /var/snap /var/snap/nextcloud /var/log /var/www $ROOT; do
+            [ -d "$d" ] || continue
+            echo "--- $d ---"
+            timeout 15 $S find "$d" -xdev -maxdepth 2 -type f -size +500M -printf '%s\t%p\n' > "$STATE_DIR/large.out" 2>/dev/null; rc=$?
+            sort -rn "$STATE_DIR/large.out" | head -10 | awk -F'\t' '{printf "%.2f GiB\t%s\n",$1/1073741824,$2}'
+            if [ $rc -eq 0 ]; then echo "RESOLVED with evidence: $d scan complete"
+            else echo "UNRESOLVED/PARTIAL ($d: find exit $rc; 124 = 15s timeout; absence of entries is not evidence of absence)"; fi
+          done
+          echo "Note: depth <= 2 limits large-file discovery; deeper files are UNRESOLVED by design."
+
+      - name: "6. Snap retained revisions and journal retention"
+        timeout-minutes: 2
+        run: |
+          set +e
+          . "${RUNNER_TEMP:-/tmp}/cleanup_readiness_${GITHUB_RUN_ID:-local}/lib.sh"
+          echo "=== SNAP REVISIONS ==="
+          SNAPROW() { row "Disabled snap revisions" "$1" "$2" "snap list --all + stat of snap files" "$3" "Low" "Old revisions only; active revision untouched" "Approved per-revision removal by a human (not by this workflow)" "Yes"; }
+          if ! command -v snap >/dev/null 2>&1; then
+            echo "UNRESOLVED (snap not installed)"; SNAPROW unknown unknown "UNRESOLVED (snap missing)"
+          else
+            timeout 15 snap list --all > "$STATE_DIR/snaps.txt" 2>/dev/null; rc=$?
+            head -60 "$STATE_DIR/snaps.txt"
+            if [ $rc -ne 0 ]; then
+              echo "UNRESOLVED (snap list --all failed, exit $rc)"; SNAPROW unknown unknown "UNRESOLVED (snap list exit $rc)"
+            elif ! head -1 "$STATE_DIR/snaps.txt" | grep -Eq '^Name[[:space:]]+Version[[:space:]]+Rev'; then
+              echo "UNRESOLVED (snap list output has no recognizable header; malformed or empty)"; SNAPROW unknown unknown "UNRESOLVED (malformed snap list)"
+            else
+              awk 'NR>1 && /disabled/{print $1, $3}' "$STATE_DIR/snaps.txt" > "$STATE_DIR/disabled.txt"
+              echo "--- disabled revisions ---"; cat "$STATE_DIR/disabled.txt"
+              total=0; n=0; bad=0
+              while read -r name rev; do
+                [ -z "$name" ] && continue
+                n=$((n+1))
+                f="/var/lib/snapd/snaps/${name}_${rev}.snap"
+                b=$(stat -c %s "$f" 2>/dev/null); src=$?
+                if [ $src -eq 0 ] && printf '%s' "$b" | grep -Eq '^[0-9]+$'; then total=$((total+b)); echo "  $name r$rev: $(awk -v b=$b 'BEGIN{printf "%.3f GiB",b/1073741824}')"
+                else bad=$((bad+1)); echo "  $name r$rev: UNRESOLVED (snap file not stat-able)"; fi
+              done < "$STATE_DIR/disabled.txt"
+              human=$(awk -v b=$total 'BEGIN{printf "%.2f GiB",b/1073741824}')
+              if [ $bad -gt 0 ]; then
+                echo "UNRESOLVED (partially inspected: $bad of $n disabled revision(s) not measurable; measured lower bound $human)"
+                SNAPROW "$n revisions; lower bound $human ($bad unmeasured)" "unknown" "UNRESOLVED (partial: $bad of $n unmeasured)"
+              else
+                echo "RESOLVED with evidence: $n disabled revision(s), $human squashfs footprint"
+                SNAPROW "$n revisions, $human" "$human if removed (approval required)" "RESOLVED"
+              fi
+            fi
+          fi
+          echo ""
+          echo "=== JOURNAL ==="
+          J=$(timeout 15 journalctl --disk-usage 2>/dev/null); rc=$?
+          if [ $rc -eq 0 ] && printf '%s' "$J" | grep -Eq 'take up [0-9.]+[KMGT]?B? in the file system'; then
+            echo "RESOLVED with evidence (usage): $J"; JST="RESOLVED (usage)"
+          else
+            echo "UNRESOLVED (journalctl --disk-usage failed or malformed, exit $rc)"; J="unknown"; JST="UNRESOLVED (usage)"
+          fi
+          echo "Explicit retention entries in merged journald configuration (NOT verified effective settings):"
+          KEYS='SystemMaxUse|SystemKeepFree|SystemMaxFileSize|MaxRetentionSec'
+          EFFNOTE="explicit entries read; effective running settings UNVERIFIED"
+          if command -v systemd-analyze >/dev/null 2>&1 && timeout 15 systemd-analyze cat-config systemd/journald.conf > "$STATE_DIR/jconf.txt" 2>/dev/null; then
+            awk -v keys="^($KEYS)=" '/^# \//{f=$2} $0 ~ keys {print f": "$0}' "$STATE_DIR/jconf.txt"
+            grep -Eq "^($KEYS)=" "$STATE_DIR/jconf.txt" || echo "No explicit retention keys present (systemd compiled-in defaults would apply; not verified)"
+            # Evidence on whether explicit entries could have been applied: config file mtime vs journald start.
+            JS=$(timeout 15 systemctl show systemd-journald.service -p ActiveEnterTimestamp 2>/dev/null | sed 's/^ActiveEnterTimestamp=//')
+            JSE=$(date -d "$JS" +%s 2>/dev/null)
+            if printf '%s' "$JSE" | grep -Eq '^[0-9]+$'; then
+              NEWER=0
+              for f in $(grep -E '^# /' "$STATE_DIR/jconf.txt" | awk '{print $2}'); do
+                m=$(stat -c %Y "$f" 2>/dev/null); printf '%s' "$m" | grep -Eq '^[0-9]+$' && [ "$m" -gt "$JSE" ] && NEWER=1
+              done
+              if [ $NEWER -eq 1 ]; then EFFNOTE="explicit entries read; config files modified AFTER journald start, so effective settings are NOT confirmed"
+              else EFFNOTE="explicit entries read; config predates journald start (inference only, not directly observed)"; fi
+            fi
+          else
+            echo "systemd-analyze unavailable or failed; partial direct read of conf files (vendor/default directories not read):"
+            timeout 15 grep -HE "^($KEYS)=" /etc/systemd/journald.conf /etc/systemd/journald.conf.d/*.conf /run/systemd/journald.conf.d/*.conf 2>/dev/null || echo "No explicit entries found in the files read"
+            EFFNOTE="PARTIAL read only (merged configuration unavailable); effective settings UNRESOLVED"
+          fi
+          echo "Retention status: $EFFNOTE"
+          row "systemd journal" "$J" "depends on approved retention policy" "journalctl --disk-usage + journald.conf(.d)" "$JST; retention: $EFFNOTE" "Low" "Logs for incident forensics" "Approved SystemMaxUse setting (no vacuum without approval)" "Yes"
+
+      - name: "7. Cleanup Readiness Matrix & Storage Reconciliation"
+        if: always()
+        timeout-minutes: 2
+        run: |
+          set +e
+          . "${RUNNER_TEMP:-/tmp}/cleanup_readiness_${GITHUB_RUN_ID:-local}/lib.sh"
+          M="$STATE_DIR/matrix.tsv"
+          REC="$STATE_DIR/reconciliation.tsv"
+          BASE="$STATE_DIR/root_baseline.txt"
+
+          {
+            awk -F'\t' '
+              NR == FNR {
+                if ($0 ~ /^ROOT_BASELINE/) {
+                  split($0, arr, /[ \t]+/)
+                  root_total = arr[2]; root_used = arr[3]; root_avail = arr[4]; root_use_pct = arr[5]
+                }
+                next
+              }
+              {
+                kind = $1; parent = $2; name = $3; path = $4; devino = $5; realpath = $6; usage = $7; status = $8; notes = $9
+                if (kind == "LEVEL1") {
+                  # Deduplicate by device:inode, canonical path, and literal path
+                  is_dup = 0
+                  if (devino != "" && devino != "none" && seen_l1_devino[devino]++) { is_dup = 1 }
+                  if (realpath != "" && realpath != "none" && seen_l1_realpath[realpath]++) { is_dup = 1 }
+                  if (path != "" && seen_l1_path[path]++) { is_dup = 1 }
+                  if (is_dup) {
+                    l1_dup_count++
+                    next
+                  }
+                  l1_count++
+                  l1_name[l1_count] = name
+                  l1_path[l1_count] = path
+                  l1_devino[l1_count] = devino
+                  l1_realpath[l1_count] = realpath
+                  l1_usage[l1_count] = usage
+                  l1_status[l1_count] = status
+                  l1_notes[l1_count] = notes
+
+                  if (status == "RESOLVED" && usage ~ /^[0-9]+$/) {
+                    l1_resolved_sum += usage
+                  } else if (status == "RESOLVED (absent)" && (usage == "0" || usage == 0)) {
+                    # Confirmed absent Level 1 component: zero contribution, NOT unresolved!
+                  } else {
+                    l1_unresolved_count++
+                  }
+                } else if (kind == "CHILD") {
+                  c_count[parent]++
+                  idx = c_count[parent]
+                  c_name[parent, idx] = name
+                  c_usage[parent, idx] = usage
+                  c_status[parent, idx] = status
+                  c_notes[parent, idx] = notes
+                } else if (kind == "SECONDARY") {
+                  sec_count++
+                  sec_name[sec_count] = name
+                  sec_parent[sec_count] = parent
+                  sec_usage[sec_count] = usage
+                  sec_status[sec_count] = status
+                  sec_notes[sec_count] = notes
+                }
+              }
+              END {
+                printf "## 1. Physical Storage Reconciliation Table (Hierarchical & Non-Overlapping)\n\n"
+                if (root_total ~ /^[0-9]+$/) {
+                  ratio_pct = sprintf("%.1f%%", (root_used / root_total) * 100)
+                  avail_pct = sprintf("%.1f%%", (root_avail / root_total) * 100)
+                  printf "| Baseline | 1K-Blocks | GiB Equivalent | Percentage / Metric | Evidence Source |\n"
+                  printf "|---|---|---|---|---|\n"
+                  printf "| Root Filesystem Total (/) | %d | %.2f GiB | 100.0%% | df -P / fresh baseline |\n", root_total, root_total/1048576
+                  printf "| Root Filesystem Used (/) | %d | %.2f GiB | %s (Used/Total ratio) | df -P / fresh baseline |\n", root_used, root_used/1048576, ratio_pct
+                  printf "| Root Filesystem Available (/) | %d | %.2f GiB | %s (Avail/Total ratio) | df -P / fresh baseline |\n", root_avail, root_avail/1048576, avail_pct
+                  printf "| Root Filesystem Capacity (`df` Use%%) | - | - | %s (reported `df` Use%%) | df -P / (Used / [Used + Avail]) |\n\n", root_use_pct
+                } else {
+                  printf "**Root Filesystem Baseline:** UNRESOLVED (fresh df -P / failed, timed out, or unreadable)\n\n"
+                }
+
+                printf "| Accounting Level | Component / Subtree | Physical Allocation | Status | Relationship / Notes |\n"
+                printf "|---|---|---|---|---|\n"
+
+                for (i = 1; i <= l1_count; i++) {
+                  n = l1_name[i]; u = l1_usage[i]; s = l1_status[i]; nt = l1_notes[i]
+                  if (s == "RESOLVED" && u ~ /^[0-9]+$/) {
+                    u_str = sprintf("%.2f GiB (%d KiB)", u/1048576, u)
+                  } else if (s == "RESOLVED (absent)" && (u == "0" || u == 0)) {
+                    u_str = "0.00 GiB (0 KiB) [absent]"
+                  } else {
+                    u_str = "unknown"
+                  }
+                  printf "| **Level 1 (Root Component)** | `%s` | %s | %s | %s |\n", n, u_str, s, nt
+
+                  if (n in c_count) {
+                    for (j = 1; j <= c_count[n]; j++) {
+                      cn = c_name[n, j]; cu = c_usage[n, j]; cs = c_status[n, j]; cnt = c_notes[n, j]
+                      if (cs == "RESOLVED" && cu ~ /^[0-9]+$/) {
+                        cu_str = sprintf("%.2f GiB", cu/1048576)
+                      } else if (cs == "RESOLVED (absent)" && (cu == "0" || cu == 0)) {
+                        cu_str = "0.00 GiB [absent]"
+                      } else {
+                        cu_str = "unknown"
+                      }
+                      printf "| &nbsp;&nbsp;↳ *Level 2 [Child Breakdown]* | `%s` | %s | %s | *Informational only; NOT added to root sum* (%s) |\n", cn, cu_str, cs, cnt
+
+                      if (cn in c_count) {
+                        for (k = 1; k <= c_count[cn]; k++) {
+                          gcn = c_name[cn, k]; gcu = c_usage[cn, k]; gcs = c_status[cn, k]; gcnt = c_notes[cn, k]
+                          if (gcs == "RESOLVED" && gcu ~ /^[0-9]+$/) {
+                            gcu_str = sprintf("%.2f GiB", gcu/1048576)
+                          } else if (gcs == "RESOLVED (absent)" && (gcu == "0" || gcu == 0)) {
+                            gcu_str = "0.00 GiB [absent]"
+                          } else {
+                            gcu_str = "unknown"
+                          }
+                          printf "| &nbsp;&nbsp;&nbsp;&nbsp;↳↳ *Level 3 [Sub-breakdown]* | `%s` | %s | %s | *Informational only; NOT added to root sum* (%s) |\n", gcn, gcu_str, gcs, gcnt
+                        }
+                      }
+                    }
+                  }
+                }
+
+                if (sec_count > 0) {
+                  printf "\n#### Separate Mounted Filesystems (Excluded from Root Sum)\n\n"
+                  printf "| Component / Path | Mount Target | Physical Usage | Status | Exclusion Rationale |\n"
+                  printf "|---|---|---|---|---|\n"
+                  for (k = 1; k <= sec_count; k++) {
+                    sn = sec_name[k]; sp = sec_parent[k]; su = sec_usage[k]; ss = sec_status[k]; snt = sec_notes[k]
+                    if ((ss == "RESOLVED" || ss ~ /^RESOLVED \(/) && su ~ /^[0-9]+$/) {
+                      su_str = sprintf("%.2f GiB (%d KiB)", su/1048576, su)
+                    } else {
+                      su_str = "unknown"
+                    }
+                    printf "| `%s` | `%s` | %s | %s | Excluded from root SSD sum: %s |\n", sn, sp, su_str, ss, snt
+                  }
+                }
+
+                if (l1_dup_count > 0) {
+                  printf "\n> [!CAUTION]\n"
+                  printf "> %d duplicate Level 1 entry(ies) detected by path/identity and excluded to prevent double-counting.\n\n", l1_dup_count
+                }
+
+                printf "\n### Reconciliation Balance\n\n"
+                printf "| Metric | Size (GiB) | 1K-Blocks | Accounting Formula |\n"
+                printf "|---|---|---|---|\n"
+                if (root_used ~ /^[0-9]+$/) {
+                  printf "| **Fresh Root Filesystem Used** | **%.2f GiB** | %d | Fresh `df -P /` baseline |\n", root_used/1048576, root_used
+                  printf "| **Accounted Physical Root Components** | **%.2f GiB** | %d | Sum of resolved Level 1 components only |\n", l1_resolved_sum/1048576, l1_resolved_sum
+
+                  residual = root_used - l1_resolved_sum
+                  if (residual < 0) {
+                    printf "| **Accounting Discrepancy (Over-accounted)** | **%.2f GiB** | %d | Root Used - Accounted Physical (NEGATIVE) |\n\n", residual/1048576, residual
+                    printf "> [!CAUTION]\n"
+                    printf "> **ACCOUNTING INCONSISTENCY DETECTED:** Sum of resolved Level 1 components (%.2f GiB) exceeds `df` reported root used (%.2f GiB) by %.2f GiB (%d KiB).\n", l1_resolved_sum/1048576, root_used/1048576, (-residual)/1048576, -residual
+                    printf "> Possible causes: cross-component bind mounts, separate mountpoint included in scan, hard-linked file duplication across measured directories, or filesystem mutation during scan.\n\n"
+                  } else {
+                    printf "| **Unaccounted / Residual Storage** | **%.2f GiB** | %d | Root Used - Accounted Physical |\n\n", residual/1048576, residual
+                  }
+
+                  if (l1_unresolved_count > 0) {
+                    printf "> [!IMPORTANT]\n"
+                    printf "> Residual includes %d unresolved or timed-out Level 1 component(s). Unresolved components are preserved as unknown and are NEVER assumed to be zero.\n\n", l1_unresolved_count
+                  }
+                } else {
+                  printf "| Accounted Physical Root Components | %.2f GiB | %d | Sum of resolved Level 1 components |\n", l1_resolved_sum/1048576, l1_resolved_sum
+                  printf "| Fresh Root Baseline | unknown | unknown | df -P / failed or unreadable |\n\n"
+                  printf "> [!WARNING]\n"
+                  printf "> Root filesystem baseline is UNRESOLVED. Residual cannot be computed reliably.\n\n"
+                }
+
+                printf "#### Accounting Integrity Rules\n"
+                printf "1. **Hierarchical Model & Exclusion Rule:** Level 1 components represent direct top-level paths verified to reside on the root filesystem (`/`). Level 2 child breakdowns are purely informational and are strictly excluded from root addition to prevent double-counting. Pathname hierarchy provides structural partitioning, but does not universally guarantee block-level disjointness (e.g. cross-directory hard links or active bind mounts); independent measurements are reconciled against `df` baseline.\n"
+                printf "2. **df vs du Reconciliation:** Residual differences between `df` and `du` reflect: (a) filesystem metadata and ext4 inode tables / journal overhead (~1.5–3%%), (b) deleted-but-unlinked open files held by running processes, (c) hard link deduplication boundaries, and (d) any unresolved/timed-out Level 1 subtrees.\n"
+                printf "3. **Logical vs Physical Separation:** Docker logical reclaimable values (images, build cache) overlap and represent candidate layer metadata, not confirmed ext4 SSD recovery.\n\n"
+              }
+            ' "$BASE" "$REC" 2>/dev/null
+
+            echo "## 2. Cleanup Readiness Matrix (read-only; no action taken)"
+            echo ""
+            HDR="| Category | Observed usage | Est. reclaimable | Evidence source | Status | Risk | Dependency / rollback impact | Proposed future action | Separate approval? |"
+            SEP="|---|---|---|---|---|---|---|---|---|"
+            echo "$HDR"; echo "$SEP"
+            tr -d '|' < "$M" | awk -F'\t' '{printf "| "; for(i=1;i<=9;i++){printf "%s | ",$i}; print ""}'
+            echo ""
+            echo "- Docker logical figures overlap and must not be summed; Docker-reported reclaimable is a candidate, not authorization."
+            echo "- UNRESOLVED rows mean the probe failed, timed out, was denied, or returned partial/malformed data; they are never zero usage."
+            echo "- Production data deleted: NONE. Pruning/vacuum/restart/config change: NONE."
+            echo ""
+            echo "## 3. Operational Safety Summary"
+            echo "- Files/volumes/snaps deleted: NONE"
+            echo "- Docker prune: NONE; journal vacuum: NONE; services restarted: NONE"
+            echo "- Config/mount/LVM modified: NONE"
+            echo "- Ephemeral state left in RUNNER_TEMP for the runner to reclaim (nothing deleted by this workflow)."
+          } | tee -a "${GITHUB_STEP_SUMMARY:-/dev/null}"
